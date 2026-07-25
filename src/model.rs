@@ -23,6 +23,8 @@ pub struct Session {
     pub initial_git: GitSnapshot,
     pub final_git: Option<GitSnapshot>,
     pub last_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,6 +57,72 @@ pub struct GitSnapshot {
     pub commit: Option<String>,
     pub clean: Option<bool>,
     pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_path_encoding: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockOwner {
+    pub schema_version: u32,
+    pub pid: u32,
+    pub command: String,
+    pub acquired_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationEffect {
+    pub kind: String,
+    pub path: String,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationMarker {
+    pub schema_version: u32,
+    pub id: Uuid,
+    pub command: String,
+    pub session_id: Option<Uuid>,
+    pub started_at: DateTime<Utc>,
+    pub effects: Vec<OperationEffect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diagnostic {
+    pub code: String,
+    pub severity: DiagnosticSeverity,
+    pub path: String,
+    pub message: String,
+    pub guidance: String,
+    pub repairable: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SuccessEnvelope<T: Serialize> {
+    pub output_schema_version: u32,
+    pub ok: bool,
+    pub command: String,
+    pub data: T,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ErrorEnvelope {
+    pub output_schema_version: u32,
+    pub ok: bool,
+    pub command: String,
+    pub error: OutputError,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutputError {
+    pub code: String,
+    pub message: String,
 }
 
 impl GitSnapshot {

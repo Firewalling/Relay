@@ -2,8 +2,9 @@ use relay::model::{Event, Session, SessionState};
 use std::{
     ffi::OsStr,
     fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 
 fn relay(project: &Path, args: &[&str]) -> Output {
@@ -12,6 +13,28 @@ fn relay(project: &Path, args: &[&str]) -> Output {
         .current_dir(project)
         .output()
         .expect("run relay binary")
+}
+
+fn relay_with_env(project: &Path, args: &[&str], key: &str, value: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(args)
+        .env(key, value)
+        .current_dir(project)
+        .output()
+        .expect("run relay binary")
+}
+
+fn relay_with_stdin(project: &Path, args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(args)
+        .current_dir(project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
 }
 
 fn git<I, S>(project: &Path, args: I) -> Output
@@ -46,6 +69,23 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr is UTF-8")
+}
+
+#[test]
+fn completion_commands_emit_current_cli_without_project_state() {
+    for shell in ["bash", "zsh", "fish"] {
+        let directory = tempfile::tempdir().unwrap();
+        let output = relay(directory.path(), &["completions", shell]);
+
+        assert_success(&output);
+        assert!(output.stderr.is_empty());
+        let script = stdout(&output);
+        assert!(!script.is_empty());
+        for command in ["start", "doctor", "context", "completions"] {
+            assert!(script.contains(command), "{shell} omitted {command}");
+        }
+        assert!(!directory.path().join(".relay").exists());
+    }
 }
 
 fn assert_success(output: &Output) {
@@ -109,6 +149,17 @@ fn user_status(project: &Path) -> Vec<String> {
     })
     .map(str::to_owned)
     .collect()
+}
+
+fn git_fingerprint(project: &Path) -> (String, String, String, Vec<String>, String, Vec<u8>) {
+    (
+        git_ok(project, ["rev-parse", "HEAD"]),
+        git_ok(project, ["write-tree"]),
+        git_ok(project, ["diff", "--", "."]),
+        user_status(project),
+        git_ok(project, ["stash", "list", "--format=%H"]),
+        fs::read(project.join("tracked file.txt")).unwrap(),
+    )
 }
 
 #[test]
@@ -359,4 +410,554 @@ fn relay_directory_symlink_cannot_write_outside_project() {
     assert!(stderr(&output).contains("refusing to use symlinked Relay state path"));
     assert!(stderr(&output).contains("replace it with a real file or directory"));
     assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
+}
+
+#[test]
+fn nested_discovery_and_monorepo_git_status_are_project_bounded() {
+    let directory = init_repository();
+    let root = directory.path();
+    let project = root.join("packages/relay-app");
+    let nested = project.join("src/deep");
+    let sibling = root.join("packages/sibling");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&sibling).unwrap();
+    fs::write(sibling.join("dirty.txt"), "sibling\n").unwrap();
+
+    assert_success(&relay(&project, &["start", "Bound scope"]));
+    let nested_status = relay(&nested, &["status"]);
+    assert_success(&nested_status);
+    assert!(stdout(&nested_status).contains("Goal: Bound scope"));
+    assert!(stdout(&nested_status).contains("Git clean: yes"));
+
+    fs::write(project.join("local.txt"), "local\n").unwrap();
+    let checkpoint = relay(&nested, &["checkpoint", "scoped"]);
+    assert_success(&checkpoint);
+    assert!(stdout(&checkpoint).contains("local.txt"));
+    assert!(!stdout(&checkpoint).contains("sibling"));
+
+    let current = relay(&nested, &["--scope", "current", "status"]);
+    assert!(!current.status.success());
+    assert!(stderr(&current).contains("no Relay session"));
+}
+
+#[test]
+fn lock_contention_is_nonblocking_and_owner_metadata_is_actionable() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut owner = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(["start", "lock owner"])
+        .env("RELAY_TEST_HOLD_LOCK_MS", "1200")
+        .current_dir(directory.path())
+        .spawn()
+        .unwrap();
+    let lock_path = directory.path().join(".relay/lock");
+    for _ in 0..100 {
+        if lock_path.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let contender = relay(directory.path(), &["start", "contender"]);
+    assert!(!contender.status.success());
+    let error = stderr(&contender);
+    assert!(error.contains("busy"));
+    assert!(error.contains("PID"));
+    assert!(error.contains("retry"));
+    assert!(owner.wait().unwrap().success());
+
+    assert_success(&relay(directory.path(), &["finish"]));
+    assert_success(&relay(directory.path(), &["start", "released normally"]));
+}
+
+#[test]
+fn injected_fault_leaves_durable_effect_and_operation_marker() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", "fault testing"]));
+
+    let failed = relay_with_env(
+        directory.path(),
+        &["checkpoint", "interrupted"],
+        "RELAY_TEST_FAIL_AFTER",
+        "artifact",
+    );
+    assert!(!failed.status.success());
+    assert!(stderr(&failed).contains("injected interruption"));
+    assert_eq!(
+        fs::read_dir(directory.path().join(".relay/checkpoints"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let marker = only_file(directory.path().join(".relay/operations"));
+    let marker: serde_json::Value = serde_json::from_slice(&fs::read(marker).unwrap()).unwrap();
+    assert_eq!(marker["command"], "checkpoint");
+    assert_eq!(marker["effects"][0]["completed"], true);
+    assert_eq!(marker["effects"][1]["completed"], false);
+
+    // Returned errors release the kernel lock even though diagnostic intent remains.
+    assert_success(&relay(directory.path(), &["checkpoint", "after error"]));
+}
+
+#[test]
+fn sessions_remain_addressable_and_resume_creates_lineage() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", "first goal"]));
+    let first = read_session(directory.path());
+    assert_success(&relay(directory.path(), &["finish"]));
+    let source_bytes = fs::read(
+        directory
+            .path()
+            .join(format!(".relay/sessions/{}.json", first.id)),
+    )
+    .unwrap();
+
+    let resumed = relay(directory.path(), &["resume", &first.id.to_string()[..8]]);
+    assert_success(&resumed);
+    let second = read_session(directory.path());
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.resumed_from, Some(first.id));
+    assert_eq!(second.goal, first.goal);
+    assert_eq!(
+        fs::read(
+            directory
+                .path()
+                .join(format!(".relay/sessions/{}.json", first.id))
+        )
+        .unwrap(),
+        source_bytes
+    );
+
+    let listed = relay(directory.path(), &["list"]);
+    assert_success(&listed);
+    assert!(stdout(&listed).contains(&first.id.to_string()));
+    assert!(stdout(&listed).contains(&second.id.to_string()));
+    let shown = relay(directory.path(), &["show", &first.id.to_string()[..8]]);
+    assert_success(&shown);
+    assert!(stdout(&shown).contains("State: completed"));
+    let history = relay(
+        directory.path(),
+        &[
+            "history",
+            "--session",
+            &second.id.to_string()[..8],
+            "--limit",
+            "1",
+        ],
+    );
+    assert_success(&history);
+    assert!(stdout(&history).contains("session.resumed"));
+
+    let invalid = relay(directory.path(), &["resume", &first.id.to_string()]);
+    assert!(!invalid.status.success());
+    assert!(stderr(&invalid).contains("active Relay session already exists"));
+}
+
+#[test]
+fn valid_legacy_session_is_read_only_until_locked_mutation_materializes_it() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", "legacy"]));
+    let session = read_session(directory.path());
+    fs::remove_file(
+        directory
+            .path()
+            .join(format!(".relay/sessions/{}.json", session.id)),
+    )
+    .unwrap();
+    let pointer_before = fs::read(directory.path().join(".relay/session.json")).unwrap();
+
+    assert_success(&relay(directory.path(), &["list"]));
+    assert!(
+        !directory
+            .path()
+            .join(format!(".relay/sessions/{}.json", session.id))
+            .exists()
+    );
+    assert_success(&relay(directory.path(), &["checkpoint", "materialize"]));
+    assert!(
+        directory
+            .path()
+            .join(format!(".relay/sessions/{}.json", session.id))
+            .exists()
+    );
+    assert_eq!(
+        fs::read(directory.path().join(".relay/session.json")).unwrap(),
+        pointer_before
+    );
+}
+
+#[test]
+fn ambiguous_session_prefix_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", "seed"]));
+    let template = read_session(directory.path());
+    assert_success(&relay(directory.path(), &["finish"]));
+    let sessions = directory.path().join(".relay/sessions");
+    for id in [
+        "aaaaaaaa-0000-4000-8000-000000000001",
+        "aaaaaaaa-0000-4000-8000-000000000002",
+    ] {
+        let mut session = template.clone();
+        session.id = id.parse().unwrap();
+        session.state = SessionState::Completed;
+        session.completed_at = Some(session.started_at);
+        session.final_git = Some(session.initial_git.clone());
+        fs::write(
+            sessions.join(format!("{id}.json")),
+            serde_json::to_vec_pretty(&session).unwrap(),
+        )
+        .unwrap();
+    }
+    let output = relay(directory.path(), &["show", "aaaaaaaa"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("ambiguous"));
+}
+
+#[test]
+fn every_lifecycle_and_history_command_preserves_git_state_and_stashes() {
+    let directory = init_repository();
+    let project = directory.path();
+    fs::write(project.join("stashed.txt"), "stash\n").unwrap();
+    assert!(
+        git(
+            project,
+            ["stash", "push", "--include-untracked", "-m", "keep"]
+        )
+        .status
+        .success()
+    );
+    fs::write(project.join("tracked file.txt"), "unstaged\n").unwrap();
+    fs::write(project.join("untracked.txt"), "untracked\n").unwrap();
+    let before = git_fingerprint(project);
+
+    let commands = [
+        vec!["start", "immutable git"],
+        vec!["status"],
+        vec!["checkpoint", "snapshot"],
+        vec!["handoff", "codex"],
+        vec!["list"],
+        vec!["history", "--limit", "2"],
+        vec!["finish"],
+    ];
+    for args in commands {
+        let output = relay(project, &args);
+        assert_success(&output);
+        assert_eq!(
+            git_fingerprint(project),
+            before,
+            "Git changed after {args:?}"
+        );
+    }
+    let completed = read_session(project);
+    let completed_id = completed.id.to_string();
+    for args in [
+        vec!["show", completed_id.as_str()],
+        vec!["resume", completed_id.as_str()],
+    ] {
+        let output = relay(project, &args);
+        assert_success(&output);
+        assert_eq!(
+            git_fingerprint(project),
+            before,
+            "Git changed after {args:?}"
+        );
+    }
+}
+
+#[test]
+fn abandoned_process_releases_kernel_lock_and_metadata_is_refreshed() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut owner = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .args(["start", "abandoned"])
+        .env("RELAY_TEST_HOLD_LOCK_MS", "10000")
+        .current_dir(directory.path())
+        .spawn()
+        .unwrap();
+    let lock = directory.path().join(".relay/lock");
+    for _ in 0..100 {
+        if lock.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+
+    let recovered = relay(directory.path(), &["start", "recovered"]);
+    assert_success(&recovered);
+    let metadata: serde_json::Value = serde_json::from_slice(&fs::read(lock).unwrap()).unwrap();
+    assert_ne!(metadata["pid"], serde_json::json!(owner.id()));
+    assert_eq!(metadata["command"], "start");
+}
+
+#[test]
+fn faults_after_event_and_session_record_leave_precise_progress() {
+    for fault in ["event", "session_record"] {
+        let directory = tempfile::tempdir().unwrap();
+        assert_success(&relay(directory.path(), &["start", "handoff fault"]));
+        let failed = relay_with_env(
+            directory.path(),
+            &["handoff", "codex"],
+            "RELAY_TEST_FAIL_AFTER",
+            fault,
+        );
+        assert!(!failed.status.success());
+        let marker = only_file(directory.path().join(".relay/operations"));
+        let marker: serde_json::Value = serde_json::from_slice(&fs::read(marker).unwrap()).unwrap();
+        let effects = marker["effects"].as_array().unwrap();
+        assert!(
+            effects
+                .iter()
+                .find(|effect| effect["kind"] == fault)
+                .unwrap()["completed"]
+                .as_bool()
+                .unwrap()
+        );
+        assert_eq!(
+            read_events(directory.path())
+                .iter()
+                .filter(|event| event.event_type == "handoff.generated")
+                .count(),
+            1
+        );
+        if fault == "session_record" {
+            let session = read_session(directory.path());
+            let durable: Session = serde_json::from_slice(
+                &fs::read(
+                    directory
+                        .path()
+                        .join(format!(".relay/sessions/{}.json", session.id)),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(durable.last_agent.as_deref(), Some("codex"));
+            assert_eq!(session.last_agent, None);
+        }
+    }
+}
+
+#[test]
+fn list_recovers_older_supported_legacy_session_from_events() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", "older"]));
+    let older = read_session(directory.path());
+    assert_success(&relay(directory.path(), &["finish"]));
+    assert_success(&relay(directory.path(), &["start", "newer"]));
+    fs::remove_file(
+        directory
+            .path()
+            .join(format!(".relay/sessions/{}.json", older.id)),
+    )
+    .unwrap();
+
+    let output = relay(directory.path(), &["list"]);
+    assert_success(&output);
+    assert!(stdout(&output).contains(&older.id.to_string()));
+    assert!(stdout(&output).contains("older"));
+}
+
+#[test]
+fn json_envelopes_are_single_typed_documents_and_failures_stay_on_stderr() {
+    let directory = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["--json", "start", "json goal"],
+        vec!["--json", "status"],
+        vec!["--json", "checkpoint", "typed"],
+        vec!["--json", "handoff", "codex"],
+        vec!["--json", "list"],
+        vec!["--json", "history", "--limit", "2"],
+        vec!["--json", "finish"],
+    ] {
+        let output = relay(directory.path(), &args);
+        assert_success(&output);
+        assert!(output.stderr.is_empty());
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(document["output_schema_version"], 1);
+        assert_eq!(document["ok"], true);
+        assert!(document["data"].is_object());
+        assert!(
+            !String::from_utf8_lossy(&output.stdout)
+                .contains(directory.path().to_string_lossy().as_ref())
+        );
+    }
+    let failed = relay(directory.path(), &["--json", "finish"]);
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    let document: serde_json::Value = serde_json::from_slice(&failed.stderr).unwrap();
+    assert_eq!(document["ok"], false);
+    assert_eq!(document["error"]["code"], "lifecycle_error");
+}
+
+#[test]
+fn doctor_detects_damage_without_changing_any_bytes_and_refuses_unsafe_repair() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", "diagnose"]));
+    let events = directory.path().join(".relay/events.jsonl");
+    fs::write(&events, b"{\"partial\":true}").unwrap();
+    let before = fs::read(&events).unwrap();
+
+    let diagnosed = relay(directory.path(), &["--json", "doctor"]);
+    assert_success(&diagnosed);
+    let document: serde_json::Value = serde_json::from_slice(&diagnosed.stdout).unwrap();
+    assert_eq!(document["data"]["healthy"], false);
+    assert!(
+        document["data"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "events_partial_line")
+    );
+    assert_eq!(fs::read(&events).unwrap(), before);
+
+    let repair = relay(directory.path(), &["doctor", "--repair"]);
+    assert!(!repair.status.success());
+    assert!(stderr(&repair).contains("refused repair"));
+    assert_eq!(fs::read(&events).unwrap(), before);
+}
+
+#[test]
+fn doctor_repairs_only_a_provably_complete_stale_marker() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", "repair marker"]));
+    let session = read_session(directory.path());
+    let marker_id = uuid::Uuid::new_v4();
+    let marker = serde_json::json!({
+        "schema_version": 1,
+        "id": marker_id,
+        "command": "start",
+        "session_id": session.id,
+        "started_at": session.started_at,
+        "effects": [
+            {"kind":"session_record","path":format!(".relay/sessions/{}.json", session.id),"completed":true},
+            {"kind":"current_session","path":".relay/session.json","completed":true},
+            {"kind":"event","path":".relay/events.jsonl","completed":true}
+        ]
+    });
+    let marker_path = directory
+        .path()
+        .join(format!(".relay/operations/{marker_id}.json"));
+    fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+
+    let repaired = relay(directory.path(), &["--json", "doctor", "--repair"]);
+    assert_success(&repaired);
+    assert!(!marker_path.exists());
+    let document: serde_json::Value = serde_json::from_slice(&repaired.stdout).unwrap();
+    assert_eq!(document["data"]["repaired"].as_array().unwrap().len(), 1);
+    assert!(
+        read_events(directory.path())
+            .iter()
+            .any(|event| event.event_type == "doctor.repaired")
+    );
+}
+
+#[test]
+fn categorized_notes_support_argument_stdin_editor_and_generated_artifacts() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", "notes"]));
+    assert_success(&relay(
+        directory.path(),
+        &["note", "decision", "Keep JSONL"],
+    ));
+    assert_success(&relay_with_stdin(
+        directory.path(),
+        &["note", "blocker", "--stdin"],
+        b"Waiting on review\n",
+    ));
+    let editor = directory.path().join("editor.sh");
+    fs::write(&editor, "#!/bin/sh\nprintf 'Implemented parser' > \"$1\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let edited = relay_with_env(
+        directory.path(),
+        &["note", "progress", "--editor"],
+        "VISUAL",
+        editor.to_str().unwrap(),
+    );
+    assert_success(&edited);
+    let conflict = relay(directory.path(), &["note", "decision", "x", "--stdin"]);
+    assert!(!conflict.status.success());
+    let blank = relay(directory.path(), &["note", "decision", "   "]);
+    assert!(!blank.status.success());
+
+    let handoff = relay(directory.path(), &["handoff", "codex"]);
+    assert_success(&handoff);
+    assert!(stdout(&handoff).contains("Keep JSONL"));
+    assert!(stdout(&handoff).contains("Waiting on review"));
+    assert!(stdout(&handoff).contains("Implemented parser"));
+    assert_success(&relay(directory.path(), &["finish"]));
+    let summary = fs::read_to_string(directory.path().join(format!(
+        ".relay/summary-{}.md",
+        read_session(directory.path()).id
+    )))
+    .unwrap();
+    assert!(summary.contains("Keep JSONL"));
+    assert!(summary.contains("Waiting on review"));
+}
+
+#[test]
+fn context_filters_deterministically_respects_item_budget_and_preserves_privacy() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", "bounded context"]));
+    assert_success(&relay(
+        directory.path(),
+        &["note", "progress", "private progress"],
+    ));
+    assert_success(&relay(
+        directory.path(),
+        &["note", "decision", "chosen format"],
+    ));
+    assert_success(&relay(
+        directory.path(),
+        &["note", "next_action", "write tests"],
+    ));
+    assert_success(&relay(directory.path(), &["checkpoint", "context point"]));
+
+    let args = [
+        "context",
+        "--category",
+        "decision",
+        "--category",
+        "next_action",
+        "--kind",
+        "note.recorded",
+        "--notes",
+        "2",
+        "--events",
+        "1",
+        "--checkpoints",
+        "1",
+        "--max-chars",
+        "700",
+    ];
+    let first = relay(directory.path(), &args);
+    let second = relay(directory.path(), &args);
+    assert_success(&first);
+    assert_eq!(first.stdout, second.stdout);
+    let text = stdout(&first);
+    assert!(text.chars().count() <= 700);
+    assert!(text.contains("chosen format"));
+    assert!(text.contains("write tests"));
+    assert!(!text.contains("private progress"));
+    assert!(!text.contains(directory.path().to_string_lossy().as_ref()));
+
+    let json_output = relay(
+        directory.path(),
+        &[
+            "--json",
+            "context",
+            "--category",
+            "decision",
+            "--notes",
+            "1",
+        ],
+    );
+    assert_success(&json_output);
+    let document: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(document["data"]["notes"][0]["category"], "decision");
+    assert!(
+        !String::from_utf8_lossy(&json_output.stdout)
+            .contains(directory.path().to_string_lossy().as_ref())
+    );
 }
