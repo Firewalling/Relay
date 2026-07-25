@@ -1,7 +1,7 @@
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 use tempfile::NamedTempFile;
@@ -38,6 +38,30 @@ pub enum StorageError {
         "corrupt JSON Lines record in {path} at line {line}: final record is not terminated by a newline; it may be partial"
     )]
     PartialJsonLine { path: PathBuf, line: usize },
+}
+
+pub fn write_json_to_open_file<T: Serialize>(
+    mut file: &fs::File,
+    path: &Path,
+    value: &T,
+) -> Result<(), StorageError> {
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|source| StorageError::Encode {
+        path: path.to_owned(),
+        source,
+    })?;
+    bytes.push(b'\n');
+    file.set_len(0).map_err(|source| io_error(path, source))?;
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.write_all(&bytes))
+        .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all())
+        .map_err(|source| io_error(path, source))
+}
+
+pub fn remove_file_synced(path: &Path) -> Result<(), StorageError> {
+    fs::remove_file(path).map_err(|source| io_error(path, source))?;
+    sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+        .map_err(|source| io_error(path, source))
 }
 
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StorageError> {

@@ -1,110 +1,268 @@
 # Relay
 
-> Relay — continuous context for terminal agents.
+> Continuous, local context for terminal agents.
 
-Relay is a small Rust CLI that records one project-local work session, its Git
-context, explicit checkpoints, agent handoffs, and a final summary. It does not
-run agents, inspect chat transcripts, or replace Git.
+Relay is a Rust CLI for recording project-local work sessions, checkpoints,
+categorized notes, handoffs, and bounded context for the next terminal agent.
+It does not run agents, call model-provider APIs, inspect chat transcripts, or
+replace Git.
 
-## Install or build
+## Prerequisites and installation
 
-Relay requires Rust and the `git` executable for Git-aware snapshots.
+Relay requires a stable Rust toolchain with Cargo. Install `git` too if you want
+Git-aware snapshots; Relay also works outside a Git repository.
+
+Install the checked-out source directly:
+
+```sh
+cargo install --path .
+relay --version
+```
+
+For a local release build and an explicit user-local install:
 
 ```sh
 cargo build --release
-install -m 755 target/release/relay ~/.local/bin/relay
+mkdir -p "$HOME/.local/bin"
+cp target/release/relay "$HOME/.local/bin/relay"
+chmod 755 "$HOME/.local/bin/relay"
 ```
 
-For development, run `cargo run -- <command>` from this repository instead.
+Ensure `$HOME/.local/bin` is on `PATH`. Relay does not currently claim
+prebuilt packages or a crates.io release.
 
-## Milestone workflow
+## Shell completions
 
-Run commands from the exact project directory whose session you want to manage:
+`relay completions bash|zsh|fish` generates a script from the current CLI and
+writes it to stdout. It never edits shell configuration.
 
 ```sh
-relay start "Improve Fedora installer"
-relay status
-relay checkpoint "Rust detection fixed"
-relay handoff omp \
+# Bash: load now
+source <(relay completions bash)
+
+# Zsh: install in a directory already on $fpath, then restart the shell
+mkdir -p "$HOME/.zfunc"
+relay completions zsh > "$HOME/.zfunc/_relay"
+
+# Fish: install for the current user
+mkdir -p "$HOME/.config/fish/completions"
+relay completions fish > "$HOME/.config/fish/completions/relay.fish"
+```
+
+For the Zsh example, add `fpath=("$HOME/.zfunc" $fpath)` before `compinit` in
+`.zshrc` if that directory is not already on `fpath`.
+
+## Daily workflow
+
+```sh
+relay start "Improve the installer"
+relay note decision "Use the Git CLI for snapshots"
+relay note progress "Added distro detection"
+relay checkpoint "Detection and tests pass"
+relay handoff codex \
   --completed-work "Added distro detection" \
-  --completed-work "Covered spaces in paths" \
   --decision "Use the Git CLI for snapshots" \
-  --failure "Offline package mirror was unavailable" \
+  --failure "Offline mirror was unavailable" \
   --next-action "Review the installer smoke test"
-relay status
+relay context --max-chars 8000
 relay finish
 ```
 
-`start` creates an active session. `status` reports its lifecycle state, live
-Git state, event count, latest checkpoint, and last agent. `checkpoint` captures
-the current Git snapshot with an optional message. `handoff` prints and saves a
-targeted Markdown note. `finish` saves a final summary and marks the session
-completed. A second active `start` and a second `finish` are errors.
+Relay supports these commands:
 
-Handoff note flags are optional and repeatable where shown:
+- `start <GOAL>` starts the only active session.
+- `status` shows the current session and live scoped Git state.
+- `checkpoint [MESSAGE]` saves a timestamped Git snapshot.
+- `handoff <AGENT>` prints and saves Markdown. `--completed-work`,
+  `--decision`, and `--failure` are repeatable; `--next-action` accepts one
+  value. Every detail is optional, and missing facts are reported as not
+  recorded.
+- `finish` saves a final Markdown summary and completes the active session.
+- `list` lists all known sessions.
+- `show <SESSION>` shows a session selected by full UUID or an unambiguous UUID
+  prefix.
+- `history [--session <SESSION>] [--type <EVENT_TYPE>] [--limit <N>]` reads
+  matching append-only events in recorded order.
+- `resume <SESSION>` starts a new active continuation of a completed session,
+  preserving its goal and recording lineage. It does not reopen or modify the
+  source session, and it fails if a session is already active.
+- `note <CATEGORY> [TEXT]` records `progress`, `decision`, `blocker`,
+  `observation`, or `next_action`.
+- `context` emits bounded, recorded agent context; its filters are described
+  below.
+- `doctor [--repair]` diagnoses storage consistency.
+- `completions <SHELL>` prints a Bash, Zsh, or Fish completion script.
 
-- `--completed-work <TEXT>`: completed item; may be supplied more than once
-- `--decision <TEXT>`: important decision; may be supplied more than once
-- `--failure <TEXT>`: failure or blocked item; may be supplied more than once
-- `--next-action <TEXT>`: one suggested next action
+`--json` and `--scope auto|current|repository` are global options and work
+before or after a subcommand. Human output remains the default. `--json` emits
+one versioned success document on stdout, or one versioned error document on
+stderr; `output_schema_version` is separate from the on-disk schema version.
+Completions are shell text regardless of global output options.
 
-Omitted categories render as `Not recorded`; Relay does not invent content.
-Output paths such as `.relay/handoffs/<timestamp>-<id>.md` are relative to the
-project. `Git clean: no` means Git reported changed or untracked files, while
-`unavailable` means the current directory is not in a Git repository or that
-particular value (for example, a branch before the first commit) is absent.
+## Notes
 
-## Local data
+Supply note text in exactly one of these ways:
 
-Relay keeps inspectable, project-local files:
+```sh
+relay note decision "Keep JSON Lines append-only"
+printf '%s\n' "Waiting for review" | relay note blocker --stdin
+relay note next_action --editor
+```
+
+With neither text nor `--stdin`, Relay reads redirected stdin when present;
+otherwise it opens `$VISUAL`, then `$EDITOR`, falling back to `vi`. Text must be
+nonblank valid UTF-8 and is limited to 64 KiB. Explicitly combining positional
+text, `--stdin`, and `--editor` is rejected.
+
+Recorded notes are facts: Relay can include them in handoffs, final summaries,
+and context, but never fills in work, decisions, failures, or next actions that
+were not recorded.
+
+## Bounded agent context
+
+Markdown is the default; `relay --json context` returns the same categories as
+typed data. Context contains only the selected session, recorded notes and
+events, checkpoints, continuation lineage, and current scoped Git facts.
+
+```sh
+relay context \
+  --session 4f2a1c \
+  --category decision \
+  --category next_action \
+  --kind note.recorded \
+  --notes 10 \
+  --events 10 \
+  --checkpoints 3 \
+  --max-chars 8000
+```
+
+Categories and event kinds are repeatable filters. Counts default to 20 notes,
+20 events, and 5 checkpoints; the character budget defaults to 12,000 and must
+be at least 64. Ordering is deterministic. Relay truncates only at item
+boundaries and reports truncation plus omitted counts. It does not query model
+providers, scan source files, read agent conversations, or infer unrecorded
+facts. Paths in generated output are project-relative, and absolute project
+paths found in recorded text are redacted.
+
+### Terminal-agent composition
+
+These examples use only local CLI composition—Relay supplies a prompt and each
+agent uses its own existing authentication/configuration:
+
+```sh
+# Hermes: installed help defines -z/--oneshot as a prompt argument
+context="$(relay context --max-chars 8000)" && hermes -z "$context"
+
+# hermes-omp: pass the same generated text as its ordinary prompt
+context="$(relay context --max-chars 8000)" && hermes-omp "$context"
+
+# Codex CLI: `codex exec -` reads instructions from stdin
+relay context --max-chars 8000 | codex exec -
+
+# Any agent command that accepts its prompt on stdin
+relay context --max-chars 8000 | my-agent
+```
+
+Replace `my-agent` with an actual stdin-reading command. Command substitution
+is used for Hermes-family commands because their installed interfaces accept a
+prompt argument; no unsupported stdin behavior or provider flags are assumed.
+
+## Project scope and monorepos
+
+Relay stores state at a selected Relay project root:
+
+- `--scope auto` (default) searches upward for the nearest `.relay` directory,
+  stopping at the Git worktree root. If none exists, it uses the invocation
+  directory.
+- `--scope current` always uses the invocation directory.
+- `--scope repository` uses the Git worktree root and fails outside Git.
+
+This lets a nested project retain its session when commands run from deeper
+directories. In a monorepo, start with `--scope current` in a package directory
+to give that subtree independent Relay state. Git snapshots and changed paths
+are then limited to that subtree; sibling package changes do not affect its
+cleanliness. Use `--scope repository` when the whole worktree is one Relay
+project.
+
+## Files, compatibility, migration, and locking
+
+Relay's inspectable project-local layout is:
 
 ```text
 .relay/
 ├── session.json
+├── sessions/
+│   └── <session-id>.json
 ├── events.jsonl
 ├── checkpoints/
 │   └── <timestamp>-<id>.json
 ├── handoffs/
 │   └── <timestamp>-<id>.md
+├── operations/
+│   └── <operation-id>.json
+├── lock
 └── summary-<session-id>.md
 ```
 
-The append-only JSON Lines log currently uses these stable event names:
-`session.started`, `checkpoint.created`, `handoff.generated`, and
-`session.finished`. Every event includes a schema version, event ID, session ID,
-UTC timestamp, event type, and structured payload.
+JSON records and JSON Lines events currently use on-disk `schema_version: 1`;
+the crate version is independent. Optional continuation fields are
+backward-compatible. A valid earlier single-current-session layout remains
+readable without mutation. On the next normal locked mutation, Relay
+materializes the missing `sessions/<id>.json` record while preserving the
+existing current record and history. Unsupported schema versions and malformed
+JSON/JSONL are reported, never silently upgraded, discarded, or overwritten.
+Back up `.relay/` before manual migration or repair.
 
-This repository ignores `.relay/` so its own acceptance runs do not pollute Git
-snapshots. In another project, choose your own version-control policy: ignore
-`.relay/` for private/local coordination, or intentionally track appropriate
-artifacts if the team wants to share them.
+Mutating commands take a nonblocking advisory project lock. Contention fails
+with the recorded owner PID and command when available; the kernel releases
+the lock if a process exits. Read-only commands do not take the mutation lock.
+Multi-file mutations use durable operation markers that record completed
+effects. Individual JSON/Markdown replacements are synced and atomic, and
+events are appended as synced, newline-terminated records. An interruption can
+leave an operation marker or durable partial effects; Relay preserves them for
+diagnosis rather than guessing how to roll them back.
 
-## Git, non-Git, and safety
+Choose your own version-control policy for `.relay/`. Ignore it for private
+local coordination, or intentionally share selected artifacts after reviewing
+their contents. Goals, notes, handoffs, summaries, branch names, commit IDs, and
+changed paths can contain sensitive information. Relay provides no encryption,
+redaction policy beyond context-path privacy, hosted sync, or access control.
 
-Inside Git, Relay records the repository root internally plus the branch,
-commit, cleanliness, and Git-relative changed paths. Generated handoffs and
-final summaries omit the absolute project root. Outside Git, all lifecycle
-commands still work and explicitly mark Git information unavailable.
+## Git behavior and operations
 
-Relay invokes only read-only Git queries. It does not commit, stage, stash,
-reset, rewrite history, push, or edit user files. Mutable JSON and Markdown are
-written through a synced temporary file and atomically replaced; events are
-appended as synced complete lines. Malformed or unsupported session state and
-malformed event lines produce errors instead of being silently replaced or
-discarded.
-Individual state files are protected, but updates spanning several Relay files
-are not atomic as a group; an interruption between writes can leave an orphan
-artifact or event that requires manual inspection.
+Inside Git, Relay records the branch, commit, cleanliness, and project-scoped
+changed paths while excluding its own `.relay/` directory. Non-UTF-8 path bytes
+on Unix are rendered deterministically. Outside Git, lifecycle commands work
+and report Git fields as unavailable.
 
-The files under `openspec/` describe and validate development intent only.
-Relay has no runtime OpenSpec dependency and does not read those files when it
-runs.
+Relay invokes read-only Git queries only. It never commits, stages, stashes,
+checks out, resets, rewrites history, pushes, or edits working files. Relay
+mutates only its selected `.relay/` storage and user-requested completion
+redirection targets.
 
-## MVP limitations
+## Doctor and recovery
 
-Relay supports one active session per current directory and does not search
-parent directories. It has no cross-process locking, daemon, TUI, shell
-integration, hosted synchronization, model integration, automatic
-summarization, agent execution, or Git mutation. Historical events and
-timestamped artifacts remain, but there is no archive/query interface for old
-sessions yet. Git paths must be valid UTF-8 in this milestone.
+`relay doctor` performs byte-preserving diagnostics by default. It reports
+stable codes, severity, relative affected paths, guidance, and health totals
+for malformed or partial JSONL, malformed/unsupported records and artifacts,
+invalid lifecycle combinations, missing references, orphaned artifacts,
+current/history disagreement, and incomplete operation markers.
+
+`relay doctor --repair` is deliberately conservative. It takes the project
+lock and removes only stale operation markers whose listed effects are all
+provably complete. If any ambiguous, incomplete, or potentially destructive
+problem exists, repair is refused without changing it. Inspect diagnostics,
+back up `.relay/`, and resolve such damage manually.
+
+## Current limitations
+
+Relay supports one active session per selected project. It has no daemon, TUI,
+hosted synchronization, provider integration, agent execution, transcript
+import, automatic source inspection, semantic search, encryption, or automatic
+recovery of ambiguous interrupted operations. Advisory locks depend on
+filesystem lock support. Context is deterministic selection and formatting,
+not model-generated summarization. Packaging is currently source installation
+or a locally copied release binary.
+
+The files under `openspec/` describe development intent only. Relay has no
+runtime OpenSpec dependency.

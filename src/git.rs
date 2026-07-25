@@ -24,27 +24,64 @@ pub fn capture(directory: &Path) -> Result<GitSnapshot, GitError> {
     let Some(root) = repository_root(directory)? else {
         return Ok(GitSnapshot::unavailable());
     };
+    let project_prefix = directory.strip_prefix(&root).unwrap_or(Path::new(""));
 
     let branch = optional_text(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     let commit = optional_text(&root, &["rev-parse", "--verify", "HEAD"])?;
-    let status = required_output(
-        &root,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    )?;
-    let changed_files = parse_porcelain_z(&status.stdout, &root)?;
+    let mut status_command = Command::new("git");
+    status_command
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+        ])
+        .arg(if project_prefix.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            project_prefix
+        })
+        .arg({
+            let relay = if project_prefix.as_os_str().is_empty() {
+                ".relay".into()
+            } else {
+                project_prefix.join(".relay")
+            };
+            format!(":(exclude,literal){}", relay.to_string_lossy())
+        })
+        .current_dir(&root);
+    let status = status_command.output().map_err(|source| GitError::Spawn {
+        directory: root.clone(),
+        source,
+    })?;
+    if !status.status.success() {
+        return Err(GitError::Command {
+            directory: root.clone(),
+            message: String::from_utf8_lossy(&status.stderr).trim().to_owned(),
+        });
+    }
+    let (changed_files, escaped) = parse_porcelain_z(&status.stdout, &root, project_prefix)?;
 
     Ok(GitSnapshot {
         schema_version: SCHEMA_VERSION,
         available: true,
-        repository_root: Some(root.to_string_lossy().into_owned()),
+        repository_root: Some(if project_prefix.as_os_str().is_empty() {
+            ".".into()
+        } else {
+            std::iter::repeat_n("..", project_prefix.components().count())
+                .collect::<Vec<_>>()
+                .join("/")
+        }),
         branch,
         commit,
         clean: Some(changed_files.is_empty()),
         changed_files,
+        git_path_encoding: escaped.then(|| "escaped_bytes_v1".into()),
     })
 }
 
-fn repository_root(directory: &Path) -> Result<Option<PathBuf>, GitError> {
+pub fn repository_root(directory: &Path) -> Result<Option<PathBuf>, GitError> {
     let output = run(directory, &["rev-parse", "--show-toplevel"])?;
     if !output.status.success() {
         return Ok(None);
@@ -59,18 +96,6 @@ fn optional_text(directory: &Path, args: &[&str]) -> Result<Option<String>, GitE
         decode_trimmed(output.stdout, directory).map(Some)
     } else {
         Ok(None)
-    }
-}
-
-fn required_output(directory: &Path, args: &[&str]) -> Result<Output, GitError> {
-    let output = run(directory, args)?;
-    if output.status.success() {
-        Ok(output)
-    } else {
-        Err(GitError::Command {
-            directory: directory.to_owned(),
-            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        })
     }
 }
 
@@ -93,11 +118,16 @@ fn decode_trimmed(bytes: Vec<u8>, directory: &Path) -> Result<String, GitError> 
         })
 }
 
-fn parse_porcelain_z(bytes: &[u8], directory: &Path) -> Result<Vec<String>, GitError> {
+fn parse_porcelain_z(
+    bytes: &[u8],
+    directory: &Path,
+    project_prefix: &Path,
+) -> Result<(Vec<String>, bool), GitError> {
     let mut fields = bytes
         .split(|byte| *byte == 0)
         .filter(|field| !field.is_empty());
     let mut paths = Vec::new();
+    let mut escaped = false;
 
     while let Some(record) = fields.next() {
         if record.len() < 4 {
@@ -107,9 +137,9 @@ fn parse_porcelain_z(bytes: &[u8], directory: &Path) -> Result<Vec<String>, GitE
             });
         }
         let status = &record[..2];
-        let path = String::from_utf8(record[3..].to_vec()).map_err(|_| GitError::NonUtf8 {
-            directory: directory.to_owned(),
-        })?;
+        let raw_path = strip_path_prefix(&record[3..], project_prefix);
+        let (path, path_escaped) = display_git_path(raw_path);
+        escaped |= path_escaped;
 
         if matches!(status[0], b'R' | b'C') || matches!(status[1], b'R' | b'C') {
             fields.next().ok_or_else(|| GitError::Command {
@@ -124,7 +154,36 @@ fn parse_porcelain_z(bytes: &[u8], directory: &Path) -> Result<Vec<String>, GitE
 
     paths.sort();
     paths.dedup();
-    Ok(paths)
+    Ok((paths, escaped))
+}
+
+fn strip_path_prefix<'a>(path: &'a [u8], prefix: &Path) -> &'a [u8] {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let prefix = prefix.as_os_str().as_bytes();
+        if !prefix.is_empty() && path.starts_with(prefix) && path.get(prefix.len()) == Some(&b'/') {
+            return &path[prefix.len() + 1..];
+        }
+    }
+    path
+}
+
+fn display_git_path(path: &[u8]) -> (String, bool) {
+    match std::str::from_utf8(path) {
+        Ok(path) => (path.to_owned(), false),
+        Err(_) => {
+            let mut rendered = String::new();
+            for &byte in path {
+                if byte.is_ascii_graphic() && byte != b'\\' {
+                    rendered.push(char::from(byte));
+                } else {
+                    rendered.push_str(&format!("\\x{byte:02X}"));
+                }
+            }
+            (rendered, true)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -163,11 +222,31 @@ mod tests {
         assert_eq!(snapshot.changed_files, ["changed file.txt"]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn captures_an_actual_non_utf8_worktree_path() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init", "--quiet"]);
+        let name = OsString::from_vec(b"invalid-\xFF.txt".to_vec());
+        fs::write(directory.path().join(name), "new").unwrap();
+
+        let snapshot = capture(directory.path()).unwrap();
+
+        assert_eq!(snapshot.changed_files, [r"invalid-\xFF.txt"]);
+        assert_eq!(
+            snapshot.git_path_encoding.as_deref(),
+            Some("escaped_bytes_v1")
+        );
+    }
+
     #[test]
     fn parses_rename_records_and_sorts_paths() {
-        let paths = parse_porcelain_z(
+        let (paths, _) = parse_porcelain_z(
             b"?? zed.txt\0R  renamed.txt\0original.txt\0 M alpha.txt\0",
             Path::new("."),
+            Path::new(""),
         )
         .unwrap();
 
@@ -180,7 +259,7 @@ mod tests {
             let mut porcelain = status.to_vec();
             porcelain.extend_from_slice(b" destination.txt\0source.txt\0?? other.txt\0");
 
-            let paths = parse_porcelain_z(&porcelain, Path::new(".")).unwrap();
+            let (paths, _) = parse_porcelain_z(&porcelain, Path::new("."), Path::new("")).unwrap();
 
             assert_eq!(paths, ["destination.txt", "other.txt"]);
         }
@@ -191,9 +270,18 @@ mod tests {
         for status in [b"R ", b" R", b"C ", b" C"] {
             let mut porcelain = status.to_vec();
             porcelain.extend_from_slice(b" renamed.txt\0");
-            let error = parse_porcelain_z(&porcelain, Path::new(".")).unwrap_err();
+            let error = parse_porcelain_z(&porcelain, Path::new("."), Path::new("")).unwrap_err();
             assert!(matches!(error, GitError::Command { .. }));
             assert!(error.to_string().contains("malformed rename"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escapes_non_utf8_paths_without_loss() {
+        let (paths, escaped) =
+            parse_porcelain_z(b"?? bad-\xFF-name\0", Path::new("."), Path::new("")).unwrap();
+        assert_eq!(paths, [r"bad-\xFF-name"]);
+        assert!(escaped);
     }
 }

@@ -1,14 +1,24 @@
 use crate::{
-    cli::{CheckpointArgs, Command, HandoffArgs, StartArgs},
+    cli::{
+        CheckpointArgs, Command, ContextArgs, DoctorArgs, HandoffArgs, HistoryArgs, NoteArgs,
+        NoteCategory, SessionSelectorArgs, StartArgs,
+    },
     git,
-    model::{Checkpoint, Event, GitSnapshot, SCHEMA_VERSION, Session, SessionState},
+    lock::{self, ProjectLock},
+    model::{
+        Checkpoint, Diagnostic, DiagnosticSeverity, Event, GitSnapshot, OperationEffect,
+        OperationMarker, SCHEMA_VERSION, Session, SessionState,
+    },
     storage::{self, StorageError},
 };
 use chrono::{DateTime, Utc};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
-    fs, io,
+    collections::HashSet,
+    fs,
+    io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -29,6 +39,8 @@ pub enum AppError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Git(#[from] git::GitError),
+    #[error(transparent)]
+    Lock(#[from] lock::LockError),
     #[error("could not access {path}: {source}")]
     Io {
         path: PathBuf,
@@ -41,28 +53,211 @@ pub enum AppError {
         "refusing to use symlinked Relay state path {path}; replace it with a real file or directory inside the project"
     )]
     SymlinkState { path: PathBuf },
+    #[error("injected interruption after {0}")]
+    InjectedFault(String),
 }
 
-pub fn run(command: Command, project: &Path) -> Result<String, AppError> {
+pub struct RunOutput {
+    pub human: String,
+    pub data: Value,
+}
+
+pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
     validate_state_paths(&Paths::new(project))?;
-    match command {
+    if is_mutating(&command)
+        && !matches!(command, Command::Start(_))
+        && !project.join(".relay").exists()
+    {
+        return Err(AppError::Lifecycle(
+            "no Relay session exists in the current directory; run `relay start <goal>` first"
+                .into(),
+        ));
+    }
+    let name = command_name(&command);
+    let _lock = is_mutating(&command)
+        .then(|| ProjectLock::acquire(project, name))
+        .transpose()?;
+    if is_mutating(&command) && !matches!(command, Command::Doctor(_)) {
+        materialize_legacy_session(&Paths::new(project))?;
+    }
+    let human = match command {
         Command::Start(args) => start(project, args),
         Command::Status => status(project),
         Command::Checkpoint(args) => checkpoint(project, args),
         Command::Finish => finish(project),
         Command::Handoff(args) => handoff(project, args),
+        Command::List => return list_output(project),
+        Command::Show(args) => return show_output(project, args),
+        Command::History(args) => return history_output(project, args),
+        Command::Resume(args) => resume(project, args),
+        Command::Doctor(args) => return doctor(project, args),
+        Command::Note(args) => note(project, args),
+        Command::Context(args) => return context(project, args),
+        Command::Completions(_) => unreachable!("completions are handled before project discovery"),
+    }?;
+    Ok(RunOutput {
+        data: command_data(project, name, &human)?,
+        human,
+    })
+}
+
+fn list_output(project: &Path) -> Result<RunOutput, AppError> {
+    let sessions = read_all_sessions(&Paths::new(project))?;
+    Ok(RunOutput {
+        human: if sessions.is_empty() {
+            "No Relay sessions recorded".into()
+        } else {
+            sessions
+                .iter()
+                .map(|session| {
+                    format!(
+                        "{}  {}  {}  {}",
+                        session.id,
+                        state_name(&session.state),
+                        session.started_at.to_rfc3339(),
+                        session.goal
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        data: json!({"sessions": sessions}),
+    })
+}
+
+fn show_output(project: &Path, args: SessionSelectorArgs) -> Result<RunOutput, AppError> {
+    let sessions = read_all_sessions(&Paths::new(project))?;
+    let session = select_session(&sessions, &args.session)?.clone();
+    Ok(RunOutput {
+        human: show(
+            project,
+            SessionSelectorArgs {
+                session: session.id.to_string(),
+            },
+        )?,
+        data: json!({"session": session}),
+    })
+}
+
+fn history_output(project: &Path, args: HistoryArgs) -> Result<RunOutput, AppError> {
+    let paths = Paths::new(project);
+    let all = read_events(&paths.events)?;
+    let selected_id = args
+        .session
+        .as_deref()
+        .map(|selector| {
+            select_session(&read_all_sessions(&paths)?, selector).map(|session| session.id)
+        })
+        .transpose()?;
+    let mut events = all
+        .into_iter()
+        .filter(|event| selected_id.is_none_or(|id| event.session_id == id))
+        .filter(|event| {
+            args.event_type
+                .as_deref()
+                .is_none_or(|kind| event.event_type == kind)
+        })
+        .collect::<Vec<_>>();
+    let truncated = events.len() > args.limit;
+    events.truncate(args.limit);
+    let mut lines = events
+        .iter()
+        .map(|event| {
+            format!(
+                "{}  {}  {}  {}",
+                event.timestamp.to_rfc3339(),
+                event.session_id,
+                event.event_type,
+                event.id
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.push(format!(
+        "Truncated: {}",
+        if truncated { "yes" } else { "no" }
+    ));
+    Ok(RunOutput {
+        human: lines.join("\n"),
+        data: json!({"events": events, "truncated": truncated}),
+    })
+}
+
+fn is_mutating(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Start(_)
+            | Command::Checkpoint(_)
+            | Command::Handoff(_)
+            | Command::Finish
+            | Command::Resume(_)
+            | Command::Note(_)
+            | Command::Doctor(DoctorArgs { repair: true })
+    )
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Start(_) => "start",
+        Command::Status => "status",
+        Command::Checkpoint(_) => "checkpoint",
+        Command::Handoff(_) => "handoff",
+        Command::Finish => "finish",
+        Command::List => "list",
+        Command::Show(_) => "show",
+        Command::History(_) => "history",
+        Command::Resume(_) => "resume",
+        Command::Doctor(_) => "doctor",
+        Command::Note(_) => "note",
+        Command::Context(_) => "context",
+        Command::Completions(_) => "completions",
     }
+}
+
+fn command_data(project: &Path, command: &str, human: &str) -> Result<Value, AppError> {
+    let paths = Paths::new(project);
+    let sessions = read_all_sessions(&paths)?;
+    let events = read_events(&paths.events)?;
+    let current = if paths.session.exists() {
+        Some(read_session(&paths.session)?)
+    } else {
+        None
+    };
+    let latest = events.last();
+    Ok(match command {
+        "list" => json!({ "sessions": sessions }),
+        "show" => json!({ "session": sessions.first() }),
+        "history" => json!({ "events": events, "truncated": human.ends_with("Truncated: yes") }),
+        "handoff" => json!({
+            "session": current,
+            "markdown": human.rsplit_once("\nSaved: ").map(|v| v.0).unwrap_or(human),
+            "path": latest.and_then(|e| e.payload.get("path")),
+        }),
+        "checkpoint" => {
+            json!({ "session": current, "checkpoint": latest.and_then(|e| e.payload.get("checkpoint")), "path": latest.and_then(|e| e.payload.get("path")) })
+        }
+        "finish" => {
+            json!({ "session": current, "summary_path": latest.and_then(|e| e.payload.get("summary_path")) })
+        }
+        "resume" | "start" | "status" => json!({
+            "session": current,
+            "git": git::capture(project)?,
+            "event_count": current.as_ref().map(|s| events.iter().filter(|e| e.session_id == s.id).count()),
+            "project": ".",
+        }),
+        "note" => json!({ "session": current, "note": latest.map(|e| &e.payload) }),
+        _ => json!({}),
+    })
 }
 
 fn start(project: &Path, args: StartArgs) -> Result<String, AppError> {
     let paths = Paths::new(project);
-    if paths.session.exists() {
-        let existing = read_session(&paths.session)?;
-        if existing.state == SessionState::Active {
-            return Err(AppError::Lifecycle(
-                "an active Relay session already exists; finish it before starting another".into(),
-            ));
-        }
+    if read_all_sessions(&paths)?
+        .iter()
+        .any(|session| session.state == SessionState::Active)
+    {
+        return Err(AppError::Lifecycle(
+            "an active Relay session already exists; finish it before starting another".into(),
+        ));
     }
     read_events(&paths.events)?;
 
@@ -78,8 +273,28 @@ fn start(project: &Path, args: StartArgs) -> Result<String, AppError> {
         initial_git: git::capture(project)?,
         final_git: None,
         last_agent: None,
+        resumed_from: None,
     };
+    let mut operation = Operation::begin(
+        &paths,
+        "start",
+        Some(session.id),
+        vec![
+            (
+                "session_record",
+                relative_to_project(project, &paths.session_record(session.id)),
+            ),
+            (
+                "current_session",
+                relative_to_project(project, &paths.session),
+            ),
+            ("event", relative_to_project(project, &paths.events)),
+        ],
+    )?;
+    storage::write_json_atomic(&paths.session_record(session.id), &session)?;
+    operation.advance("session_record")?;
     storage::write_json_atomic(&paths.session, &session)?;
+    operation.advance("current_session")?;
     append_event(
         &paths.events,
         &session,
@@ -87,6 +302,8 @@ fn start(project: &Path, args: StartArgs) -> Result<String, AppError> {
         "session.started",
         json!({ "goal": session.goal, "git": session.initial_git }),
     )?;
+    operation.advance("event")?;
+    operation.complete()?;
 
     Ok(format!(
         "Started Relay session\nGoal: {}\nGit: {}",
@@ -134,10 +351,15 @@ fn status(project: &Path) -> Result<String, AppError> {
         .unwrap_or_else(|| "none".into());
 
     Ok(format!(
-        "Goal: {}\nState: {}\nStarted: {}\nGit branch: {}\nGit commit: {}\nGit clean: {}\nEvents: {}\nLatest checkpoint: {}\nLast agent: {}",
+        "Goal: {}\nSession: {}\nState: {}\nStarted: {}\nResumed from: {}\nProject: .\nGit branch: {}\nGit commit: {}\nGit clean: {}\nEvents: {}\nLatest checkpoint: {}\nLast agent: {}",
         session.goal,
+        session.id,
         state_name(&session.state),
         session.started_at.to_rfc3339(),
+        session
+            .resumed_from
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".into()),
         display_option(live_git.branch.as_deref(), live_git.available),
         display_option(live_git.commit.as_deref(), live_git.available),
         display_clean(&live_git),
@@ -166,7 +388,17 @@ fn checkpoint(project: &Path, args: CheckpointArgs) -> Result<String, AppError> 
         checkpoint.id
     );
     let path = paths.checkpoints.join(filename);
+    let mut operation = Operation::begin(
+        &paths,
+        "checkpoint",
+        Some(session.id),
+        vec![
+            ("artifact", relative_to_project(project, &path)),
+            ("event", relative_to_project(project, &paths.events)),
+        ],
+    )?;
     storage::write_json_atomic(&path, &checkpoint)?;
+    operation.advance("artifact")?;
     let relative = relative_to_project(project, &path);
     append_event(
         &paths.events,
@@ -175,6 +407,8 @@ fn checkpoint(project: &Path, args: CheckpointArgs) -> Result<String, AppError> 
         "checkpoint.created",
         json!({ "checkpoint": checkpoint, "path": relative }),
     )?;
+    operation.advance("event")?;
+    operation.complete()?;
 
     Ok(format!(
         "Checkpoint created: {}\nChanged files: {}",
@@ -192,7 +426,15 @@ fn handoff(project: &Path, args: HandoffArgs) -> Result<String, AppError> {
     let timestamp = Utc::now();
     let live_git = git::capture(project)?;
     let checkpoints = relevant_checkpoints(&events, session.id)?;
-    let markdown = render_handoff(project, &session, &args, &live_git, &checkpoints);
+    let session_notes = recorded_notes(&events, session.id);
+    let markdown = render_handoff(
+        project,
+        &session,
+        &args,
+        &live_git,
+        &checkpoints,
+        &session_notes,
+    );
     let filename = format!(
         "{}-{}.md",
         timestamp.format("%Y%m%dT%H%M%S%.3fZ"),
@@ -200,10 +442,28 @@ fn handoff(project: &Path, args: HandoffArgs) -> Result<String, AppError> {
     );
     let path = paths.handoffs.join(filename);
     let relative = relative_to_project(project, &path);
+    let mut operation = Operation::begin(
+        &paths,
+        "handoff",
+        Some(session.id),
+        vec![
+            ("artifact", relative.clone()),
+            ("event", relative_to_project(project, &paths.events)),
+            (
+                "session_record",
+                relative_to_project(project, &paths.session_record(session.id)),
+            ),
+            (
+                "current_session",
+                relative_to_project(project, &paths.session),
+            ),
+        ],
+    )?;
 
     // Keep the handoff recoverable before recording it, then record history
     // before advancing mutable agent context.
     storage::write_markdown_atomic(&path, &markdown)?;
+    operation.advance("artifact")?;
     append_event(
         &paths.events,
         &session,
@@ -219,8 +479,13 @@ fn handoff(project: &Path, args: HandoffArgs) -> Result<String, AppError> {
             "path": relative,
         }),
     )?;
+    operation.advance("event")?;
     session.last_agent = Some(args.agent);
+    storage::write_json_atomic(&paths.session_record(session.id), &session)?;
+    operation.advance("session_record")?;
     storage::write_json_atomic(&paths.session, &session)?;
+    operation.advance("current_session")?;
+    operation.complete()?;
 
     Ok(format!("{markdown}\nSaved: {relative}"))
 }
@@ -258,23 +523,27 @@ fn render_handoff(
     args: &HandoffArgs,
     git: &GitSnapshot,
     checkpoints: &[Checkpoint],
+    recorded: &[(NoteCategory, String, DateTime<Utc>)],
 ) -> String {
-    let notes = |values: &[String]| {
-        if values.is_empty() {
+    let notes = |values: &[String], category: NoteCategory| {
+        let mut combined = recorded
+            .iter()
+            .filter(|(candidate, _, _)| *candidate == category)
+            .map(|(_, text, _)| text.as_str())
+            .collect::<Vec<_>>();
+        combined.extend(values.iter().map(String::as_str));
+        if combined.is_empty() {
             "Not recorded".into()
         } else {
-            values
+            combined
                 .iter()
                 .map(|value| format!("- {}", safe_markdown_value(project, value)))
                 .collect::<Vec<_>>()
                 .join("\n")
         }
     };
-    let next_action = args
-        .next_action
-        .as_ref()
-        .map(|value| format!("- {}", safe_markdown_value(project, value)))
-        .unwrap_or_else(|| "Not recorded".into());
+    let next_values = args.next_action.iter().cloned().collect::<Vec<_>>();
+    let next_action = notes(&next_values, NoteCategory::NextAction);
     let changed_files = if !git.available {
         "Unavailable (not a Git repository)".into()
     } else if git.changed_files.is_empty() {
@@ -314,9 +583,9 @@ fn render_handoff(
          ## Suggested next action\n\n{}\n\n\
          ## Target agent\n\n{}\n",
         safe_markdown_value(project, &session.goal),
-        notes(&args.completed_work),
-        notes(&args.decision),
-        notes(&args.failure),
+        notes(&args.completed_work, NoteCategory::Progress),
+        notes(&args.decision, NoteCategory::Decision),
+        notes(&args.failure, NoteCategory::Blocker),
         safe_markdown_value(
             project,
             display_option(git.branch.as_deref(), git.available)
@@ -346,16 +615,35 @@ fn safe_markdown_value(project: &Path, value: &str) -> String {
 fn finish(project: &Path) -> Result<String, AppError> {
     let paths = Paths::new(project);
     let mut session = require_active(&paths)?;
-    read_events(&paths.events)?;
+    let events = read_events(&paths.events)?;
     create_state_directories(&paths)?;
     let completed_at = Utc::now();
     let final_git = git::capture(project)?;
     let summary_path = paths.relay.join(format!("summary-{}.md", session.id));
     let summary_relative = relative_to_project(project, &summary_path);
-    let markdown = render_summary(project, &session, completed_at, &final_git);
+    let notes = recorded_notes(&events, session.id);
+    let markdown = render_summary(project, &session, completed_at, &final_git, &notes);
+    let mut operation = Operation::begin(
+        &paths,
+        "finish",
+        Some(session.id),
+        vec![
+            ("artifact", summary_relative.clone()),
+            ("event", relative_to_project(project, &paths.events)),
+            (
+                "session_record",
+                relative_to_project(project, &paths.session_record(session.id)),
+            ),
+            (
+                "current_session",
+                relative_to_project(project, &paths.session),
+            ),
+        ],
+    )?;
 
     // Preserve recoverability: durable artifact and history precede the state transition.
     storage::write_markdown_atomic(&summary_path, &markdown)?;
+    operation.advance("artifact")?;
     append_event(
         &paths.events,
         &session,
@@ -363,10 +651,15 @@ fn finish(project: &Path) -> Result<String, AppError> {
         "session.finished",
         json!({ "git": final_git, "summary_path": summary_relative }),
     )?;
+    operation.advance("event")?;
     session.state = SessionState::Completed;
     session.completed_at = Some(completed_at);
     session.final_git = Some(final_git);
+    storage::write_json_atomic(&paths.session_record(session.id), &session)?;
+    operation.advance("session_record")?;
     storage::write_json_atomic(&paths.session, &session)?;
+    operation.advance("current_session")?;
+    operation.complete()?;
 
     Ok(format!("Session finished\nSummary: {summary_relative}"))
 }
@@ -376,6 +669,7 @@ fn render_summary(
     session: &Session,
     completed_at: DateTime<Utc>,
     git: &GitSnapshot,
+    notes: &[(NoteCategory, String, DateTime<Utc>)],
 ) -> String {
     let changed = if git.available && git.changed_files.is_empty() {
         "None".into()
@@ -388,12 +682,29 @@ fn render_summary(
     } else {
         "Unavailable (not a Git repository)".into()
     };
+    let category = |wanted: NoteCategory| {
+        let values = notes
+            .iter()
+            .filter(|(category, _, _)| *category == wanted)
+            .map(|(_, text, _)| format!("- {}", safe_markdown_value(project, text)))
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            "Not recorded".into()
+        } else {
+            values.join("\n")
+        }
+    };
     format!(
         "# Relay session summary\n\n\
          ## Goal\n\n{}\n\n\
          ## Session\n\n- Started: {}\n- Finished: {}\n- Last agent: {}\n\n\
          ## Final Git state\n\n- Branch: {}\n- Commit: {}\n- Clean: {}\n\n\
-         ## Changed files\n\n{}\n",
+         ## Changed files\n\n{}\n\n\
+         ## Progress\n\n{}\n\n\
+         ## Important decisions\n\n{}\n\n\
+         ## Blockers\n\n{}\n\n\
+         ## Observations\n\n{}\n\n\
+         ## Suggested next actions\n\n{}\n",
         safe_markdown_value(project, &session.goal),
         session.started_at.to_rfc3339(),
         completed_at.to_rfc3339(),
@@ -408,7 +719,1100 @@ fn render_summary(
         ),
         display_clean(git),
         changed,
+        category(NoteCategory::Progress),
+        category(NoteCategory::Decision),
+        category(NoteCategory::Blocker),
+        category(NoteCategory::Observation),
+        category(NoteCategory::NextAction),
     )
+}
+
+fn show(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError> {
+    let sessions = read_all_sessions(&Paths::new(project))?;
+    let session = select_session(&sessions, &args.session)?;
+    Ok(format!(
+        "Session: {}\nGoal: {}\nState: {}\nStarted: {}\nCompleted: {}\nResumed from: {}\nLast agent: {}",
+        session.id,
+        session.goal,
+        state_name(&session.state),
+        session.started_at.to_rfc3339(),
+        session
+            .completed_at
+            .map(|time| time.to_rfc3339())
+            .unwrap_or_else(|| "not completed".into()),
+        session
+            .resumed_from
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".into()),
+        session.last_agent.as_deref().unwrap_or("unknown")
+    ))
+}
+
+fn resume(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError> {
+    let paths = Paths::new(project);
+    if read_all_sessions(&paths)?
+        .iter()
+        .any(|session| session.state == SessionState::Active)
+    {
+        return Err(AppError::Lifecycle(
+            "an active Relay session already exists; finish it before resuming another".into(),
+        ));
+    }
+    let sessions = read_all_sessions(&paths)?;
+    let source = select_session(&sessions, &args.session)?.clone();
+    if source.state != SessionState::Completed {
+        return Err(AppError::Lifecycle(format!(
+            "session {} is active; only completed sessions can be resumed",
+            source.id
+        )));
+    }
+    read_events(&paths.events)?;
+    create_state_directories(&paths)?;
+    let now = Utc::now();
+    let session = Session {
+        schema_version: SCHEMA_VERSION,
+        id: Uuid::new_v4(),
+        goal: source.goal.clone(),
+        state: SessionState::Active,
+        started_at: now,
+        completed_at: None,
+        initial_git: git::capture(project)?,
+        final_git: None,
+        last_agent: None,
+        resumed_from: Some(source.id),
+    };
+    let mut operation = Operation::begin(
+        &paths,
+        "resume",
+        Some(session.id),
+        vec![
+            (
+                "session_record",
+                relative_to_project(project, &paths.session_record(session.id)),
+            ),
+            (
+                "current_session",
+                relative_to_project(project, &paths.session),
+            ),
+            ("event", relative_to_project(project, &paths.events)),
+        ],
+    )?;
+    storage::write_json_atomic(&paths.session_record(session.id), &session)?;
+    operation.advance("session_record")?;
+    storage::write_json_atomic(&paths.session, &session)?;
+    operation.advance("current_session")?;
+    append_event(
+        &paths.events,
+        &session,
+        now,
+        "session.resumed",
+        json!({ "goal": session.goal, "resumed_from": source.id, "git": session.initial_git }),
+    )?;
+    operation.advance("event")?;
+    operation.complete()?;
+    Ok(format!(
+        "Resumed Relay session\nSource: {}\nSession: {}\nGoal: {}",
+        source.id, session.id, session.goal
+    ))
+}
+
+const MAX_NOTE_BYTES: usize = 64 * 1024;
+
+fn note(project: &Path, args: NoteArgs) -> Result<String, AppError> {
+    let paths = Paths::new(project);
+    let session = require_active(&paths)?;
+    let text = read_note_text(args.text, args.stdin, args.editor)?;
+    if text.trim().is_empty() {
+        return Err(AppError::Lifecycle("note text must not be blank".into()));
+    }
+    if text.len() > MAX_NOTE_BYTES {
+        return Err(AppError::Lifecycle(format!(
+            "note exceeds the {MAX_NOTE_BYTES}-byte limit"
+        )));
+    }
+    let timestamp = Utc::now();
+    append_event(
+        &paths.events,
+        &session,
+        timestamp,
+        "note.recorded",
+        json!({"category": args.category.as_str(), "text": text}),
+    )?;
+    Ok(format!(
+        "Recorded {} note for session {}",
+        args.category.as_str(),
+        session.id
+    ))
+}
+
+fn read_note_text(
+    positional: Option<String>,
+    explicit_stdin: bool,
+    editor: bool,
+) -> Result<String, AppError> {
+    if let Some(text) = positional {
+        return Ok(text);
+    }
+    if explicit_stdin {
+        let mut bytes = Vec::new();
+        io::stdin()
+            .take((MAX_NOTE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                AppError::Lifecycle(format!("could not read note from stdin: {error}"))
+            })?;
+        if bytes.len() > MAX_NOTE_BYTES {
+            return Err(AppError::Lifecycle(format!(
+                "note exceeds the {MAX_NOTE_BYTES}-byte limit"
+            )));
+        }
+        return String::from_utf8(bytes)
+            .map_err(|_| AppError::Lifecycle("note input must be valid UTF-8".into()));
+    }
+    if editor || io::stdin().is_terminal() {
+        let editor_command = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".into());
+        let temporary = tempfile::NamedTempFile::new().map_err(|error| {
+            AppError::Lifecycle(format!("could not create editor note file: {error}"))
+        })?;
+        let mut parts = editor_command.split_whitespace();
+        let executable = parts
+            .next()
+            .ok_or_else(|| AppError::Lifecycle("configured editor is blank".into()))?;
+        let status = ProcessCommand::new(executable)
+            .args(parts)
+            .arg(temporary.path())
+            .status()
+            .map_err(|error| AppError::Lifecycle(format!("could not launch editor: {error}")))?;
+        if !status.success() {
+            return Err(AppError::Lifecycle(format!(
+                "editor exited unsuccessfully with {status}"
+            )));
+        }
+        let bytes = fs::read(temporary.path()).map_err(|error| {
+            AppError::Lifecycle(format!("could not read editor note file: {error}"))
+        })?;
+        if bytes.len() > MAX_NOTE_BYTES {
+            return Err(AppError::Lifecycle(format!(
+                "note exceeds the {MAX_NOTE_BYTES}-byte limit"
+            )));
+        }
+        return String::from_utf8(bytes)
+            .map_err(|_| AppError::Lifecycle("editor note must be valid UTF-8".into()));
+    }
+    if !io::stdin().is_terminal() {
+        let mut bytes = Vec::new();
+        io::stdin()
+            .take((MAX_NOTE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                AppError::Lifecycle(format!("could not read note from stdin: {error}"))
+            })?;
+        if bytes.len() > MAX_NOTE_BYTES {
+            return Err(AppError::Lifecycle(format!(
+                "note exceeds the {MAX_NOTE_BYTES}-byte limit"
+            )));
+        }
+        return String::from_utf8(bytes)
+            .map_err(|_| AppError::Lifecycle("note input must be valid UTF-8".into()));
+    }
+    Err(AppError::Lifecycle(
+        "provide note text, pipe stdin, or use --editor".into(),
+    ))
+}
+
+fn recorded_notes(
+    events: &[Event],
+    session_id: Uuid,
+) -> Vec<(NoteCategory, String, DateTime<Utc>)> {
+    events
+        .iter()
+        .filter(|event| event.session_id == session_id && event.event_type == "note.recorded")
+        .filter_map(|event| {
+            let category = match event.payload.get("category")?.as_str()? {
+                "progress" => NoteCategory::Progress,
+                "decision" => NoteCategory::Decision,
+                "blocker" => NoteCategory::Blocker,
+                "observation" => NoteCategory::Observation,
+                "next_action" => NoteCategory::NextAction,
+                _ => return None,
+            };
+            Some((
+                category,
+                event.payload.get("text")?.as_str()?.to_owned(),
+                event.timestamp,
+            ))
+        })
+        .collect()
+}
+
+fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
+    if args.max_chars < 64 {
+        return Err(AppError::Lifecycle(
+            "--max-chars must be at least 64".into(),
+        ));
+    }
+    let paths = Paths::new(project);
+    let sessions = read_all_sessions(&paths)?;
+    let session = if let Some(selector) = args.session.as_deref() {
+        select_session(&sessions, selector)?.clone()
+    } else {
+        require_session(&paths)?
+    };
+    let all_events = read_events(&paths.events)?;
+    let selected_categories: HashSet<_> =
+        args.categories.iter().map(|value| value.as_str()).collect();
+    let selected_kinds: HashSet<_> = args.kinds.iter().map(String::as_str).collect();
+    let mut notes = recorded_notes(&all_events, session.id)
+        .into_iter()
+        .filter(|(category, _, _)| {
+            selected_categories.is_empty() || selected_categories.contains(category.as_str())
+        })
+        .collect::<Vec<_>>();
+    let omitted_notes = notes.len().saturating_sub(args.notes);
+    notes.truncate(args.notes);
+    let mut events = all_events
+        .iter()
+        .filter(|event| event.session_id == session.id)
+        .filter(|event| {
+            selected_kinds.is_empty() || selected_kinds.contains(event.event_type.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let omitted_events = events.len().saturating_sub(args.events);
+    events.truncate(args.events);
+    let mut checkpoints = relevant_checkpoints(&all_events, session.id)?;
+    let omitted_checkpoints = checkpoints.len().saturating_sub(args.checkpoints);
+    checkpoints.truncate(args.checkpoints);
+    let live_git = git::capture(project)?;
+
+    let mut markdown = format!(
+        "# Relay context\n\n## Session\n\n- ID: {}\n- Goal: {}\n- State: {}\n- Resumed from: {}\n- Last agent: {}\n\n## Current Git state\n\n- Branch: {}\n- Commit: {}\n- Clean: {}\n",
+        session.id,
+        safe_markdown_value(project, &session.goal),
+        state_name(&session.state),
+        session
+            .resumed_from
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".into()),
+        safe_markdown_value(
+            project,
+            session.last_agent.as_deref().unwrap_or("not recorded")
+        ),
+        safe_markdown_value(
+            project,
+            display_option(live_git.branch.as_deref(), live_git.available)
+        ),
+        safe_markdown_value(
+            project,
+            display_option(live_git.commit.as_deref(), live_git.available)
+        ),
+        display_clean(&live_git),
+    );
+    let mut budget_truncated = false;
+    for item in notes
+        .iter()
+        .map(|(category, text, time)| {
+            format!(
+                "\n- Note [{}] {} — {}",
+                category.as_str(),
+                time.to_rfc3339(),
+                safe_markdown_value(project, text)
+            )
+        })
+        .chain(checkpoints.iter().map(|checkpoint| {
+            format!(
+                "\n- Checkpoint {} — {}",
+                checkpoint.timestamp.to_rfc3339(),
+                safe_markdown_value(
+                    project,
+                    checkpoint.message.as_deref().unwrap_or("(no message)")
+                )
+            )
+        }))
+        .chain(events.iter().map(|event| {
+            format!(
+                "\n- Event {} — {}",
+                event.timestamp.to_rfc3339(),
+                event.event_type
+            )
+        }))
+    {
+        if markdown.chars().count() + item.chars().count() + 64 <= args.max_chars {
+            markdown.push_str(&item);
+        } else {
+            budget_truncated = true;
+        }
+    }
+    let mut truncated =
+        budget_truncated || omitted_notes > 0 || omitted_events > 0 || omitted_checkpoints > 0;
+    let mut footer = format!(
+        "\n\nTruncated: {}\nOmitted notes: {}\nOmitted checkpoints: {}\nOmitted events: {}\n",
+        if truncated { "yes" } else { "no" },
+        omitted_notes,
+        omitted_checkpoints,
+        omitted_events
+    );
+    if markdown.chars().count() + footer.chars().count() <= args.max_chars {
+        markdown.push_str(&footer);
+    } else {
+        truncated = true;
+        markdown = "# Relay context\n".into();
+        footer = format!(
+            "\nTruncated: yes\nOmitted notes: {}\nOmitted checkpoints: {}\nOmitted events: {}\n",
+            omitted_notes, omitted_checkpoints, omitted_events
+        );
+        markdown.push_str(&footer);
+    }
+    Ok(RunOutput {
+        human: markdown,
+        data: json!({
+            "session": session,
+            "git": live_git,
+            "notes": notes.iter().map(|(category, text, timestamp)| json!({"category": category.as_str(), "text": text, "timestamp": timestamp})).collect::<Vec<_>>(),
+            "checkpoints": checkpoints,
+            "events": events,
+            "truncated": truncated,
+            "omitted": {"notes": omitted_notes, "checkpoints": omitted_checkpoints, "events": omitted_events},
+            "max_chars": args.max_chars,
+            "project": ".",
+        }),
+    })
+}
+
+fn doctor(project: &Path, args: DoctorArgs) -> Result<RunOutput, AppError> {
+    let paths = Paths::new(project);
+    let mut diagnostics = inspect_state(project, &paths);
+    let repairable = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.repairable)
+        .map(|diagnostic| diagnostic.path.clone())
+        .collect::<Vec<_>>();
+    let unsafe_count = diagnostics
+        .iter()
+        .filter(|diagnostic| !diagnostic.repairable)
+        .count();
+    let mut repaired = Vec::new();
+    if args.repair {
+        if unsafe_count > 0 {
+            return Err(AppError::Lifecycle(
+                "doctor refused repair because state contains ambiguous or destructive problems; no repairs were performed".into(),
+            ));
+        }
+        for relative in repairable {
+            let path = project.join(&relative);
+            storage::remove_file_synced(&path)?;
+            repaired.push(relative);
+        }
+        if !repaired.is_empty() {
+            if let Ok(session) = require_active(&paths)
+                && read_events(&paths.events).is_ok()
+            {
+                append_event(
+                    &paths.events,
+                    &session,
+                    Utc::now(),
+                    "doctor.repaired",
+                    json!({"actions": repaired.iter().map(|path| json!({"action": "remove_completed_operation_marker", "path": path})).collect::<Vec<_>>()}),
+                )?;
+            }
+            diagnostics = inspect_state(project, &paths);
+        }
+    }
+    let error_count = diagnostics
+        .iter()
+        .filter(|value| value.severity == DiagnosticSeverity::Error)
+        .count();
+    let warning_count = diagnostics.len() - error_count;
+    let healthy = error_count == 0;
+    let human = if diagnostics.is_empty() {
+        "Relay state is healthy\nErrors: 0\nWarnings: 0".into()
+    } else {
+        let lines = diagnostics
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} [{}] {}: {}\n  Guidance: {}",
+                    match item.severity {
+                        DiagnosticSeverity::Error => "ERROR",
+                        DiagnosticSeverity::Warning => "WARNING",
+                    },
+                    item.code,
+                    item.path,
+                    item.message,
+                    item.guidance
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Relay state diagnostics\nErrors: {error_count}\nWarnings: {warning_count}\n{lines}"
+        )
+    };
+    Ok(RunOutput {
+        human,
+        data: json!({
+            "healthy": healthy,
+            "counts": {"errors": error_count, "warnings": warning_count},
+            "diagnostics": diagnostics,
+            "repaired": repaired,
+        }),
+    })
+}
+
+fn inspect_state(project: &Path, paths: &Paths) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut events = Vec::new();
+    if !paths.relay.exists() {
+        push_diagnostic(
+            &mut diagnostics,
+            "state_missing",
+            DiagnosticSeverity::Error,
+            ".relay",
+            "Relay state directory is missing",
+            "Run `relay start <goal>` at the intended scope.",
+            false,
+        );
+        return diagnostics;
+    }
+    if paths.events.exists() {
+        match fs::read(&paths.events) {
+            Ok(bytes) if !bytes.is_empty() && !bytes.ends_with(b"\n") => push_diagnostic(
+                &mut diagnostics,
+                "events_partial_line",
+                DiagnosticSeverity::Error,
+                ".relay/events.jsonl",
+                "the final JSONL record is not newline-terminated",
+                "Restore the complete line manually; Relay will not truncate the log.",
+                false,
+            ),
+            Ok(bytes) => {
+                for (index, line) in bytes
+                    .strip_suffix(b"\n")
+                    .unwrap_or(&bytes)
+                    .split(|byte| *byte == b'\n')
+                    .enumerate()
+                {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_slice::<Event>(line) {
+                        Ok(event) if event.schema_version != SCHEMA_VERSION => push_diagnostic(
+                            &mut diagnostics,
+                            "unsupported_event_schema",
+                            DiagnosticSeverity::Error,
+                            ".relay/events.jsonl",
+                            &format!(
+                                "event at line {} uses schema version {}",
+                                index + 1,
+                                event.schema_version
+                            ),
+                            "Use a Relay version supporting this schema; it will not be rewritten.",
+                            false,
+                        ),
+                        Ok(event) => events.push(event),
+                        Err(error) => push_diagnostic(
+                            &mut diagnostics,
+                            "events_malformed_json",
+                            DiagnosticSeverity::Error,
+                            ".relay/events.jsonl",
+                            &format!("line {} is malformed: {error}", index + 1),
+                            "Repair the source record manually; Relay will not discard it.",
+                            false,
+                        ),
+                    }
+                }
+            }
+            Err(error) => push_diagnostic(
+                &mut diagnostics,
+                "events_unreadable",
+                DiagnosticSeverity::Error,
+                ".relay/events.jsonl",
+                &error.to_string(),
+                "Correct filesystem permissions or damage manually.",
+                false,
+            ),
+        }
+    } else {
+        push_diagnostic(
+            &mut diagnostics,
+            "events_missing",
+            DiagnosticSeverity::Error,
+            ".relay/events.jsonl",
+            "event log is missing",
+            "Restore it from backup; Relay will not invent history.",
+            false,
+        );
+    }
+
+    let mut sessions = Vec::new();
+    for path in state_json_files(paths) {
+        let relative = relative_to_project(project, &path);
+        match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<Session>(&bytes) {
+                Ok(session) if session.schema_version != SCHEMA_VERSION => push_diagnostic(
+                    &mut diagnostics,
+                    "unsupported_session_schema",
+                    DiagnosticSeverity::Error,
+                    &relative,
+                    &format!("session uses schema version {}", session.schema_version),
+                    "Use a Relay version supporting this schema; it will not be rewritten.",
+                    false,
+                ),
+                Ok(session) => {
+                    let invalid = (session.state == SessionState::Active
+                        && (session.completed_at.is_some() || session.final_git.is_some()))
+                        || (session.state == SessionState::Completed
+                            && (session.completed_at.is_none() || session.final_git.is_none()));
+                    if invalid {
+                        push_diagnostic(
+                            &mut diagnostics,
+                            "invalid_session_lifecycle",
+                            DiagnosticSeverity::Error,
+                            &relative,
+                            "session state disagrees with completion fields",
+                            "Resolve lifecycle truth manually from durable evidence.",
+                            false,
+                        );
+                    }
+                    sessions.push((relative, session));
+                }
+                Err(error) => push_diagnostic(
+                    &mut diagnostics,
+                    "session_malformed_json",
+                    DiagnosticSeverity::Error,
+                    &relative,
+                    &error.to_string(),
+                    "Repair or restore this document manually.",
+                    false,
+                ),
+            },
+            Err(error) => push_diagnostic(
+                &mut diagnostics,
+                "session_unreadable",
+                DiagnosticSeverity::Error,
+                &relative,
+                &error.to_string(),
+                "Correct filesystem permissions or damage manually.",
+                false,
+            ),
+        }
+    }
+    if !paths.session.exists() {
+        push_diagnostic(
+            &mut diagnostics,
+            "current_session_missing",
+            DiagnosticSeverity::Error,
+            ".relay/session.json",
+            "current session record is missing",
+            "Restore it from valid durable evidence; Relay will not guess which session is current.",
+            false,
+        );
+    }
+    if let Some((_, current)) = sessions
+        .iter()
+        .find(|(path, _)| path == ".relay/session.json")
+    {
+        if let Some((relative, durable)) = sessions
+            .iter()
+            .find(|(path, session)| path != ".relay/session.json" && session.id == current.id)
+        {
+            if durable != current {
+                push_diagnostic(
+                    &mut diagnostics,
+                    "current_session_disagrees",
+                    DiagnosticSeverity::Error,
+                    relative,
+                    "current and per-session records disagree",
+                    "Compare durable events and resolve the records manually.",
+                    false,
+                );
+            }
+        } else {
+            push_diagnostic(
+                &mut diagnostics,
+                "session_record_missing",
+                DiagnosticSeverity::Error,
+                &format!(".relay/sessions/{}.json", current.id),
+                "current session has no per-session record",
+                "Run a normal locked mutation only if the current record is known valid.",
+                false,
+            );
+        }
+    }
+    for (_, session) in &sessions {
+        let starts = events
+            .iter()
+            .filter(|event| {
+                event.session_id == session.id
+                    && matches!(
+                        event.event_type.as_str(),
+                        "session.started" | "session.resumed"
+                    )
+            })
+            .count();
+        let finishes = events
+            .iter()
+            .filter(|event| {
+                event.session_id == session.id && event.event_type == "session.finished"
+            })
+            .count();
+        if starts != 1
+            || finishes > 1
+            || (session.state == SessionState::Completed && finishes != 1)
+        {
+            push_diagnostic(
+                &mut diagnostics,
+                "lifecycle_event_inconsistent",
+                DiagnosticSeverity::Error,
+                ".relay/events.jsonl",
+                &format!(
+                    "session {} has {starts} start/resume and {finishes} finish events",
+                    session.id
+                ),
+                "Resolve duplicate or missing lifecycle evidence manually.",
+                false,
+            );
+        }
+    }
+
+    let referenced = events
+        .iter()
+        .filter_map(|event| {
+            event
+                .payload
+                .get("path")
+                .or_else(|| event.payload.get("summary_path"))
+                .and_then(Value::as_str)
+        })
+        .collect::<HashSet<_>>();
+    inspect_artifacts(
+        project,
+        &paths.checkpoints,
+        "checkpoint",
+        &referenced,
+        &mut diagnostics,
+    );
+    inspect_artifacts(
+        project,
+        &paths.handoffs,
+        "handoff",
+        &referenced,
+        &mut diagnostics,
+    );
+    for path in referenced {
+        if !project.join(path).exists() {
+            push_diagnostic(
+                &mut diagnostics,
+                "referenced_artifact_missing",
+                DiagnosticSeverity::Error,
+                path,
+                "an event references a missing artifact",
+                "Restore the referenced artifact; Relay will not reconstruct user content.",
+                false,
+            );
+        }
+    }
+    if paths.operations.exists()
+        && let Ok(entries) = fs::read_dir(&paths.operations)
+    {
+        let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let relative = relative_to_project(project, &entry.path());
+            match storage::read_json::<OperationMarker>(&entry.path()) {
+                Ok(marker) if marker.schema_version != SCHEMA_VERSION => push_diagnostic(
+                    &mut diagnostics,
+                    "unsupported_operation_schema",
+                    DiagnosticSeverity::Error,
+                    &relative,
+                    &format!(
+                        "operation marker uses schema version {}",
+                        marker.schema_version
+                    ),
+                    "Use a compatible Relay version; do not rewrite it.",
+                    false,
+                ),
+                Ok(marker) => {
+                    let complete = operation_is_provably_complete(project, &marker, &events);
+                    if complete {
+                        push_diagnostic(
+                            &mut diagnostics,
+                            "completed_operation_marker",
+                            DiagnosticSeverity::Warning,
+                            &relative,
+                            "all declared effects are complete but the marker remains",
+                            "Run `relay doctor --repair` to remove only this stale marker.",
+                            true,
+                        );
+                    } else {
+                        push_diagnostic(
+                            &mut diagnostics,
+                            "incomplete_operation",
+                            DiagnosticSeverity::Error,
+                            &relative,
+                            "one or more declared effects are incomplete or missing",
+                            "Inspect the listed durable effects and resolve manually; Relay will not guess.",
+                            false,
+                        );
+                    }
+                }
+                Err(error) => push_diagnostic(
+                    &mut diagnostics,
+                    "operation_malformed_json",
+                    DiagnosticSeverity::Error,
+                    &relative,
+                    &error.to_string(),
+                    "Preserve and inspect this interruption evidence manually.",
+                    false,
+                ),
+            }
+        }
+    }
+    diagnostics.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    diagnostics
+}
+
+fn state_json_files(paths: &Paths) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if paths.session.exists() {
+        files.push(paths.session.clone());
+    }
+    if let Ok(entries) = fs::read_dir(&paths.sessions) {
+        files.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("json")),
+        );
+    }
+    files.sort();
+    files
+}
+
+fn operation_is_provably_complete(
+    project: &Path,
+    marker: &OperationMarker,
+    events: &[Event],
+) -> bool {
+    let paths_safe = marker.effects.iter().all(|effect| {
+        let path = Path::new(&effect.path);
+        effect.completed
+            && !path.is_absolute()
+            && path.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+            && effect.path.starts_with(".relay/")
+            && project.join(path).exists()
+    });
+    if !paths_safe {
+        return false;
+    }
+    let expected_event = match marker.command.as_str() {
+        "start" => Some("session.started"),
+        "resume" => Some("session.resumed"),
+        "checkpoint" => Some("checkpoint.created"),
+        "handoff" => Some("handoff.generated"),
+        "finish" => Some("session.finished"),
+        "note" => Some("note.recorded"),
+        "history.materialize" => None,
+        _ => return false,
+    };
+    expected_event.is_none_or(|kind| {
+        marker.session_id.is_some_and(|session_id| {
+            events
+                .iter()
+                .any(|event| event.session_id == session_id && event.event_type == kind)
+        })
+    })
+}
+
+fn inspect_artifacts(
+    project: &Path,
+    directory: &Path,
+    kind: &str,
+    referenced: &HashSet<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let relative = relative_to_project(project, &entry.path());
+        if kind == "checkpoint" && storage::read_json::<Checkpoint>(&entry.path()).is_err() {
+            push_diagnostic(
+                diagnostics,
+                "artifact_malformed",
+                DiagnosticSeverity::Error,
+                &relative,
+                "checkpoint artifact is malformed",
+                "Restore or repair it manually; Relay will not discard it.",
+                false,
+            );
+        }
+        if !referenced.contains(relative.as_str()) {
+            push_diagnostic(
+                diagnostics,
+                "orphaned_artifact",
+                DiagnosticSeverity::Warning,
+                &relative,
+                &format!("{kind} artifact has no matching event reference"),
+                "Preserve it while investigating the interrupted operation.",
+                false,
+            );
+        }
+    }
+}
+
+fn push_diagnostic(
+    diagnostics: &mut Vec<Diagnostic>,
+    code: &str,
+    severity: DiagnosticSeverity,
+    path: &str,
+    message: &str,
+    guidance: &str,
+    repairable: bool,
+) {
+    diagnostics.push(Diagnostic {
+        code: code.into(),
+        severity,
+        path: path.into(),
+        message: message.into(),
+        guidance: guidance.into(),
+        repairable,
+    });
+}
+
+fn read_all_sessions(paths: &Paths) -> Result<Vec<Session>, AppError> {
+    let mut sessions = Vec::new();
+    if paths.sessions.exists() {
+        let mut entries = fs::read_dir(&paths.sessions)
+            .map_err(|source| AppError::Io {
+                path: paths.sessions.clone(),
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| AppError::Io {
+                path: paths.sessions.clone(),
+                source,
+            })?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
+                sessions.push(read_session(&entry.path())?);
+            }
+        }
+    }
+    if paths.session.exists() {
+        let current = read_session(&paths.session)?;
+        if !sessions.iter().any(|session| session.id == current.id) {
+            sessions.push(current);
+        }
+    }
+    let history = read_events(&paths.events)?;
+    for event in &history {
+        if sessions
+            .iter()
+            .any(|session| session.id == event.session_id)
+        {
+            continue;
+        }
+        if event.event_type != "session.started" && event.event_type != "session.resumed" {
+            continue;
+        }
+        let goal = event.payload["goal"]
+            .as_str()
+            .ok_or_else(|| {
+                AppError::Lifecycle(format!(
+                    "{} event {} is missing a goal",
+                    event.event_type, event.id
+                ))
+            })?
+            .to_owned();
+        let initial_git: GitSnapshot = serde_json::from_value(event.payload["git"].clone())
+            .map_err(|error| {
+                AppError::Lifecycle(format!(
+                    "{} event {} has malformed Git data: {error}",
+                    event.event_type, event.id
+                ))
+            })?;
+        validate_git_version(&initial_git)?;
+        let resumed_from = event.payload["resumed_from"]
+            .as_str()
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|error| {
+                AppError::Lifecycle(format!(
+                    "{} event {} has malformed lineage: {error}",
+                    event.event_type, event.id
+                ))
+            })?;
+        let finished = history.iter().find(|candidate| {
+            candidate.session_id == event.session_id && candidate.event_type == "session.finished"
+        });
+        let (state, completed_at, final_git) = if let Some(finished) = finished {
+            let git: GitSnapshot = serde_json::from_value(finished.payload["git"].clone())
+                .map_err(|error| {
+                    AppError::Lifecycle(format!(
+                        "session.finished event {} has malformed Git data: {error}",
+                        finished.id
+                    ))
+                })?;
+            validate_git_version(&git)?;
+            (SessionState::Completed, Some(finished.timestamp), Some(git))
+        } else {
+            (SessionState::Active, None, None)
+        };
+        let last_agent = history
+            .iter()
+            .rev()
+            .find(|candidate| {
+                candidate.session_id == event.session_id
+                    && candidate.event_type == "handoff.generated"
+            })
+            .and_then(|candidate| candidate.payload["agent"].as_str())
+            .map(str::to_owned);
+        sessions.push(Session {
+            schema_version: SCHEMA_VERSION,
+            id: event.session_id,
+            goal,
+            state,
+            started_at: event.timestamp,
+            completed_at,
+            initial_git,
+            final_git,
+            last_agent,
+            resumed_from,
+        });
+    }
+    sessions.sort_by(|left, right| {
+        right
+            .started_at
+            .cmp(&left.started_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(sessions)
+}
+
+fn select_session<'a>(sessions: &'a [Session], selector: &str) -> Result<&'a Session, AppError> {
+    let selector = selector.to_ascii_lowercase();
+    let matches = sessions
+        .iter()
+        .filter(|session| session.id.to_string().starts_with(&selector))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [session] => Ok(session),
+        [] => Err(AppError::Lifecycle(format!(
+            "no Relay session matches `{selector}`"
+        ))),
+        _ => Err(AppError::Lifecycle(format!(
+            "session selector `{selector}` is ambiguous; use more UUID characters"
+        ))),
+    }
+}
+
+fn materialize_legacy_session(paths: &Paths) -> Result<(), AppError> {
+    if !paths.session.exists() {
+        return Ok(());
+    }
+    let session = read_session(&paths.session)?;
+    let record = paths.session_record(session.id);
+    if record.exists() {
+        let existing = read_session(&record)?;
+        if existing != session {
+            return Err(AppError::Lifecycle(format!(
+                "current session {} disagrees with its durable session record; run `relay doctor`",
+                session.id
+            )));
+        }
+        return Ok(());
+    }
+    fs::create_dir_all(&paths.sessions).map_err(|source| AppError::Io {
+        path: paths.sessions.clone(),
+        source,
+    })?;
+    let mut operation = Operation::begin(
+        paths,
+        "history.materialize",
+        Some(session.id),
+        vec![(
+            "session_record",
+            format!(".relay/sessions/{}.json", session.id),
+        )],
+    )?;
+    storage::write_json_atomic(&record, &session)?;
+    operation.advance("session_record")?;
+    operation.complete()
+}
+
+struct Operation {
+    path: PathBuf,
+    marker: OperationMarker,
+}
+
+impl Operation {
+    fn begin(
+        paths: &Paths,
+        command: &str,
+        session_id: Option<Uuid>,
+        effects: Vec<(&str, String)>,
+    ) -> Result<Self, AppError> {
+        fs::create_dir_all(&paths.operations).map_err(|source| AppError::Io {
+            path: paths.operations.clone(),
+            source,
+        })?;
+        let marker = OperationMarker {
+            schema_version: SCHEMA_VERSION,
+            id: Uuid::new_v4(),
+            command: command.into(),
+            session_id,
+            started_at: Utc::now(),
+            effects: effects
+                .into_iter()
+                .map(|(kind, path)| OperationEffect {
+                    kind: kind.into(),
+                    path,
+                    completed: false,
+                })
+                .collect(),
+        };
+        let path = paths.operations.join(format!("{}.json", marker.id));
+        storage::write_json_atomic(&path, &marker)?;
+        Ok(Self { path, marker })
+    }
+
+    fn advance(&mut self, kind: &str) -> Result<(), AppError> {
+        let effect = self
+            .marker
+            .effects
+            .iter_mut()
+            .find(|effect| effect.kind == kind && !effect.completed)
+            .ok_or_else(|| {
+                AppError::Lifecycle(format!("operation has no pending {kind} effect"))
+            })?;
+        effect.completed = true;
+        storage::write_json_atomic(&self.path, &self.marker)?;
+        #[cfg(debug_assertions)]
+        if std::env::var("RELAY_TEST_FAIL_AFTER").as_deref() == Ok(kind) {
+            return Err(AppError::InjectedFault(kind.into()));
+        }
+        Ok(())
+    }
+
+    fn complete(self) -> Result<(), AppError> {
+        storage::remove_file_synced(&self.path)?;
+        Ok(())
+    }
 }
 
 fn require_session(paths: &Paths) -> Result<Session, AppError> {
@@ -506,7 +1910,12 @@ fn validate_git_version(git: &GitSnapshot) -> Result<(), AppError> {
 }
 
 fn create_state_directories(paths: &Paths) -> Result<(), AppError> {
-    for path in [&paths.checkpoints, &paths.handoffs] {
+    for path in [
+        &paths.checkpoints,
+        &paths.handoffs,
+        &paths.sessions,
+        &paths.operations,
+    ] {
         fs::create_dir_all(path).map_err(|source| AppError::Io {
             path: path.to_owned(),
             source,
@@ -522,6 +1931,9 @@ fn validate_state_paths(paths: &Paths) -> Result<(), AppError> {
         &paths.events,
         &paths.checkpoints,
         &paths.handoffs,
+        &paths.sessions,
+        &paths.operations,
+        &paths.lock,
     ] {
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -600,6 +2012,9 @@ struct Paths {
     events: PathBuf,
     checkpoints: PathBuf,
     handoffs: PathBuf,
+    sessions: PathBuf,
+    operations: PathBuf,
+    lock: PathBuf,
 }
 
 impl Paths {
@@ -610,8 +2025,15 @@ impl Paths {
             events: relay.join("events.jsonl"),
             checkpoints: relay.join("checkpoints"),
             handoffs: relay.join("handoffs"),
+            sessions: relay.join("sessions"),
+            operations: relay.join("operations"),
+            lock: relay.join("lock"),
             relay,
         }
+    }
+
+    fn session_record(&self, id: Uuid) -> PathBuf {
+        self.sessions.join(format!("{id}.json"))
     }
 }
 
