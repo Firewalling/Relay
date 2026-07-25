@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-07-25
+goal: Implement start, status, checkpoint, handoff, and finish with inspectable
+  local state.
