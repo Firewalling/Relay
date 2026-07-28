@@ -1,4 +1,4 @@
-use relay::model::{Event, Session, SessionState};
+use relay::model::{Checkpoint, Event, Session, SessionState};
 use std::{
     ffi::OsStr,
     fs,
@@ -90,6 +90,30 @@ fn completion_commands_emit_current_cli_without_project_state() {
 
 fn assert_success(output: &Output) {
     assert!(output.status.success(), "relay failed: {}", stderr(output));
+}
+
+fn json_success_data(output: &Output) -> serde_json::Value {
+    assert_success(output);
+    assert!(output.stderr.is_empty());
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_json_object_has_required_keys(
+        &document,
+        &["command", "data", "ok", "output_schema_version"],
+    );
+    assert_eq!(document["output_schema_version"], 1);
+    assert_eq!(document["ok"], true);
+    assert!(document["data"].is_object());
+    document["data"].clone()
+}
+
+fn assert_json_object_has_required_keys(value: &serde_json::Value, required: &[&str]) {
+    let object = value.as_object().expect("JSON value is an object");
+    for key in required {
+        assert!(
+            object.contains_key(*key),
+            "JSON object is missing required key `{key}`"
+        );
+    }
 }
 
 fn init_repository() -> tempfile::TempDir {
@@ -756,33 +780,207 @@ fn list_recovers_older_supported_legacy_session_from_events() {
 }
 
 #[test]
+fn mutation_results_do_not_rescan_corrupt_unrelated_session_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+
+    assert_success(&relay(project, &["start", "completed historical work"]));
+    assert_success(&relay(project, &["finish"]));
+    let old_session = read_session(project);
+    assert_eq!(old_session.state, SessionState::Completed);
+    assert_success(&relay(project, &["start", "current typed results"]));
+    let current_session = read_session(project);
+    assert_eq!(current_session.state, SessionState::Active);
+    assert_ne!(current_session.id, old_session.id);
+    let current_record: Session = serde_json::from_slice(
+        &fs::read(project.join(format!(".relay/sessions/{}.json", current_session.id))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(current_record, current_session);
+
+    let old_record = project.join(format!(".relay/sessions/{}.json", old_session.id));
+    let corrupt_bytes = b"{ unrelated historical corruption\n";
+    fs::write(&old_record, corrupt_bytes).unwrap();
+
+    let note_text = "Typed results use the completed mutation";
+    let note = relay(project, &["note", "progress", note_text]);
+    assert_success(&note);
+    assert!(note.stderr.is_empty());
+    assert_eq!(
+        stdout(&note).trim_end(),
+        format!("Recorded progress note for session {}", current_session.id)
+    );
+    let note_event = read_events(project).pop().unwrap();
+    assert_eq!(note_event.session_id, current_session.id);
+    assert_eq!(note_event.event_type, "note.recorded");
+    assert_eq!(
+        note_event.payload,
+        serde_json::json!({"category": "progress", "text": note_text})
+    );
+    assert_eq!(fs::read(&old_record).unwrap(), corrupt_bytes);
+
+    let checkpoint_output = relay(project, &["--json", "checkpoint", "typed checkpoint"]);
+    let checkpoint_data = json_success_data(&checkpoint_output);
+    assert_json_object_has_required_keys(&checkpoint_data, &["checkpoint", "path", "session"]);
+    let checkpoint_session: Session =
+        serde_json::from_value(checkpoint_data["session"].clone()).unwrap();
+    assert_eq!(checkpoint_session, current_session);
+    let checkpoint: Checkpoint =
+        serde_json::from_value(checkpoint_data["checkpoint"].clone()).unwrap();
+    assert_eq!(checkpoint.session_id, current_session.id);
+    assert_eq!(checkpoint.message.as_deref(), Some("typed checkpoint"));
+    let checkpoint_path = checkpoint_data["path"].as_str().unwrap();
+    assert!(Path::new(checkpoint_path).is_relative());
+    let saved_checkpoint: Checkpoint =
+        serde_json::from_slice(&fs::read(project.join(checkpoint_path)).unwrap()).unwrap();
+    assert_eq!(saved_checkpoint, checkpoint);
+    let checkpoint_event = read_events(project).pop().unwrap();
+    assert_eq!(checkpoint_event.session_id, current_session.id);
+    assert_eq!(checkpoint_event.event_type, "checkpoint.created");
+    assert_eq!(
+        checkpoint_event.payload["checkpoint"],
+        checkpoint_data["checkpoint"]
+    );
+    assert_eq!(checkpoint_event.payload["path"], checkpoint_data["path"]);
+    assert_eq!(fs::read(&old_record).unwrap(), corrupt_bytes);
+
+    let handoff_output = relay(
+        project,
+        &[
+            "--json",
+            "handoff",
+            "next-agent",
+            "--completed-work",
+            "Returned the durable handoff",
+            "--next-action",
+            "Finish the current session",
+        ],
+    );
+    let handoff_data = json_success_data(&handoff_output);
+    assert_json_object_has_required_keys(&handoff_data, &["markdown", "path", "session"]);
+    let handed_off_session: Session =
+        serde_json::from_value(handoff_data["session"].clone()).unwrap();
+    assert_eq!(handed_off_session.id, current_session.id);
+    assert_eq!(handed_off_session.last_agent.as_deref(), Some("next-agent"));
+    assert_eq!(handed_off_session, read_session(project));
+    let handoff_path = handoff_data["path"].as_str().unwrap();
+    assert!(Path::new(handoff_path).is_relative());
+    assert_eq!(
+        fs::read(project.join(handoff_path)).unwrap(),
+        handoff_data["markdown"].as_str().unwrap().as_bytes()
+    );
+    assert_eq!(fs::read(&old_record).unwrap(), corrupt_bytes);
+
+    let finish_output = relay(project, &["--json", "finish"]);
+    let finish_data = json_success_data(&finish_output);
+    assert_json_object_has_required_keys(&finish_data, &["session", "summary_path"]);
+    let finished_session: Session = serde_json::from_value(finish_data["session"].clone()).unwrap();
+    assert_eq!(finished_session.id, current_session.id);
+    assert_eq!(finished_session.state, SessionState::Completed);
+    assert_eq!(finished_session, read_session(project));
+    let summary_path = finish_data["summary_path"].as_str().unwrap();
+    assert!(Path::new(summary_path).is_relative());
+    assert!(project.join(summary_path).is_file());
+    let finish_event = read_events(project).pop().unwrap();
+    assert_eq!(finish_event.event_type, "session.finished");
+    assert_eq!(finish_event.session_id, current_session.id);
+    assert_eq!(
+        finish_event.payload["summary_path"],
+        finish_data["summary_path"]
+    );
+    assert_eq!(fs::read(&old_record).unwrap(), corrupt_bytes);
+}
+
+#[test]
 fn json_envelopes_are_single_typed_documents_and_failures_stay_on_stderr() {
     let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+
+    let started = relay(project, &["--json", "start", "json goal"]);
+    let start_data = json_success_data(&started);
+    assert_json_object_has_required_keys(
+        &start_data,
+        &["event_count", "git", "project", "session"],
+    );
+    let started_session: Session = serde_json::from_value(start_data["session"].clone()).unwrap();
+    assert_eq!(started_session, read_session(project));
+    assert_eq!(
+        start_data["git"],
+        serde_json::to_value(&started_session.initial_git).unwrap()
+    );
+    assert_eq!(start_data["event_count"], 1);
+    assert_eq!(start_data["project"], ".");
+    assert!(!String::from_utf8_lossy(&started.stdout).contains(project.to_string_lossy().as_ref()));
+
+    let note = relay(project, &["--json", "note", "decision", "Keep typed data"]);
+    let note_data = json_success_data(&note);
+    assert_json_object_has_required_keys(&note_data, &["note", "session"]);
+    let note_session: Session = serde_json::from_value(note_data["session"].clone()).unwrap();
+    assert_eq!(note_session, read_session(project));
+    assert_json_object_has_required_keys(&note_data["note"], &["category", "text"]);
+    assert_eq!(
+        note_data["note"],
+        serde_json::json!({"category": "decision", "text": "Keep typed data"})
+    );
+    assert_eq!(
+        read_events(project).last().unwrap().payload,
+        note_data["note"]
+    );
+
     for args in [
-        vec!["--json", "start", "json goal"],
         vec!["--json", "status"],
         vec!["--json", "checkpoint", "typed"],
         vec!["--json", "handoff", "codex"],
         vec!["--json", "list"],
         vec!["--json", "history", "--limit", "2"],
-        vec!["--json", "finish"],
     ] {
-        let output = relay(directory.path(), &args);
-        assert_success(&output);
-        assert!(output.stderr.is_empty());
-        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(document["output_schema_version"], 1);
-        assert_eq!(document["ok"], true);
-        assert!(document["data"].is_object());
+        let output = relay(project, &args);
+        let data = json_success_data(&output);
         assert!(
-            !String::from_utf8_lossy(&output.stdout)
-                .contains(directory.path().to_string_lossy().as_ref())
+            !String::from_utf8_lossy(&output.stdout).contains(project.to_string_lossy().as_ref())
         );
+        assert!(data.is_object());
     }
-    let failed = relay(directory.path(), &["--json", "finish"]);
+
+    let finished = relay(project, &["--json", "finish"]);
+    let finish_data = json_success_data(&finished);
+    let completed_session: Session =
+        serde_json::from_value(finish_data["session"].clone()).unwrap();
+    assert_eq!(completed_session.state, SessionState::Completed);
+    assert!(
+        !String::from_utf8_lossy(&finished.stdout).contains(project.to_string_lossy().as_ref())
+    );
+
+    let completed_id = completed_session.id.to_string();
+    let resumed = relay(project, &["--json", "resume", &completed_id]);
+    let resume_data = json_success_data(&resumed);
+    assert_json_object_has_required_keys(
+        &resume_data,
+        &["event_count", "git", "project", "session"],
+    );
+    let resumed_session: Session = serde_json::from_value(resume_data["session"].clone()).unwrap();
+    assert_eq!(resumed_session, read_session(project));
+    assert_eq!(resumed_session.resumed_from, Some(completed_session.id));
+    assert_eq!(
+        resume_data["git"],
+        serde_json::to_value(&resumed_session.initial_git).unwrap()
+    );
+    assert_eq!(resume_data["event_count"], 1);
+    assert_eq!(resume_data["project"], ".");
+    assert!(!String::from_utf8_lossy(&resumed.stdout).contains(project.to_string_lossy().as_ref()));
+
+    assert_success(&relay(project, &["finish"]));
+    let failed = relay(project, &["--json", "finish"]);
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
     let document: serde_json::Value = serde_json::from_slice(&failed.stderr).unwrap();
+    assert_json_object_has_required_keys(
+        &document,
+        &["command", "error", "ok", "output_schema_version"],
+    );
+    assert_json_object_has_required_keys(&document["error"], &["code", "message"]);
+    assert_eq!(document["output_schema_version"], 1);
+    assert_eq!(document["command"], "finish");
     assert_eq!(document["ok"], false);
     assert_eq!(document["error"]["code"], "lifecycle_error");
 }

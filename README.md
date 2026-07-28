@@ -97,6 +97,9 @@ Relay supports these commands:
 before or after a subcommand. Human output remains the default. `--json` emits
 one versioned success document on stdout, or one versioned error document on
 stderr; `output_schema_version` is separate from the on-disk schema version.
+For mutating commands, human and JSON output are rendered from the operation's
+typed result; Relay does not reconstruct a completed mutation by rescanning
+unrelated historical records.
 Completions are shell text regardless of global output options.
 
 ## Notes

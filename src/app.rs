@@ -62,6 +62,198 @@ pub struct RunOutput {
     pub data: Value,
 }
 
+trait IntoRunOutput {
+    fn into_run_output(self) -> RunOutput;
+}
+
+#[derive(Debug)]
+struct StartResult {
+    session: Session,
+}
+
+impl IntoRunOutput for StartResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = format!(
+            "Started Relay session\nGoal: {}\nGit: {}",
+            self.session.goal,
+            format_git(&self.session.initial_git)
+        );
+        let data = json!({
+            "session": &self.session,
+            "git": &self.session.initial_git,
+            "event_count": 1,
+            "project": ".",
+        });
+        RunOutput { human, data }
+    }
+}
+
+#[derive(Debug)]
+struct CheckpointResult {
+    session: Session,
+    checkpoint: Checkpoint,
+    path: String,
+}
+
+impl IntoRunOutput for CheckpointResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = format!(
+            "Checkpoint created: {}\nChanged files: {}",
+            self.path,
+            format_changed_files(&self.checkpoint.git)
+        );
+        let data = json!({
+            "session": &self.session,
+            "checkpoint": &self.checkpoint,
+            "path": &self.path,
+        });
+        RunOutput { human, data }
+    }
+}
+
+#[derive(Debug)]
+struct HandoffResult {
+    session: Session,
+    markdown: String,
+    path: String,
+}
+
+impl IntoRunOutput for HandoffResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = format!("{}\nSaved: {}", self.markdown, self.path);
+        let data = json!({
+            "session": &self.session,
+            "markdown": &self.markdown,
+            "path": &self.path,
+        });
+        RunOutput { human, data }
+    }
+}
+
+#[derive(Debug)]
+struct FinishResult {
+    session: Session,
+    summary_path: String,
+}
+
+impl IntoRunOutput for FinishResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = format!("Session finished\nSummary: {}", self.summary_path);
+        let data = json!({
+            "session": &self.session,
+            "summary_path": &self.summary_path,
+        });
+        RunOutput { human, data }
+    }
+}
+
+#[derive(Debug)]
+struct ResumeResult {
+    source_id: Uuid,
+    session: Session,
+}
+
+impl IntoRunOutput for ResumeResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = format!(
+            "Resumed Relay session\nSource: {}\nSession: {}\nGoal: {}",
+            self.source_id, self.session.id, self.session.goal
+        );
+        let data = json!({
+            "session": &self.session,
+            "git": &self.session.initial_git,
+            "event_count": 1,
+            "project": ".",
+        });
+        RunOutput { human, data }
+    }
+}
+
+#[derive(Debug)]
+struct NoteValue {
+    category: NoteCategory,
+    text: String,
+}
+
+#[derive(Debug)]
+struct NoteResult {
+    session: Session,
+    note: NoteValue,
+}
+
+impl IntoRunOutput for NoteResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = format!(
+            "Recorded {} note for session {}",
+            self.note.category.as_str(),
+            self.session.id
+        );
+        let data = json!({
+            "session": &self.session,
+            "note": {
+                "category": self.note.category.as_str(),
+                "text": &self.note.text,
+            },
+        });
+        RunOutput { human, data }
+    }
+}
+
+#[derive(Debug)]
+struct DoctorCounts {
+    errors: usize,
+    warnings: usize,
+}
+
+#[derive(Debug)]
+struct DoctorResult {
+    healthy: bool,
+    counts: DoctorCounts,
+    diagnostics: Vec<Diagnostic>,
+    repaired: Vec<String>,
+}
+
+impl IntoRunOutput for DoctorResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = if self.diagnostics.is_empty() {
+            "Relay state is healthy\nErrors: 0\nWarnings: 0".into()
+        } else {
+            let lines = self
+                .diagnostics
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{} [{}] {}: {}\n  Guidance: {}",
+                        match item.severity {
+                            DiagnosticSeverity::Error => "ERROR",
+                            DiagnosticSeverity::Warning => "WARNING",
+                        },
+                        item.code,
+                        item.path,
+                        item.message,
+                        item.guidance
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "Relay state diagnostics\nErrors: {}\nWarnings: {}\n{lines}",
+                self.counts.errors, self.counts.warnings
+            )
+        };
+        let data = json!({
+            "healthy": self.healthy,
+            "counts": {
+                "errors": self.counts.errors,
+                "warnings": self.counts.warnings,
+            },
+            "diagnostics": &self.diagnostics,
+            "repaired": &self.repaired,
+        });
+        RunOutput { human, data }
+    }
+}
+
 pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
     validate_state_paths(&Paths::new(project))?;
     if is_mutating(&command)
@@ -80,25 +272,22 @@ pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
     if is_mutating(&command) && !matches!(command, Command::Doctor(_)) {
         materialize_legacy_session(&Paths::new(project))?;
     }
-    let human = match command {
-        Command::Start(args) => start(project, args),
-        Command::Status => status(project),
-        Command::Checkpoint(args) => checkpoint(project, args),
-        Command::Finish => finish(project),
-        Command::Handoff(args) => handoff(project, args),
-        Command::List => return list_output(project),
-        Command::Show(args) => return show_output(project, args),
-        Command::History(args) => return history_output(project, args),
-        Command::Resume(args) => resume(project, args),
-        Command::Doctor(args) => return doctor(project, args),
-        Command::Note(args) => note(project, args),
-        Command::Context(args) => return context(project, args),
+    let output = match command {
+        Command::Start(args) => start(project, args)?.into_run_output(),
+        Command::Status => status(project)?,
+        Command::Checkpoint(args) => checkpoint(project, args)?.into_run_output(),
+        Command::Finish => finish(project)?.into_run_output(),
+        Command::Handoff(args) => handoff(project, args)?.into_run_output(),
+        Command::List => list_output(project)?,
+        Command::Show(args) => show_output(project, args)?,
+        Command::History(args) => history_output(project, args)?,
+        Command::Resume(args) => resume(project, args)?.into_run_output(),
+        Command::Doctor(args) => doctor(project, args)?.into_run_output(),
+        Command::Note(args) => note(project, args)?.into_run_output(),
+        Command::Context(args) => context(project, args)?,
         Command::Completions(_) => unreachable!("completions are handled before project discovery"),
-    }?;
-    Ok(RunOutput {
-        data: command_data(project, name, &human)?,
-        human,
-    })
+    };
+    Ok(output)
 }
 
 fn list_output(project: &Path) -> Result<RunOutput, AppError> {
@@ -213,43 +402,7 @@ fn command_name(command: &Command) -> &'static str {
     }
 }
 
-fn command_data(project: &Path, command: &str, human: &str) -> Result<Value, AppError> {
-    let paths = Paths::new(project);
-    let sessions = read_all_sessions(&paths)?;
-    let events = read_events(&paths.events)?;
-    let current = if paths.session.exists() {
-        Some(read_session(&paths.session)?)
-    } else {
-        None
-    };
-    let latest = events.last();
-    Ok(match command {
-        "list" => json!({ "sessions": sessions }),
-        "show" => json!({ "session": sessions.first() }),
-        "history" => json!({ "events": events, "truncated": human.ends_with("Truncated: yes") }),
-        "handoff" => json!({
-            "session": current,
-            "markdown": human.rsplit_once("\nSaved: ").map(|v| v.0).unwrap_or(human),
-            "path": latest.and_then(|e| e.payload.get("path")),
-        }),
-        "checkpoint" => {
-            json!({ "session": current, "checkpoint": latest.and_then(|e| e.payload.get("checkpoint")), "path": latest.and_then(|e| e.payload.get("path")) })
-        }
-        "finish" => {
-            json!({ "session": current, "summary_path": latest.and_then(|e| e.payload.get("summary_path")) })
-        }
-        "resume" | "start" | "status" => json!({
-            "session": current,
-            "git": git::capture(project)?,
-            "event_count": current.as_ref().map(|s| events.iter().filter(|e| e.session_id == s.id).count()),
-            "project": ".",
-        }),
-        "note" => json!({ "session": current, "note": latest.map(|e| &e.payload) }),
-        _ => json!({}),
-    })
-}
-
-fn start(project: &Path, args: StartArgs) -> Result<String, AppError> {
+fn start(project: &Path, args: StartArgs) -> Result<StartResult, AppError> {
     let paths = Paths::new(project);
     if read_all_sessions(&paths)?
         .iter()
@@ -305,26 +458,22 @@ fn start(project: &Path, args: StartArgs) -> Result<String, AppError> {
     operation.advance("event")?;
     operation.complete()?;
 
-    Ok(format!(
-        "Started Relay session\nGoal: {}\nGit: {}",
-        session.goal,
-        format_git(&session.initial_git)
-    ))
+    Ok(StartResult { session })
 }
 
-fn status(project: &Path) -> Result<String, AppError> {
+fn status(project: &Path) -> Result<RunOutput, AppError> {
     let paths = Paths::new(project);
     let session = require_session(&paths)?;
     let events = read_events(&paths.events)?;
     let live_git = git::capture(project)?;
-    let session_events: Vec<_> = events
+    let event_count = events
         .iter()
         .filter(|event| event.session_id == session.id)
-        .collect();
-    let latest_checkpoint = session_events
+        .count();
+    let latest_checkpoint = events
         .iter()
         .rev()
-        .find(|event| event.event_type == "checkpoint.created")
+        .find(|event| event.session_id == session.id && event.event_type == "checkpoint.created")
         .map(|event| {
             let checkpoint: Checkpoint = serde_json::from_value(
                 event.payload.get("checkpoint").cloned().ok_or_else(|| {
@@ -350,7 +499,7 @@ fn status(project: &Path) -> Result<String, AppError> {
         })
         .unwrap_or_else(|| "none".into());
 
-    Ok(format!(
+    let human = format!(
         "Goal: {}\nSession: {}\nState: {}\nStarted: {}\nResumed from: {}\nProject: .\nGit branch: {}\nGit commit: {}\nGit clean: {}\nEvents: {}\nLatest checkpoint: {}\nLast agent: {}",
         session.goal,
         session.id,
@@ -363,13 +512,20 @@ fn status(project: &Path) -> Result<String, AppError> {
         display_option(live_git.branch.as_deref(), live_git.available),
         display_option(live_git.commit.as_deref(), live_git.available),
         display_clean(&live_git),
-        session_events.len(),
+        event_count,
         latest,
         session.last_agent.as_deref().unwrap_or("unknown"),
-    ))
+    );
+    let data = json!({
+        "session": &session,
+        "git": &live_git,
+        "event_count": event_count,
+        "project": ".",
+    });
+    Ok(RunOutput { human, data })
 }
 
-fn checkpoint(project: &Path, args: CheckpointArgs) -> Result<String, AppError> {
+fn checkpoint(project: &Path, args: CheckpointArgs) -> Result<CheckpointResult, AppError> {
     let paths = Paths::new(project);
     let session = require_active(&paths)?;
     read_events(&paths.events)?;
@@ -410,14 +566,14 @@ fn checkpoint(project: &Path, args: CheckpointArgs) -> Result<String, AppError> 
     operation.advance("event")?;
     operation.complete()?;
 
-    Ok(format!(
-        "Checkpoint created: {}\nChanged files: {}",
-        relative,
-        format_changed_files(&checkpoint.git)
-    ))
+    Ok(CheckpointResult {
+        session,
+        checkpoint,
+        path: relative,
+    })
 }
 
-fn handoff(project: &Path, args: HandoffArgs) -> Result<String, AppError> {
+fn handoff(project: &Path, args: HandoffArgs) -> Result<HandoffResult, AppError> {
     let paths = Paths::new(project);
     let mut session = require_active(&paths)?;
     let events = read_events(&paths.events)?;
@@ -487,7 +643,11 @@ fn handoff(project: &Path, args: HandoffArgs) -> Result<String, AppError> {
     operation.advance("current_session")?;
     operation.complete()?;
 
-    Ok(format!("{markdown}\nSaved: {relative}"))
+    Ok(HandoffResult {
+        session,
+        markdown,
+        path: relative,
+    })
 }
 
 fn relevant_checkpoints(
@@ -615,7 +775,7 @@ fn safe_markdown_value(project: &Path, value: &str) -> String {
     }
 }
 
-fn finish(project: &Path) -> Result<String, AppError> {
+fn finish(project: &Path) -> Result<FinishResult, AppError> {
     let paths = Paths::new(project);
     let mut session = require_active(&paths)?;
     let events = read_events(&paths.events)?;
@@ -664,7 +824,10 @@ fn finish(project: &Path) -> Result<String, AppError> {
     operation.advance("current_session")?;
     operation.complete()?;
 
-    Ok(format!("Session finished\nSummary: {summary_relative}"))
+    Ok(FinishResult {
+        session,
+        summary_path: summary_relative,
+    })
 }
 
 fn render_summary(
@@ -751,7 +914,7 @@ fn show(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError> {
     ))
 }
 
-fn resume(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError> {
+fn resume(project: &Path, args: SessionSelectorArgs) -> Result<ResumeResult, AppError> {
     let paths = Paths::new(project);
     if read_all_sessions(&paths)?
         .iter()
@@ -762,27 +925,29 @@ fn resume(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError>
         ));
     }
     let sessions = read_all_sessions(&paths)?;
-    let source = select_session(&sessions, &args.session)?.clone();
+    let source = select_session(&sessions, &args.session)?;
     if source.state != SessionState::Completed {
         return Err(AppError::Lifecycle(format!(
             "session {} is active; only completed sessions can be resumed",
             source.id
         )));
     }
+    let source_id = source.id;
+    let goal = source.goal.clone();
     read_events(&paths.events)?;
     create_state_directories(&paths)?;
     let now = Utc::now();
     let session = Session {
         schema_version: SCHEMA_VERSION,
         id: Uuid::new_v4(),
-        goal: source.goal.clone(),
+        goal,
         state: SessionState::Active,
         started_at: now,
         completed_at: None,
         initial_git: git::capture(project)?,
         final_git: None,
         last_agent: None,
-        resumed_from: Some(source.id),
+        resumed_from: Some(source_id),
     };
     let mut operation = Operation::begin(
         &paths,
@@ -809,19 +974,16 @@ fn resume(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError>
         &session,
         now,
         "session.resumed",
-        json!({ "goal": session.goal, "resumed_from": source.id, "git": session.initial_git }),
+        json!({ "goal": session.goal, "resumed_from": source_id, "git": session.initial_git }),
     )?;
     operation.advance("event")?;
     operation.complete()?;
-    Ok(format!(
-        "Resumed Relay session\nSource: {}\nSession: {}\nGoal: {}",
-        source.id, session.id, session.goal
-    ))
+    Ok(ResumeResult { source_id, session })
 }
 
 const MAX_NOTE_BYTES: usize = 64 * 1024;
 
-fn note(project: &Path, args: NoteArgs) -> Result<String, AppError> {
+fn note(project: &Path, args: NoteArgs) -> Result<NoteResult, AppError> {
     let paths = Paths::new(project);
     let session = require_active(&paths)?;
     let text = read_note_text(args.text, args.stdin, args.editor)?;
@@ -841,11 +1003,13 @@ fn note(project: &Path, args: NoteArgs) -> Result<String, AppError> {
         "note.recorded",
         json!({"category": args.category.as_str(), "text": text}),
     )?;
-    Ok(format!(
-        "Recorded {} note for session {}",
-        args.category.as_str(),
-        session.id
-    ))
+    Ok(NoteResult {
+        session,
+        note: NoteValue {
+            category: args.category,
+            text,
+        },
+    })
 }
 
 fn read_note_text(
@@ -1329,7 +1493,7 @@ fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
     })
 }
 
-fn doctor(project: &Path, args: DoctorArgs) -> Result<RunOutput, AppError> {
+fn doctor(project: &Path, args: DoctorArgs) -> Result<DoctorResult, AppError> {
     let paths = Paths::new(project);
     let mut diagnostics = inspect_state(project, &paths);
     let repairable = diagnostics
@@ -1372,40 +1536,15 @@ fn doctor(project: &Path, args: DoctorArgs) -> Result<RunOutput, AppError> {
         .iter()
         .filter(|value| value.severity == DiagnosticSeverity::Error)
         .count();
-    let warning_count = diagnostics.len() - error_count;
-    let healthy = error_count == 0;
-    let human = if diagnostics.is_empty() {
-        "Relay state is healthy\nErrors: 0\nWarnings: 0".into()
-    } else {
-        let lines = diagnostics
-            .iter()
-            .map(|item| {
-                format!(
-                    "{} [{}] {}: {}\n  Guidance: {}",
-                    match item.severity {
-                        DiagnosticSeverity::Error => "ERROR",
-                        DiagnosticSeverity::Warning => "WARNING",
-                    },
-                    item.code,
-                    item.path,
-                    item.message,
-                    item.guidance
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "Relay state diagnostics\nErrors: {error_count}\nWarnings: {warning_count}\n{lines}"
-        )
+    let counts = DoctorCounts {
+        errors: error_count,
+        warnings: diagnostics.len() - error_count,
     };
-    Ok(RunOutput {
-        human,
-        data: json!({
-            "healthy": healthy,
-            "counts": {"errors": error_count, "warnings": warning_count},
-            "diagnostics": diagnostics,
-            "repaired": repaired,
-        }),
+    Ok(DoctorResult {
+        healthy: counts.errors == 0,
+        counts,
+        diagnostics,
+        repaired,
     })
 }
 
@@ -2319,12 +2458,12 @@ mod tests {
             },
         )
         .unwrap();
-        let status_output = status(directory.path()).unwrap();
+        let status_output = status(directory.path()).unwrap().human;
         assert!(status_output.contains("Events: 2"));
         assert!(status_output.contains("first"));
         assert!(status_output.contains("Git branch: unavailable"));
 
-        let finish_output = finish(directory.path()).unwrap();
+        let finish_output = finish(directory.path()).unwrap().into_run_output().human;
         let session = read_session(&directory.path().join(".relay/session.json")).unwrap();
         assert_eq!(session.state, SessionState::Completed);
         assert!(finish_output.contains("Summary: .relay/summary-"));
@@ -2421,7 +2560,10 @@ mod tests {
         )
         .unwrap();
 
-        let output = handoff(directory.path(), handoff_args("omp")).unwrap();
+        let output = handoff(directory.path(), handoff_args("omp"))
+            .unwrap()
+            .into_run_output()
+            .human;
         let headings = output
             .lines()
             .filter(|line| line.starts_with("## "))
@@ -2463,7 +2605,10 @@ mod tests {
             next_action: Some("review diff".into()),
         };
 
-        let output = handoff(directory.path(), args).unwrap();
+        let output = handoff(directory.path(), args)
+            .unwrap()
+            .into_run_output()
+            .human;
         assert!(output.contains("- implemented flow\n- ran tests"));
         assert!(output.contains("- keep JSONL"));
         assert!(output.contains("- network unavailable"));
@@ -2498,7 +2643,10 @@ mod tests {
         let mut args = handoff_args("../../escape\n## Injected");
         args.completed_work = vec![format!("inspected {private_root}")];
 
-        let output = handoff(directory.path(), args).unwrap();
+        let output = handoff(directory.path(), args)
+            .unwrap()
+            .into_run_output()
+            .human;
         assert!(!output.contains(&private_root));
         assert!(!output.contains("\n## Injected"));
         let events = read_events(&directory.path().join(".relay/events.jsonl")).unwrap();

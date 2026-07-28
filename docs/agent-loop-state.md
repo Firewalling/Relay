@@ -217,3 +217,79 @@ cargo test --all-targets --all-features                   PASS (53 tests)
 1. Make mutating commands return first-class typed results so successful durable writes cannot be reported as failures because unrelated historical records are corrupt.
 2. Add an inspected deterministic subset of context/history navigation, such as latest-session selection, reverse display, or time bounds, without changing existing defaults.
 3. Add deterministic local search across recorded sessions, event types, note categories, times, and plain substrings without hosted services or inferred relevance.
+
+## Cycle 4 — typed mutation results
+
+### Repository baseline
+
+- The working tree was clean on `feat/relay-daily-driver` at `61909b2` before this cycle. The local branch was two verified cycles ahead of `origin/feat/relay-daily-driver`.
+- Mutating functions returned only human strings. After durable effects completed, generic `command_data` rescanned every session and event, recaptured Git, assumed the last event belonged to the command, and parsed the handoff path from a human suffix.
+- An unrelated malformed historical session record could therefore make a successfully appended note or completed artifact mutation exit as a failure during output reconstruction.
+- This cycle implements only typed mutation results. It does not begin navigation, search, Go orchestration, or Lua workflows.
+
+### Selected improvement and rationale
+
+Make each mutation return its own typed result after durable effects complete, then render both human and versioned JSON output directly from that result. A command that has safely completed its write must not be reclassified as failed because unrelated historical records cannot be rescanned or because generic reconstruction guesses the wrong latest event.
+
+### Focused implementation plan
+
+1. Define private typed results for start, checkpoint, handoff, finish, resume, note, and doctor.
+2. Preserve existing human wording and JSON field names while rendering from operation-owned session, Git, artifact, path, Markdown, and note values.
+3. Remove generic post-dispatch history rescans, latest-event assumptions, handoff suffix parsing, and second Git captures.
+4. Assemble status directly from one coherent read set so the generic reconstruction function can be deleted.
+5. Prove durable mutation output survives unrelated historical corruption and corresponds exactly to current artifacts, events, sessions, and additive-compatible envelopes.
+
+### Cycle outcome
+
+#### Implemented
+
+- `start`, `checkpoint`, `handoff`, `finish`, `resume`, `note`, and `doctor` now return command-specific typed result objects. A small infallible conversion layer renders each result into the existing human text and JSON object.
+- Start and resume reuse the Git snapshot already stored in their new session and report the deterministic single creation event. Checkpoint, handoff, finish, and note return their direct artifact/session/payload values rather than inspecting the event-log tail.
+- Handoff JSON receives the exact saved Markdown and relative path without parsing `Saved:` from human text. Finish returns its own summary path, and note returns its exact category/text payload.
+- Doctor uses a typed diagnostic result for both inspection and repair; its post-repair state inspection remains intentional command behavior rather than generic output reconstruction.
+- Status now builds human and JSON output from one session/event/Git read set. The generic `command_data` function and every post-dispatch reconstruction call were deleted.
+- Existing human wording, JSON field names and types, output schema version, storage schema, operation ordering, locking, and recovery behavior remain unchanged.
+- The README now documents that mutating human and JSON output come from the operation's typed result rather than an unrelated history rescan.
+
+#### Architectural decisions
+
+- Typed command results remain private to the Rust application layer. They are transient output values, not new persisted models, so schema-v1 state and compatibility require no migration.
+- Result rendering is infallible and performs no filesystem or Git access after durable completion. Any command-specific validation or history access still occurs before mutation or as an explicit part of the operation.
+- Output-v1 tests require established fields but permit additive fields, preserving the documented backward-compatible envelope policy.
+
+#### Verification
+
+The focused regressions passed:
+
+```text
+cargo test --test cli mutation_results_do_not_rescan_corrupt_unrelated_session_records -- --exact                 PASS (1 test)
+cargo test --test cli json_envelopes_are_single_typed_documents_and_failures_stay_on_stderr -- --exact           PASS (1 test)
+```
+
+The corruption regression finishes an older session, starts a valid current session, corrupts only the older durable session record, and then successfully records a human note plus JSON checkpoint, handoff, and finish results. It verifies the note event, checkpoint artifact/event/path, handoff bytes/path/current last agent, finish event/current summary path/completed session, single envelopes, relative paths, and unchanged corrupt bytes.
+
+`cargo build --quiet` passed. A direct isolated non-Git workflow repeated the same historical-corruption scenario and confirmed that note, checkpoint, handoff, and finish output remained successful and matched their current durable artifacts.
+
+The first canonical Clippy compilation exposed missing `Debug` derives required by existing in-file `unwrap_err` tests after their success types became typed results. An isolated correction added consistent derives without runtime changes. Independent test review also corrected two coverage defects: required-key assertions now permit additive output fields, and finish output is tied to the latest current-session `session.finished` event rather than merely any existing summary file.
+
+The complete canonical suite then passed in order:
+
+```text
+cargo fmt --check                                         PASS
+cargo clippy --all-targets --all-features -- -D warnings PASS
+cargo test --all-targets --all-features                   PASS (54 tests)
+```
+
+#### Known limitations and remaining technical debt
+
+- Commands that semantically select or validate historical state, such as start and resume, still reject malformed records before mutation. Typed results prevent only post-completion output reconstruction from introducing a new failure.
+- Doctor intentionally inspects state after a repair to report the resulting diagnostics; that inspection is part of the repair contract and not generic reconstruction.
+- Typed results are private Rust application values rather than a cross-process protocol. Relay still has no Go orchestrator or Lua workflow layer.
+- Deterministic context/history navigation and local search remain unimplemented.
+- This is not the final completion cycle, so the branch is committed locally but not pushed again and no draft pull request is created in this cycle.
+
+#### Strongest next-cycle candidates
+
+1. Add an inspected deterministic subset of context/history navigation, such as latest-session selection, reverse display, or time bounds, without changing existing defaults.
+2. Add deterministic local search across sessions, event types, note categories, times, and plain substrings without embeddings, hosted services, or inferred relevance.
+3. Define the first versioned Rust/Go orchestration protocol boundary before implementing any external-process scheduler or Lua workflow runtime.
