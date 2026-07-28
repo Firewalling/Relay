@@ -1,0 +1,90 @@
+{
+  "protocol_version": 1,
+  "relay_version": "0.2.0",
+  "transport": {
+    "kind": "process",
+    "invocation": "direct_argv",
+    "framing": "one_json_document_per_process",
+    "shell": false,
+    "invocation_prefix": [
+      "--json",
+      "--scope",
+      "current"
+    ],
+    "success_stream": "stdout",
+    "error_stream": "stderr",
+    "output_schema_version": 1,
+    "one_document": true,
+    "success_exit_code": 0,
+    "failure_exit_code_nonzero": true
+  },
+  "state": {
+    "owner": "rust",
+    "schema_version": 1,
+    "root": ".relay"
+  },
+  "orchestrator": {
+    "owner": "go",
+    "implemented": false
+  },
+  "workflow": {
+    "owner": "lua",
+    "implemented": false
+  },
+  "operations": [
+    {
+      "name": "status",
+      "argv_template": [
+        "status"
+      ],
+      "mutating": false,
+      "stdin": "none"
+    },
+    {
+      "name": "context",
+      "argv_template": [
+        "context",
+        "<options...>"
+      ],
+      "mutating": false,
+      "stdin": "none"
+    },
+    {
+      "name": "note",
+      "argv_template": [
+        "note",
+        "<category>",
+        "--stdin"
+      ],
+      "mutating": true,
+      "stdin": "utf8_note"
+    },
+    {
+      "name": "checkpoint",
+      "argv_template": [
+        "checkpoint",
+        "[message]"
+      ],
+      "mutating": true,
+      "stdin": "none"
+    },
+    {
+      "name": "handoff",
+      "argv_template": [
+        "handoff",
+        "<agent>",
+        "<detail-options...>"
+      ],
+      "mutating": true,
+      "stdin": "none"
+    },
+    {
+      "name": "finish",
+      "argv_template": [
+        "finish"
+      ],
+      "mutating": true,
+      "stdin": "none"
+    }
+  ]
+}

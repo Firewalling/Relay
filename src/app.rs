@@ -1,13 +1,15 @@
 use crate::{
     cli::{
         CheckpointArgs, Command, ContextArgs, DoctorArgs, HandoffArgs, HistoryArgs, NoteArgs,
-        NoteCategory, SessionSelectorArgs, StartArgs,
+        NoteCategory, SearchArgs, SessionSelectorArgs, StartArgs,
     },
     git,
     lock::{self, ProjectLock},
     model::{
-        Checkpoint, Diagnostic, DiagnosticSeverity, Event, GitSnapshot, OperationEffect,
-        OperationMarker, SCHEMA_VERSION, Session, SessionState,
+        Checkpoint, Diagnostic, DiagnosticSeverity, Event, GitSnapshot,
+        ORCHESTRATION_PROTOCOL_VERSION, OUTPUT_SCHEMA_VERSION, OperationEffect, OperationMarker,
+        ProtocolComponent, ProtocolManifest, ProtocolOperation, ProtocolState, ProtocolStdin,
+        ProtocolTransport, SCHEMA_VERSION, Session, SessionState,
     },
     storage::{self, StorageError},
 };
@@ -62,8 +64,307 @@ pub struct RunOutput {
     pub data: Value,
 }
 
+trait IntoRunOutput {
+    fn into_run_output(self) -> RunOutput;
+}
+
+#[derive(Debug)]
+struct ProtocolResult {
+    manifest: ProtocolManifest,
+}
+
+impl IntoRunOutput for ProtocolResult {
+    fn into_run_output(self) -> RunOutput {
+        RunOutput {
+            human: format!(
+                "Relay orchestration protocol: {}\n\
+                 Transport: direct argv, one JSON document per process\n\
+                 Output schema: {}\n\
+                 State owner: Rust (schema {})\n\
+                 Agent/workflow process launch: no\n\
+                 Go orchestrator: not implemented\n\
+                 Lua workflow: not implemented\n\
+                 Operations: status, context, note, checkpoint, handoff, finish",
+                ORCHESTRATION_PROTOCOL_VERSION, OUTPUT_SCHEMA_VERSION, SCHEMA_VERSION,
+            ),
+            data: json!(self.manifest),
+        }
+    }
+}
+
+pub fn protocol_output() -> RunOutput {
+    ProtocolResult {
+        manifest: ProtocolManifest {
+            protocol_version: ORCHESTRATION_PROTOCOL_VERSION,
+            relay_version: env!("CARGO_PKG_VERSION").into(),
+            transport: ProtocolTransport {
+                kind: "process".into(),
+                invocation: "direct_argv".into(),
+                framing: "one_json_document_per_process".into(),
+                shell: false,
+                invocation_prefix: vec!["--json".into(), "--scope".into(), "current".into()],
+                success_stream: "stdout".into(),
+                error_stream: "stderr".into(),
+                output_schema_version: OUTPUT_SCHEMA_VERSION,
+                one_document: true,
+                success_exit_code: 0,
+                failure_exit_code_nonzero: true,
+            },
+            state: ProtocolState {
+                owner: "rust".into(),
+                schema_version: SCHEMA_VERSION,
+                root: ".relay".into(),
+            },
+            orchestrator: ProtocolComponent {
+                owner: "go".into(),
+                implemented: false,
+            },
+            workflow: ProtocolComponent {
+                owner: "lua".into(),
+                implemented: false,
+            },
+            operations: vec![
+                ProtocolOperation {
+                    name: "status".into(),
+                    argv_template: vec!["status".into()],
+                    mutating: false,
+                    stdin: ProtocolStdin::None,
+                },
+                ProtocolOperation {
+                    name: "context".into(),
+                    argv_template: vec!["context".into(), "<options...>".into()],
+                    mutating: false,
+                    stdin: ProtocolStdin::None,
+                },
+                ProtocolOperation {
+                    name: "note".into(),
+                    argv_template: vec!["note".into(), "<category>".into(), "--stdin".into()],
+                    mutating: true,
+                    stdin: ProtocolStdin::Utf8Note,
+                },
+                ProtocolOperation {
+                    name: "checkpoint".into(),
+                    argv_template: vec!["checkpoint".into(), "[message]".into()],
+                    mutating: true,
+                    stdin: ProtocolStdin::None,
+                },
+                ProtocolOperation {
+                    name: "handoff".into(),
+                    argv_template: vec![
+                        "handoff".into(),
+                        "<agent>".into(),
+                        "<detail-options...>".into(),
+                    ],
+                    mutating: true,
+                    stdin: ProtocolStdin::None,
+                },
+                ProtocolOperation {
+                    name: "finish".into(),
+                    argv_template: vec!["finish".into()],
+                    mutating: true,
+                    stdin: ProtocolStdin::None,
+                },
+            ],
+        },
+    }
+    .into_run_output()
+}
+
+#[derive(Debug)]
+struct StartResult {
+    session: Session,
+}
+
+impl IntoRunOutput for StartResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = format!(
+            "Started Relay session\nGoal: {}\nGit: {}",
+            self.session.goal,
+            format_git(&self.session.initial_git)
+        );
+        let data = json!({
+            "session": &self.session,
+            "git": &self.session.initial_git,
+            "event_count": 1,
+            "project": ".",
+        });
+        RunOutput { human, data }
+    }
+}
+
+#[derive(Debug)]
+struct CheckpointResult {
+    session: Session,
+    checkpoint: Checkpoint,
+    path: String,
+}
+
+impl IntoRunOutput for CheckpointResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = format!(
+            "Checkpoint created: {}\nChanged files: {}",
+            self.path,
+            format_changed_files(&self.checkpoint.git)
+        );
+        let data = json!({
+            "session": &self.session,
+            "checkpoint": &self.checkpoint,
+            "path": &self.path,
+        });
+        RunOutput { human, data }
+    }
+}
+
+#[derive(Debug)]
+struct HandoffResult {
+    session: Session,
+    markdown: String,
+    path: String,
+}
+
+impl IntoRunOutput for HandoffResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = format!("{}\nSaved: {}", self.markdown, self.path);
+        let data = json!({
+            "session": &self.session,
+            "markdown": &self.markdown,
+            "path": &self.path,
+        });
+        RunOutput { human, data }
+    }
+}
+
+#[derive(Debug)]
+struct FinishResult {
+    session: Session,
+    summary_path: String,
+}
+
+impl IntoRunOutput for FinishResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = format!("Session finished\nSummary: {}", self.summary_path);
+        let data = json!({
+            "session": &self.session,
+            "summary_path": &self.summary_path,
+        });
+        RunOutput { human, data }
+    }
+}
+
+#[derive(Debug)]
+struct ResumeResult {
+    source_id: Uuid,
+    session: Session,
+}
+
+impl IntoRunOutput for ResumeResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = format!(
+            "Resumed Relay session\nSource: {}\nSession: {}\nGoal: {}",
+            self.source_id, self.session.id, self.session.goal
+        );
+        let data = json!({
+            "session": &self.session,
+            "git": &self.session.initial_git,
+            "event_count": 1,
+            "project": ".",
+        });
+        RunOutput { human, data }
+    }
+}
+
+#[derive(Debug)]
+struct NoteValue {
+    category: NoteCategory,
+    text: String,
+}
+
+#[derive(Debug)]
+struct NoteResult {
+    session: Session,
+    note: NoteValue,
+}
+
+impl IntoRunOutput for NoteResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = format!(
+            "Recorded {} note for session {}",
+            self.note.category.as_str(),
+            self.session.id
+        );
+        let data = json!({
+            "session": &self.session,
+            "note": {
+                "category": self.note.category.as_str(),
+                "text": &self.note.text,
+            },
+        });
+        RunOutput { human, data }
+    }
+}
+
+#[derive(Debug)]
+struct DoctorCounts {
+    errors: usize,
+    warnings: usize,
+}
+
+#[derive(Debug)]
+struct DoctorResult {
+    healthy: bool,
+    counts: DoctorCounts,
+    diagnostics: Vec<Diagnostic>,
+    repaired: Vec<String>,
+}
+
+impl IntoRunOutput for DoctorResult {
+    fn into_run_output(self) -> RunOutput {
+        let human = if self.diagnostics.is_empty() {
+            "Relay state is healthy\nErrors: 0\nWarnings: 0".into()
+        } else {
+            let lines = self
+                .diagnostics
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{} [{}] {}: {}\n  Guidance: {}",
+                        match item.severity {
+                            DiagnosticSeverity::Error => "ERROR",
+                            DiagnosticSeverity::Warning => "WARNING",
+                        },
+                        item.code,
+                        item.path,
+                        item.message,
+                        item.guidance
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "Relay state diagnostics\nErrors: {}\nWarnings: {}\n{lines}",
+                self.counts.errors, self.counts.warnings
+            )
+        };
+        let data = json!({
+            "healthy": self.healthy,
+            "counts": {
+                "errors": self.counts.errors,
+                "warnings": self.counts.warnings,
+            },
+            "diagnostics": &self.diagnostics,
+            "repaired": &self.repaired,
+        });
+        RunOutput { human, data }
+    }
+}
+
 pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
-    validate_state_paths(&Paths::new(project))?;
+    if let Command::Search(args) = &command {
+        validate_search_bounds(args)?;
+    }
+    if !matches!(&command, Command::Protocol) {
+        validate_state_paths(&Paths::new(project))?;
+    }
     if is_mutating(&command)
         && !matches!(command, Command::Start(_))
         && !project.join(".relay").exists()
@@ -80,25 +381,24 @@ pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
     if is_mutating(&command) && !matches!(command, Command::Doctor(_)) {
         materialize_legacy_session(&Paths::new(project))?;
     }
-    let human = match command {
-        Command::Start(args) => start(project, args),
-        Command::Status => status(project),
-        Command::Checkpoint(args) => checkpoint(project, args),
-        Command::Finish => finish(project),
-        Command::Handoff(args) => handoff(project, args),
-        Command::List => return list_output(project),
-        Command::Show(args) => return show_output(project, args),
-        Command::History(args) => return history_output(project, args),
-        Command::Resume(args) => resume(project, args),
-        Command::Doctor(args) => return doctor(project, args),
-        Command::Note(args) => note(project, args),
-        Command::Context(args) => return context(project, args),
+    let output = match command {
+        Command::Start(args) => start(project, args)?.into_run_output(),
+        Command::Status => status(project)?,
+        Command::Checkpoint(args) => checkpoint(project, args)?.into_run_output(),
+        Command::Finish => finish(project)?.into_run_output(),
+        Command::Handoff(args) => handoff(project, args)?.into_run_output(),
+        Command::List => list_output(project)?,
+        Command::Show(args) => show_output(project, args)?,
+        Command::History(args) => history_output(project, args)?,
+        Command::Search(args) => search_output(project, args)?,
+        Command::Resume(args) => resume(project, args)?.into_run_output(),
+        Command::Doctor(args) => doctor(project, args)?.into_run_output(),
+        Command::Note(args) => note(project, args)?.into_run_output(),
+        Command::Context(args) => context(project, args)?,
+        Command::Protocol => protocol_output(),
         Command::Completions(_) => unreachable!("completions are handled before project discovery"),
-    }?;
-    Ok(RunOutput {
-        data: command_data(project, name, &human)?,
-        human,
-    })
+    };
+    Ok(output)
 }
 
 fn list_output(project: &Path) -> Result<RunOutput, AppError> {
@@ -140,6 +440,18 @@ fn show_output(project: &Path, args: SessionSelectorArgs) -> Result<RunOutput, A
 }
 
 fn history_output(project: &Path, args: HistoryArgs) -> Result<RunOutput, AppError> {
+    if args
+        .since
+        .as_ref()
+        .zip(args.until.as_ref())
+        .is_some_and(|(since, until)| since > until)
+    {
+        return Err(AppError::Lifecycle(
+            "`--since` must be earlier than or equal to `--until`; use an earlier `--since` or a later `--until`"
+                .into(),
+        ));
+    }
+
     let paths = Paths::new(project);
     let all = read_events(&paths.events)?;
     let selected_id = args
@@ -157,7 +469,23 @@ fn history_output(project: &Path, args: HistoryArgs) -> Result<RunOutput, AppErr
                 .as_deref()
                 .is_none_or(|kind| event.event_type == kind)
         })
+        .filter(|event| {
+            args.since
+                .as_ref()
+                .is_none_or(|since| &event.timestamp >= since)
+        })
+        .filter(|event| {
+            args.until
+                .as_ref()
+                .is_none_or(|until| &event.timestamp <= until)
+        })
         .collect::<Vec<_>>();
+    let order = if args.reverse {
+        events.reverse();
+        "newest_first"
+    } else {
+        "oldest_first"
+    };
     let truncated = events.len() > args.limit;
     events.truncate(args.limit);
     let mut lines = events
@@ -178,8 +506,186 @@ fn history_output(project: &Path, args: HistoryArgs) -> Result<RunOutput, AppErr
     ));
     Ok(RunOutput {
         human: lines.join("\n"),
-        data: json!({"events": events, "truncated": truncated}),
+        data: json!({
+            "events": events,
+            "truncated": truncated,
+            "order": order,
+            "since": args.since,
+            "until": args.until,
+            "limit": args.limit,
+        }),
     })
+}
+
+fn validate_search_bounds(args: &SearchArgs) -> Result<(), AppError> {
+    if args
+        .since
+        .as_ref()
+        .zip(args.until.as_ref())
+        .is_some_and(|(since, until)| since > until)
+    {
+        return Err(AppError::Lifecycle(
+            "`--since` must be earlier than or equal to `--until`; use an earlier `--since` or a later `--until`"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn search_output(project: &Path, args: SearchArgs) -> Result<RunOutput, AppError> {
+    validate_search_bounds(&args)?;
+
+    let paths = Paths::new(project);
+    let mut events = read_events(&paths.events)?;
+    let selected_id = args
+        .session
+        .as_deref()
+        .map(|selector| {
+            select_session(&read_all_sessions_from_events(&paths, &events)?, selector)
+                .map(|session| session.id)
+        })
+        .transpose()?;
+    let selected_category = args.category.map(NoteCategory::as_str);
+    let order = if args.reverse {
+        events.reverse();
+        "newest_first"
+    } else {
+        "oldest_first"
+    };
+    let mut matches = events
+        .into_iter()
+        .filter(|event| selected_id.is_none_or(|id| event.session_id == id))
+        .filter(|event| {
+            args.event_type
+                .as_deref()
+                .is_none_or(|kind| event.event_type == kind)
+        })
+        .filter(|event| {
+            selected_category.is_none_or(|category| {
+                event.event_type == "note.recorded"
+                    && event.payload.get("category").and_then(Value::as_str) == Some(category)
+            })
+        })
+        .filter(|event| {
+            args.since
+                .as_ref()
+                .is_none_or(|since| &event.timestamp >= since)
+        })
+        .filter(|event| {
+            args.until
+                .as_ref()
+                .is_none_or(|until| &event.timestamp <= until)
+        })
+        .filter_map(|event| {
+            search_event(&event, &args.query).map(|(field, text)| (event, field, text))
+        })
+        .take(args.limit.saturating_add(1))
+        .collect::<Vec<_>>();
+    let truncated = matches.len() > args.limit;
+    matches.truncate(args.limit);
+
+    let mut lines = matches
+        .iter()
+        .map(|(event, field, text)| {
+            format!(
+                "{}  {}  {}  {}  {}",
+                event.timestamp.to_rfc3339(),
+                event.session_id,
+                safe_markdown_value(project, &event.event_type),
+                safe_markdown_value(project, field),
+                safe_markdown_value(project, text)
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.push(format!(
+        "Truncated: {}",
+        if truncated { "yes" } else { "no" }
+    ));
+    let json_matches = matches
+        .iter()
+        .map(|(event, field, text)| {
+            json!({
+                "event": event,
+                "field": field,
+                "text": text,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(RunOutput {
+        human: lines.join("\n"),
+        data: json!({
+            "query": args.query,
+            "matches": json_matches,
+            "truncated": truncated,
+            "order": order,
+            "session": selected_id.map(|id| id.to_string()),
+            "type": args.event_type,
+            "category": selected_category,
+            "since": args.since,
+            "until": args.until,
+            "limit": args.limit,
+        }),
+    })
+}
+
+fn search_event(event: &Event, query: &str) -> Option<(String, String)> {
+    if event.event_type.contains(query) {
+        return Some(("type".into(), event.event_type.clone()));
+    }
+
+    let mut pointer = "/payload".to_owned();
+    search_payload(&event.payload, query, &mut pointer)
+        .map(|(field, text)| (field, text.to_owned()))
+}
+
+fn search_payload<'a>(
+    value: &'a Value,
+    query: &str,
+    pointer: &mut String,
+) -> Option<(String, &'a str)> {
+    match value {
+        Value::String(text) if text.contains(query) => Some((pointer.clone(), text)),
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                let original_len = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&index.to_string());
+                let found = search_payload(value, query, pointer);
+                pointer.truncate(original_len);
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+        Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys {
+                let original_len = pointer.len();
+                push_json_pointer_segment(pointer, key);
+                let found = search_payload(&values[key], query, pointer);
+                pointer.truncate(original_len);
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn push_json_pointer_segment(pointer: &mut String, segment: &str) {
+    pointer.push('/');
+    for character in segment.chars() {
+        match character {
+            '~' => pointer.push_str("~0"),
+            '/' => pointer.push_str("~1"),
+            _ => pointer.push(character),
+        }
+    }
 }
 
 fn is_mutating(command: &Command) -> bool {
@@ -205,51 +711,17 @@ fn command_name(command: &Command) -> &'static str {
         Command::List => "list",
         Command::Show(_) => "show",
         Command::History(_) => "history",
+        Command::Search(_) => "search",
         Command::Resume(_) => "resume",
         Command::Doctor(_) => "doctor",
         Command::Note(_) => "note",
         Command::Context(_) => "context",
+        Command::Protocol => "protocol",
         Command::Completions(_) => "completions",
     }
 }
 
-fn command_data(project: &Path, command: &str, human: &str) -> Result<Value, AppError> {
-    let paths = Paths::new(project);
-    let sessions = read_all_sessions(&paths)?;
-    let events = read_events(&paths.events)?;
-    let current = if paths.session.exists() {
-        Some(read_session(&paths.session)?)
-    } else {
-        None
-    };
-    let latest = events.last();
-    Ok(match command {
-        "list" => json!({ "sessions": sessions }),
-        "show" => json!({ "session": sessions.first() }),
-        "history" => json!({ "events": events, "truncated": human.ends_with("Truncated: yes") }),
-        "handoff" => json!({
-            "session": current,
-            "markdown": human.rsplit_once("\nSaved: ").map(|v| v.0).unwrap_or(human),
-            "path": latest.and_then(|e| e.payload.get("path")),
-        }),
-        "checkpoint" => {
-            json!({ "session": current, "checkpoint": latest.and_then(|e| e.payload.get("checkpoint")), "path": latest.and_then(|e| e.payload.get("path")) })
-        }
-        "finish" => {
-            json!({ "session": current, "summary_path": latest.and_then(|e| e.payload.get("summary_path")) })
-        }
-        "resume" | "start" | "status" => json!({
-            "session": current,
-            "git": git::capture(project)?,
-            "event_count": current.as_ref().map(|s| events.iter().filter(|e| e.session_id == s.id).count()),
-            "project": ".",
-        }),
-        "note" => json!({ "session": current, "note": latest.map(|e| &e.payload) }),
-        _ => json!({}),
-    })
-}
-
-fn start(project: &Path, args: StartArgs) -> Result<String, AppError> {
+fn start(project: &Path, args: StartArgs) -> Result<StartResult, AppError> {
     let paths = Paths::new(project);
     if read_all_sessions(&paths)?
         .iter()
@@ -305,26 +777,22 @@ fn start(project: &Path, args: StartArgs) -> Result<String, AppError> {
     operation.advance("event")?;
     operation.complete()?;
 
-    Ok(format!(
-        "Started Relay session\nGoal: {}\nGit: {}",
-        session.goal,
-        format_git(&session.initial_git)
-    ))
+    Ok(StartResult { session })
 }
 
-fn status(project: &Path) -> Result<String, AppError> {
+fn status(project: &Path) -> Result<RunOutput, AppError> {
     let paths = Paths::new(project);
     let session = require_session(&paths)?;
     let events = read_events(&paths.events)?;
     let live_git = git::capture(project)?;
-    let session_events: Vec<_> = events
+    let event_count = events
         .iter()
         .filter(|event| event.session_id == session.id)
-        .collect();
-    let latest_checkpoint = session_events
+        .count();
+    let latest_checkpoint = events
         .iter()
         .rev()
-        .find(|event| event.event_type == "checkpoint.created")
+        .find(|event| event.session_id == session.id && event.event_type == "checkpoint.created")
         .map(|event| {
             let checkpoint: Checkpoint = serde_json::from_value(
                 event.payload.get("checkpoint").cloned().ok_or_else(|| {
@@ -350,7 +818,7 @@ fn status(project: &Path) -> Result<String, AppError> {
         })
         .unwrap_or_else(|| "none".into());
 
-    Ok(format!(
+    let human = format!(
         "Goal: {}\nSession: {}\nState: {}\nStarted: {}\nResumed from: {}\nProject: .\nGit branch: {}\nGit commit: {}\nGit clean: {}\nEvents: {}\nLatest checkpoint: {}\nLast agent: {}",
         session.goal,
         session.id,
@@ -363,13 +831,20 @@ fn status(project: &Path) -> Result<String, AppError> {
         display_option(live_git.branch.as_deref(), live_git.available),
         display_option(live_git.commit.as_deref(), live_git.available),
         display_clean(&live_git),
-        session_events.len(),
+        event_count,
         latest,
         session.last_agent.as_deref().unwrap_or("unknown"),
-    ))
+    );
+    let data = json!({
+        "session": &session,
+        "git": &live_git,
+        "event_count": event_count,
+        "project": ".",
+    });
+    Ok(RunOutput { human, data })
 }
 
-fn checkpoint(project: &Path, args: CheckpointArgs) -> Result<String, AppError> {
+fn checkpoint(project: &Path, args: CheckpointArgs) -> Result<CheckpointResult, AppError> {
     let paths = Paths::new(project);
     let session = require_active(&paths)?;
     read_events(&paths.events)?;
@@ -410,14 +885,14 @@ fn checkpoint(project: &Path, args: CheckpointArgs) -> Result<String, AppError> 
     operation.advance("event")?;
     operation.complete()?;
 
-    Ok(format!(
-        "Checkpoint created: {}\nChanged files: {}",
-        relative,
-        format_changed_files(&checkpoint.git)
-    ))
+    Ok(CheckpointResult {
+        session,
+        checkpoint,
+        path: relative,
+    })
 }
 
-fn handoff(project: &Path, args: HandoffArgs) -> Result<String, AppError> {
+fn handoff(project: &Path, args: HandoffArgs) -> Result<HandoffResult, AppError> {
     let paths = Paths::new(project);
     let mut session = require_active(&paths)?;
     let events = read_events(&paths.events)?;
@@ -487,7 +962,11 @@ fn handoff(project: &Path, args: HandoffArgs) -> Result<String, AppError> {
     operation.advance("current_session")?;
     operation.complete()?;
 
-    Ok(format!("{markdown}\nSaved: {relative}"))
+    Ok(HandoffResult {
+        session,
+        markdown,
+        path: relative,
+    })
 }
 
 fn relevant_checkpoints(
@@ -606,16 +1085,31 @@ fn render_handoff(
 }
 
 fn safe_markdown_value(project: &Path, value: &str) -> String {
-    let concise = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let project_root = project.to_string_lossy();
+    let normalize = |text: &str| {
+        let mut safe = String::with_capacity(text.len());
+        for (index, segment) in text.split_whitespace().enumerate() {
+            if index > 0 {
+                safe.push(' ');
+            }
+            for character in segment.chars() {
+                if character.is_control() {
+                    safe.extend(character.escape_default());
+                } else {
+                    safe.push(character);
+                }
+            }
+        }
+        safe
+    };
     if project_root.is_empty() || project_root == "/" {
-        concise
+        normalize(value)
     } else {
-        concise.replace(project_root.as_ref(), "[project root]")
+        normalize(&value.replace(project_root.as_ref(), "[project root]"))
     }
 }
 
-fn finish(project: &Path) -> Result<String, AppError> {
+fn finish(project: &Path) -> Result<FinishResult, AppError> {
     let paths = Paths::new(project);
     let mut session = require_active(&paths)?;
     let events = read_events(&paths.events)?;
@@ -664,7 +1158,10 @@ fn finish(project: &Path) -> Result<String, AppError> {
     operation.advance("current_session")?;
     operation.complete()?;
 
-    Ok(format!("Session finished\nSummary: {summary_relative}"))
+    Ok(FinishResult {
+        session,
+        summary_path: summary_relative,
+    })
 }
 
 fn render_summary(
@@ -751,7 +1248,7 @@ fn show(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError> {
     ))
 }
 
-fn resume(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError> {
+fn resume(project: &Path, args: SessionSelectorArgs) -> Result<ResumeResult, AppError> {
     let paths = Paths::new(project);
     if read_all_sessions(&paths)?
         .iter()
@@ -762,27 +1259,29 @@ fn resume(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError>
         ));
     }
     let sessions = read_all_sessions(&paths)?;
-    let source = select_session(&sessions, &args.session)?.clone();
+    let source = select_session(&sessions, &args.session)?;
     if source.state != SessionState::Completed {
         return Err(AppError::Lifecycle(format!(
             "session {} is active; only completed sessions can be resumed",
             source.id
         )));
     }
+    let source_id = source.id;
+    let goal = source.goal.clone();
     read_events(&paths.events)?;
     create_state_directories(&paths)?;
     let now = Utc::now();
     let session = Session {
         schema_version: SCHEMA_VERSION,
         id: Uuid::new_v4(),
-        goal: source.goal.clone(),
+        goal,
         state: SessionState::Active,
         started_at: now,
         completed_at: None,
         initial_git: git::capture(project)?,
         final_git: None,
         last_agent: None,
-        resumed_from: Some(source.id),
+        resumed_from: Some(source_id),
     };
     let mut operation = Operation::begin(
         &paths,
@@ -809,19 +1308,16 @@ fn resume(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError>
         &session,
         now,
         "session.resumed",
-        json!({ "goal": session.goal, "resumed_from": source.id, "git": session.initial_git }),
+        json!({ "goal": session.goal, "resumed_from": source_id, "git": session.initial_git }),
     )?;
     operation.advance("event")?;
     operation.complete()?;
-    Ok(format!(
-        "Resumed Relay session\nSource: {}\nSession: {}\nGoal: {}",
-        source.id, session.id, session.goal
-    ))
+    Ok(ResumeResult { source_id, session })
 }
 
 const MAX_NOTE_BYTES: usize = 64 * 1024;
 
-fn note(project: &Path, args: NoteArgs) -> Result<String, AppError> {
+fn note(project: &Path, args: NoteArgs) -> Result<NoteResult, AppError> {
     let paths = Paths::new(project);
     let session = require_active(&paths)?;
     let text = read_note_text(args.text, args.stdin, args.editor)?;
@@ -841,11 +1337,13 @@ fn note(project: &Path, args: NoteArgs) -> Result<String, AppError> {
         "note.recorded",
         json!({"category": args.category.as_str(), "text": text}),
     )?;
-    Ok(format!(
-        "Recorded {} note for session {}",
-        args.category.as_str(),
-        session.id
-    ))
+    Ok(NoteResult {
+        session,
+        note: NoteValue {
+            category: args.category,
+            text,
+        },
+    })
 }
 
 fn read_note_text(
@@ -956,6 +1454,259 @@ fn retain_latest<T>(items: &mut Vec<T>, limit: usize) -> usize {
     omitted
 }
 
+fn render_context_event(project: &Path, event: &Event) -> String {
+    let mut rendered = format!(
+        "\n- Event {} — {}",
+        event.timestamp.to_rfc3339(),
+        event.event_type
+    );
+    if event.event_type != "handoff.generated" {
+        return rendered;
+    }
+
+    if let Some(agent) = event.payload.get("agent").and_then(Value::as_str) {
+        let agent = safe_markdown_value(project, agent);
+        if !agent.is_empty() {
+            rendered.push_str("\n  - Target agent: ");
+            rendered.push_str(&agent);
+        }
+    }
+
+    for (key, label) in [
+        ("completed_work", "Completed work"),
+        ("decisions", "Decisions"),
+        ("failures", "Failures"),
+    ] {
+        let Some(values) = event.payload.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        let mut wrote_label = false;
+        for value in values.iter().filter_map(Value::as_str) {
+            let value = safe_markdown_value(project, value);
+            if value.is_empty() {
+                continue;
+            }
+            if !wrote_label {
+                rendered.push_str("\n  - ");
+                rendered.push_str(label);
+                rendered.push(':');
+                wrote_label = true;
+            }
+            rendered.push_str("\n    - ");
+            rendered.push_str(&value);
+        }
+    }
+
+    if let Some(next_action) = event.payload.get("next_action").and_then(Value::as_str) {
+        let next_action = safe_markdown_value(project, next_action);
+        if !next_action.is_empty() {
+            rendered.push_str("\n  - Next actions:\n    - ");
+            rendered.push_str(&next_action);
+        }
+    }
+
+    rendered
+}
+
+// The CLI writes human output with `println!`, which appends one Unicode character.
+const CONTEXT_TRANSPORT_NEWLINE_CHARS: usize = 1;
+const CONTEXT_FOOTER_TRUNCATED: &str = "\n\nTruncated: ";
+const CONTEXT_FOOTER_COUNT_NOTES: &str = "\nCount-omitted notes: ";
+const CONTEXT_FOOTER_COUNT_CHECKPOINTS: &str = "\nCount-omitted checkpoints: ";
+const CONTEXT_FOOTER_COUNT_EVENTS: &str = "\nCount-omitted events: ";
+const CONTEXT_FOOTER_BUDGET_NOTES: &str = "\nBudget-omitted notes: ";
+const CONTEXT_FOOTER_BUDGET_CHECKPOINTS: &str = "\nBudget-omitted checkpoints: ";
+const CONTEXT_FOOTER_BUDGET_EVENTS: &str = "\nBudget-omitted events: ";
+
+#[derive(Clone, Copy, Default)]
+struct ContextOmissions {
+    notes: usize,
+    checkpoints: usize,
+    events: usize,
+}
+
+impl ContextOmissions {
+    fn any(self) -> bool {
+        self.notes > 0 || self.checkpoints > 0 || self.events > 0
+    }
+
+    fn decrement(&mut self, kind: ContextItemKind) {
+        let count = match kind {
+            ContextItemKind::Note => &mut self.notes,
+            ContextItemKind::Checkpoint => &mut self.checkpoints,
+            ContextItemKind::Event => &mut self.events,
+        };
+        *count = count.saturating_sub(1);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ContextItemKind {
+    Note,
+    Checkpoint,
+    Event,
+}
+
+struct ContextItem {
+    kind: ContextItemKind,
+    rendered: String,
+    chars: usize,
+}
+
+impl ContextItem {
+    fn new(kind: ContextItemKind, rendered: String) -> Self {
+        let chars = rendered.chars().count();
+        Self {
+            kind,
+            rendered,
+            chars,
+        }
+    }
+}
+
+fn decimal_chars(mut value: usize) -> usize {
+    let mut chars = 1;
+    while value >= 10 {
+        value /= 10;
+        chars += 1;
+    }
+    chars
+}
+
+fn context_footer_chars(
+    truncated: bool,
+    count_omitted: ContextOmissions,
+    budget_omitted: ContextOmissions,
+) -> usize {
+    [
+        CONTEXT_FOOTER_TRUNCATED,
+        CONTEXT_FOOTER_COUNT_NOTES,
+        CONTEXT_FOOTER_COUNT_CHECKPOINTS,
+        CONTEXT_FOOTER_COUNT_EVENTS,
+        CONTEXT_FOOTER_BUDGET_NOTES,
+        CONTEXT_FOOTER_BUDGET_CHECKPOINTS,
+        CONTEXT_FOOTER_BUDGET_EVENTS,
+    ]
+    .iter()
+    .map(|text| text.chars().count())
+    .sum::<usize>()
+        + if truncated { 3 } else { 2 }
+        + decimal_chars(count_omitted.notes)
+        + decimal_chars(count_omitted.checkpoints)
+        + decimal_chars(count_omitted.events)
+        + decimal_chars(budget_omitted.notes)
+        + decimal_chars(budget_omitted.checkpoints)
+        + decimal_chars(budget_omitted.events)
+        + 1
+}
+
+fn context_footer(
+    truncated: bool,
+    count_omitted: ContextOmissions,
+    budget_omitted: ContextOmissions,
+) -> String {
+    format!(
+        "{CONTEXT_FOOTER_TRUNCATED}{}{CONTEXT_FOOTER_COUNT_NOTES}{}{CONTEXT_FOOTER_COUNT_CHECKPOINTS}{}{CONTEXT_FOOTER_COUNT_EVENTS}{}{CONTEXT_FOOTER_BUDGET_NOTES}{}{CONTEXT_FOOTER_BUDGET_CHECKPOINTS}{}{CONTEXT_FOOTER_BUDGET_EVENTS}{}\n",
+        if truncated { "yes" } else { "no" },
+        count_omitted.notes,
+        count_omitted.checkpoints,
+        count_omitted.events,
+        budget_omitted.notes,
+        budget_omitted.checkpoints,
+        budget_omitted.events,
+    )
+}
+
+fn compact_context(count_omitted: ContextOmissions, budget_omitted: ContextOmissions) -> String {
+    format!(
+        "# Relay\nTruncated: yes\nCount N/C/E: {}/{}/{}\nBudget N/C/E: {}/{}/{}\n",
+        count_omitted.notes,
+        count_omitted.checkpoints,
+        count_omitted.events,
+        budget_omitted.notes,
+        budget_omitted.checkpoints,
+        budget_omitted.events,
+    )
+}
+
+fn budget_context(
+    header: String,
+    items: &[ContextItem],
+    count_omitted: ContextOmissions,
+    max_chars: usize,
+) -> (String, ContextOmissions, bool) {
+    let mut budget_omitted = ContextOmissions::default();
+    for item in items {
+        match item.kind {
+            ContextItemKind::Note => budget_omitted.notes += 1,
+            ContextItemKind::Checkpoint => budget_omitted.checkpoints += 1,
+            ContextItemKind::Event => budget_omitted.events += 1,
+        }
+    }
+
+    let header_chars = header.chars().count();
+    let footer_chars = context_footer_chars(
+        count_omitted.any() || budget_omitted.any(),
+        count_omitted,
+        budget_omitted,
+    );
+    if header_chars.saturating_add(footer_chars) > max_chars {
+        let compact = compact_context(count_omitted, budget_omitted);
+        let human = if compact.chars().count() <= max_chars {
+            compact
+        } else {
+            "# Relay\nTruncated: yes\n".into()
+        };
+        return (human, budget_omitted, true);
+    }
+
+    let mut included = vec![false; items.len()];
+    let mut included_chars = 0usize;
+    loop {
+        let mut changed = false;
+        for (index, item) in items.iter().enumerate() {
+            if included[index] {
+                continue;
+            }
+            let mut tentative_omitted = budget_omitted;
+            tentative_omitted.decrement(item.kind);
+            let tentative_footer_chars = context_footer_chars(
+                count_omitted.any() || tentative_omitted.any(),
+                count_omitted,
+                tentative_omitted,
+            );
+            let item_chars = item.chars;
+            let total_chars = header_chars
+                .saturating_add(included_chars)
+                .saturating_add(item_chars)
+                .saturating_add(tentative_footer_chars);
+            if total_chars <= max_chars {
+                included[index] = true;
+                included_chars = included_chars.saturating_add(item_chars);
+                budget_omitted = tentative_omitted;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let budget_truncated = budget_omitted.any();
+    let mut markdown = header;
+    for (item, included) in items.iter().zip(included) {
+        if included {
+            markdown.push_str(&item.rendered);
+        }
+    }
+    markdown.push_str(&context_footer(
+        count_omitted.any() || budget_truncated,
+        count_omitted,
+        budget_omitted,
+    ));
+    (markdown, budget_omitted, budget_truncated)
+}
+
 fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
     if args.max_chars < 64 {
         return Err(AppError::Lifecycle(
@@ -992,7 +1743,7 @@ fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
         relevant_checkpoints(&all_events, session.id, args.checkpoints)?;
     let live_git = git::capture(project)?;
 
-    let mut markdown = format!(
+    let header = format!(
         "# Relay context\n\n## Session\n\n- ID: {}\n- Goal: {}\n- State: {}\n- Resumed from: {}\n- Last agent: {}\n\n## Current Git state\n\n- Branch: {}\n- Commit: {}\n- Clean: {}\n",
         session.id,
         safe_markdown_value(project, &session.goal),
@@ -1015,61 +1766,49 @@ fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
         ),
         display_clean(&live_git),
     );
-    let mut budget_truncated = false;
-    for item in notes
+    let items = notes
         .iter()
         .map(|(category, text, time)| {
-            format!(
-                "\n- Note [{}] {} — {}",
-                category.as_str(),
-                time.to_rfc3339(),
-                safe_markdown_value(project, text)
+            ContextItem::new(
+                ContextItemKind::Note,
+                format!(
+                    "\n- Note [{}] {} — {}",
+                    category.as_str(),
+                    time.to_rfc3339(),
+                    safe_markdown_value(project, text)
+                ),
             )
         })
         .chain(checkpoints.iter().map(|checkpoint| {
-            format!(
-                "\n- Checkpoint {} — {}",
-                checkpoint.timestamp.to_rfc3339(),
-                safe_markdown_value(
-                    project,
-                    checkpoint.message.as_deref().unwrap_or("(no message)")
-                )
+            ContextItem::new(
+                ContextItemKind::Checkpoint,
+                format!(
+                    "\n- Checkpoint {} — {}",
+                    checkpoint.timestamp.to_rfc3339(),
+                    safe_markdown_value(
+                        project,
+                        checkpoint.message.as_deref().unwrap_or("(no message)")
+                    )
+                ),
             )
         }))
         .chain(events.iter().map(|event| {
-            format!(
-                "\n- Event {} — {}",
-                event.timestamp.to_rfc3339(),
-                event.event_type
-            )
+            ContextItem::new(ContextItemKind::Event, render_context_event(project, event))
         }))
-    {
-        if markdown.chars().count() + item.chars().count() + 64 <= args.max_chars {
-            markdown.push_str(&item);
-        } else {
-            budget_truncated = true;
-        }
-    }
-    let mut truncated =
-        budget_truncated || omitted_notes > 0 || omitted_events > 0 || omitted_checkpoints > 0;
-    let mut footer = format!(
-        "\n\nTruncated: {}\nOmitted notes: {}\nOmitted checkpoints: {}\nOmitted events: {}\n",
-        if truncated { "yes" } else { "no" },
-        omitted_notes,
-        omitted_checkpoints,
-        omitted_events
+        .collect::<Vec<_>>();
+    let count_omitted = ContextOmissions {
+        notes: omitted_notes,
+        checkpoints: omitted_checkpoints,
+        events: omitted_events,
+    };
+    let (markdown, budget_omitted, budget_truncated) = budget_context(
+        header,
+        &items,
+        count_omitted,
+        args.max_chars - CONTEXT_TRANSPORT_NEWLINE_CHARS,
     );
-    if markdown.chars().count() + footer.chars().count() <= args.max_chars {
-        markdown.push_str(&footer);
-    } else {
-        truncated = true;
-        markdown = "# Relay context\n".into();
-        footer = format!(
-            "\nTruncated: yes\nOmitted notes: {}\nOmitted checkpoints: {}\nOmitted events: {}\n",
-            omitted_notes, omitted_checkpoints, omitted_events
-        );
-        markdown.push_str(&footer);
-    }
+    let truncated = count_omitted.any() || budget_truncated;
+
     Ok(RunOutput {
         human: markdown,
         data: json!({
@@ -1080,13 +1819,15 @@ fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
             "events": events,
             "truncated": truncated,
             "omitted": {"notes": omitted_notes, "checkpoints": omitted_checkpoints, "events": omitted_events},
+            "budget_omitted": {"notes": budget_omitted.notes, "checkpoints": budget_omitted.checkpoints, "events": budget_omitted.events},
+            "budget_truncated": budget_truncated,
             "max_chars": args.max_chars,
             "project": ".",
         }),
     })
 }
 
-fn doctor(project: &Path, args: DoctorArgs) -> Result<RunOutput, AppError> {
+fn doctor(project: &Path, args: DoctorArgs) -> Result<DoctorResult, AppError> {
     let paths = Paths::new(project);
     let mut diagnostics = inspect_state(project, &paths);
     let repairable = diagnostics
@@ -1129,40 +1870,15 @@ fn doctor(project: &Path, args: DoctorArgs) -> Result<RunOutput, AppError> {
         .iter()
         .filter(|value| value.severity == DiagnosticSeverity::Error)
         .count();
-    let warning_count = diagnostics.len() - error_count;
-    let healthy = error_count == 0;
-    let human = if diagnostics.is_empty() {
-        "Relay state is healthy\nErrors: 0\nWarnings: 0".into()
-    } else {
-        let lines = diagnostics
-            .iter()
-            .map(|item| {
-                format!(
-                    "{} [{}] {}: {}\n  Guidance: {}",
-                    match item.severity {
-                        DiagnosticSeverity::Error => "ERROR",
-                        DiagnosticSeverity::Warning => "WARNING",
-                    },
-                    item.code,
-                    item.path,
-                    item.message,
-                    item.guidance
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "Relay state diagnostics\nErrors: {error_count}\nWarnings: {warning_count}\n{lines}"
-        )
+    let counts = DoctorCounts {
+        errors: error_count,
+        warnings: diagnostics.len() - error_count,
     };
-    Ok(RunOutput {
-        human,
-        data: json!({
-            "healthy": healthy,
-            "counts": {"errors": error_count, "warnings": warning_count},
-            "diagnostics": diagnostics,
-            "repaired": repaired,
-        }),
+    Ok(DoctorResult {
+        healthy: counts.errors == 0,
+        counts,
+        diagnostics,
+        repaired,
     })
 }
 
@@ -1599,6 +2315,14 @@ fn push_diagnostic(
 }
 
 fn read_all_sessions(paths: &Paths) -> Result<Vec<Session>, AppError> {
+    let history = read_events(&paths.events)?;
+    read_all_sessions_from_events(paths, &history)
+}
+
+fn read_all_sessions_from_events(
+    paths: &Paths,
+    history: &[Event],
+) -> Result<Vec<Session>, AppError> {
     let mut sessions = Vec::new();
     if paths.sessions.exists() {
         let mut entries = fs::read_dir(&paths.sessions)
@@ -1613,8 +2337,16 @@ fn read_all_sessions(paths: &Paths) -> Result<Vec<Session>, AppError> {
             })?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
-            if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
-                sessions.push(read_session(&entry.path())?);
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                let file_type = entry.file_type().map_err(|source| AppError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                if file_type.is_symlink() {
+                    return Err(AppError::SymlinkState { path });
+                }
+                sessions.push(read_session(&path)?);
             }
         }
     }
@@ -1624,8 +2356,7 @@ fn read_all_sessions(paths: &Paths) -> Result<Vec<Session>, AppError> {
             sessions.push(current);
         }
     }
-    let history = read_events(&paths.events)?;
-    for event in &history {
+    for event in history {
         if sessions
             .iter()
             .any(|session| session.id == event.session_id)
@@ -1711,6 +2442,12 @@ fn read_all_sessions(paths: &Paths) -> Result<Vec<Session>, AppError> {
 
 fn select_session<'a>(sessions: &'a [Session], selector: &str) -> Result<&'a Session, AppError> {
     let selector = selector.to_ascii_lowercase();
+    if selector == "latest" {
+        return sessions
+            .first()
+            .ok_or_else(|| AppError::Lifecycle(format!("no Relay session matches `{selector}`")));
+    }
+
     let matches = sessions
         .iter()
         .filter(|session| session.id.to_string().starts_with(&selector))
@@ -2076,12 +2813,12 @@ mod tests {
             },
         )
         .unwrap();
-        let status_output = status(directory.path()).unwrap();
+        let status_output = status(directory.path()).unwrap().human;
         assert!(status_output.contains("Events: 2"));
         assert!(status_output.contains("first"));
         assert!(status_output.contains("Git branch: unavailable"));
 
-        let finish_output = finish(directory.path()).unwrap();
+        let finish_output = finish(directory.path()).unwrap().into_run_output().human;
         let session = read_session(&directory.path().join(".relay/session.json")).unwrap();
         assert_eq!(session.state, SessionState::Completed);
         assert!(finish_output.contains("Summary: .relay/summary-"));
@@ -2178,7 +2915,10 @@ mod tests {
         )
         .unwrap();
 
-        let output = handoff(directory.path(), handoff_args("omp")).unwrap();
+        let output = handoff(directory.path(), handoff_args("omp"))
+            .unwrap()
+            .into_run_output()
+            .human;
         let headings = output
             .lines()
             .filter(|line| line.starts_with("## "))
@@ -2220,7 +2960,10 @@ mod tests {
             next_action: Some("review diff".into()),
         };
 
-        let output = handoff(directory.path(), args).unwrap();
+        let output = handoff(directory.path(), args)
+            .unwrap()
+            .into_run_output()
+            .human;
         assert!(output.contains("- implemented flow\n- ran tests"));
         assert!(output.contains("- keep JSONL"));
         assert!(output.contains("- network unavailable"));
@@ -2255,7 +2998,10 @@ mod tests {
         let mut args = handoff_args("../../escape\n## Injected");
         args.completed_work = vec![format!("inspected {private_root}")];
 
-        let output = handoff(directory.path(), args).unwrap();
+        let output = handoff(directory.path(), args)
+            .unwrap()
+            .into_run_output()
+            .human;
         assert!(!output.contains(&private_root));
         assert!(!output.contains("\n## Injected"));
         let events = read_events(&directory.path().join(".relay/events.jsonl")).unwrap();

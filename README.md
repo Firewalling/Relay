@@ -64,6 +64,7 @@ relay handoff codex \
   --decision "Use the Git CLI for snapshots" \
   --failure "Offline mirror was unavailable" \
   --next-action "Review the installer smoke test"
+relay search "installer" --category decision --reverse
 relay context --max-chars 8000
 relay finish
 ```
@@ -79,25 +80,60 @@ Relay supports these commands:
   recorded.
 - `finish` saves a final Markdown summary and completes the active session.
 - `list` lists all known sessions.
-- `show <SESSION>` shows a session selected by full UUID or an unambiguous UUID
-  prefix.
-- `history [--session <SESSION>] [--type <EVENT_TYPE>] [--limit <N>]` reads
-  matching append-only events in recorded order.
+- `show <SESSION>` shows a session selected by full UUID, an unambiguous UUID
+  prefix, or `latest`.
+- `history [--session <SESSION>] [--type <EVENT_TYPE>] [--since <RFC3339>]
+  [--until <RFC3339>] [--reverse] [--limit <N>]` filters append-only events,
+  then displays the earliest matches by default or newest matches with
+  `--reverse`; both time bounds are inclusive and the limit follows that order.
+- `search <QUERY> [--session <SESSION>] [--type <EVENT_TYPE>]
+  [--category <CATEGORY>] [--since <RFC3339>] [--until <RFC3339>] [--reverse]
+  [--limit <N>]` searches stored event types and payload strings for an exact,
+  case-sensitive plain substring. Filters run before matching, results retain
+  append order by default, and `--reverse` selects newest matches before the
+  limit.
 - `resume <SESSION>` starts a new active continuation of a completed session,
-  preserving its goal and recording lineage. It does not reopen or modify the
-  source session, and it fails if a session is already active.
+  preserving its goal and recording lineage. It accepts the same selectors,
+  including `latest`, does not modify the source, and fails if a session is
+  already active.
 - `note <CATEGORY> [TEXT]` records `progress`, `decision`, `blocker`,
   `observation`, or `next_action`.
 - `context` emits bounded, recorded agent context; its filters are described
   below.
 - `doctor [--repair]` diagnoses storage consistency.
 - `completions <SHELL>` prints a Bash, Zsh, or Fish completion script.
+- `protocol` reports the project-independent, read-only orchestration process
+  contract compiled into Relay.
+
+See the [orchestration process protocol](docs/orchestration-protocol.md) for
+the exact versioned manifest, transport, operation subset, and security
+requirements. Relay does not yet include a Go orchestrator, Lua workflow
+runtime, or agent/workflow process launcher. Allowed Git-aware operations may
+invoke `git`; existing note editor behavior is outside protocol v1.
 
 `--json` and `--scope auto|current|repository` are global options and work
-before or after a subcommand. Human output remains the default. `--json` emits
-one versioned success document on stdout, or one versioned error document on
-stderr; `output_schema_version` is separate from the on-disk schema version.
-Completions are shell text regardless of global output options.
+before or after a subcommand. Human output remains the default. An exact global
+`--json` anywhere before a literal `--` requests JSON error framing even when
+Clap rejects the arguments: Relay writes one compact output-schema-v1 error
+envelope to stderr, writes nothing to stdout, and retains Clap's nonzero exit
+code. That envelope uses `command: "cli"`, `error.code: "argument_error"`, and
+an actionable normalized Clap message without a redundant leading `error: `.
+Without that request, parser failures remain ordinary Clap stderr text.
+
+After parsing, a failure to read the current directory uses the same JSON error
+envelope shape when requested, with `error.code: "current_directory"` and the
+parsed command name; human output remains unchanged. When JSON was requested,
+application handling likewise emits one versioned success document on stdout
+or one versioned error document on stderr. Successful help and version requests
+remain ordinary shell-facing Clap text, including with `--json`, and
+successful completion-script generation remains shell text. If the operating
+system cannot start the Relay process, Relay
+cannot emit an envelope; the caller must handle that launch failure.
+`output_schema_version` is separate from the on-disk schema version.
+
+For mutating commands, human and JSON output are rendered from the operation's
+typed result; Relay does not reconstruct a completed mutation by rescanning
+unrelated historical records.
 
 ## Notes
 
@@ -118,11 +154,36 @@ Recorded notes are facts: Relay can include them in handoffs, final summaries,
 and context, but never fills in work, decisions, failures, or next actions that
 were not recorded.
 
+## Deterministic local search
+
+Search matches only Relay's append-only event log. Session records are read
+only to resolve an optional session selector. It does not scan the working
+tree, call model providers, use embeddings, or infer relevance:
+
+```sh
+relay search "installer"
+relay search "review required" --session latest --category blocker
+relay search "timeout" --type handoff.generated --since 2025-01-02T03:04:05Z
+relay --json search "decision" --reverse --limit 20
+```
+
+Matching is an exact, case-sensitive substring over the event type and string
+values nested in its payload. Each event appears at most once, identified by
+the first deterministic match: event type first, then payload object keys in
+lexicographic order and array values in recorded order. Session, exact event
+type, note category, and inclusive RFC3339 time filters are applied before
+matching. Results remain oldest-first by default; `--reverse` reverses all
+matches before applying the limit. Search is read-only and returns stored typed
+events in JSON without adding an index or changing the schema.
+
 ## Bounded agent context
 
 Markdown is the default; `relay --json context` returns the same categories as
 typed data. Context contains only the selected session, recorded notes and
 events, checkpoints, continuation lineage, and current scoped Git facts.
+Human Markdown keeps note and checkpoint content in their dedicated items, while
+handoff events include recorded target, completed work, decisions, failures,
+and next actions when present.
 
 ```sh
 relay context \
@@ -136,11 +197,16 @@ relay context \
   --max-chars 8000
 ```
 
+`--session` accepts a full UUID, an unambiguous prefix, or `latest`.
+
 Categories and event kinds are repeatable filters. Counts default to 20 notes,
 20 events, and 5 checkpoints. Each count keeps the most recent matching items
-while preserving their recorded order. The character budget defaults to 12,000
-and must be at least 64. Relay truncates only at item boundaries and reports
-truncation plus omitted counts. It does not query model
+while preserving their recorded order. The human Markdown character budget
+defaults to 12,000 Unicode characters and must be at least 64. Relay never
+splits an item or exceeds that budget. Detailed output reports count-limit and
+character-budget omissions separately; very small budgets use a compact
+`N/C/E` (notes/checkpoints/events) summary when it fits. Typed JSON keeps the
+selected records and exposes both omission categories. It does not query model
 providers, scan source files, read agent conversations, or infer unrecorded
 facts. Paths in generated output are project-relative, and absolute project
 paths found in recorded text are redacted.

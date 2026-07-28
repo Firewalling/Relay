@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use std::io;
@@ -52,6 +53,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Prints the negotiated, versioned Rust/Go process contract and launches nothing.
+    Protocol,
     /// Start a session with a goal.
     Start(StartArgs),
     /// Show the current session.
@@ -68,6 +71,8 @@ pub enum Command {
     Show(SessionSelectorArgs),
     /// Show append-only event history.
     History(HistoryArgs),
+    /// Search stored event types and payload strings for a case-sensitive plain substring.
+    Search(SearchArgs),
     /// Continue a completed session as a new session.
     Resume(SessionSelectorArgs),
     /// Diagnose Relay state and optionally perform conservative repairs.
@@ -83,6 +88,7 @@ pub enum Command {
 impl Command {
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Protocol => "protocol",
             Self::Start(_) => "start",
             Self::Status => "status",
             Self::Checkpoint(_) => "checkpoint",
@@ -91,6 +97,7 @@ impl Command {
             Self::List => "list",
             Self::Show(_) => "show",
             Self::History(_) => "history",
+            Self::Search(_) => "search",
             Self::Resume(_) => "resume",
             Self::Doctor(_) => "doctor",
             Self::Note(_) => "note",
@@ -194,7 +201,7 @@ pub struct ContextArgs {
     /// Maximum recent checkpoints to include.
     #[arg(long, default_value_t = 5)]
     pub checkpoints: usize,
-    /// Maximum output characters; items are never split.
+    /// Maximum human Markdown characters; items are never split.
     #[arg(long = "max-chars", default_value_t = 12000)]
     pub max_chars: usize,
 }
@@ -237,13 +244,13 @@ pub struct HandoffArgs {
 
 #[derive(Debug, Args)]
 pub struct SessionSelectorArgs {
-    /// Exact session UUID or an unambiguous UUID prefix.
+    /// Exact session UUID, an unambiguous UUID prefix, or the reserved `latest` alias.
     pub session: String,
 }
 
 #[derive(Debug, Args)]
 pub struct HistoryArgs {
-    /// Restrict history to a session UUID or unambiguous prefix.
+    /// Restrict history to a session UUID, unambiguous prefix, or the reserved `latest` alias.
     #[arg(long)]
     pub session: Option<String>,
 
@@ -251,9 +258,65 @@ pub struct HistoryArgs {
     #[arg(long = "type")]
     pub event_type: Option<String>,
 
+    /// Display matching events newest first.
+    #[arg(long)]
+    pub reverse: bool,
+
+    /// Include events at or after this inclusive RFC3339 timestamp.
+    #[arg(long, value_parser = parse_rfc3339_utc)]
+    pub since: Option<DateTime<Utc>>,
+
+    /// Include events at or before this inclusive RFC3339 timestamp.
+    #[arg(long, value_parser = parse_rfc3339_utc)]
+    pub until: Option<DateTime<Utc>>,
+
     /// Maximum number of matching events to display.
     #[arg(long, default_value_t = 100)]
     pub limit: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct SearchArgs {
+    /// Required case-sensitive plain substring matched against event type and payload strings.
+    #[arg(value_parser = parse_search_query)]
+    pub query: String,
+
+    /// Filter before matching by session UUID, unambiguous prefix, or case-insensitive `latest` alias.
+    #[arg(long)]
+    pub session: Option<String>,
+
+    /// Filter before matching to exactly this event type.
+    #[arg(long = "type")]
+    pub event_type: Option<String>,
+
+    /// Filter before matching to notes with this category.
+    #[arg(long, value_enum)]
+    pub category: Option<NoteCategory>,
+
+    /// Order matching events newest first before applying the limit.
+    #[arg(long)]
+    pub reverse: bool,
+
+    /// Filter before matching to events at or after this inclusive RFC3339 timestamp.
+    #[arg(long, value_parser = parse_rfc3339_utc)]
+    pub since: Option<DateTime<Utc>>,
+
+    /// Filter before matching to events at or before this inclusive RFC3339 timestamp.
+    #[arg(long, value_parser = parse_rfc3339_utc)]
+    pub until: Option<DateTime<Utc>>,
+
+    /// Maximum number of matching events after ordering.
+    #[arg(long, default_value_t = 100)]
+    pub limit: usize,
+}
+
+fn parse_rfc3339_utc(value: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| {
+            "invalid RFC3339 timestamp; expected a value such as 2025-01-02T03:04:05Z or 2025-01-02T03:04:05+02:00"
+                .to_owned()
+        })
 }
 
 fn parse_goal(value: &str) -> Result<String, String> {
@@ -262,6 +325,10 @@ fn parse_goal(value: &str) -> Result<String, String> {
 
 fn parse_agent(value: &str) -> Result<String, String> {
     parse_nonblank(value, "target agent")
+}
+
+fn parse_search_query(value: &str) -> Result<String, String> {
+    parse_nonblank(value, "search query")
 }
 
 fn parse_nonblank(value: &str, name: &str) -> Result<String, String> {
@@ -301,6 +368,39 @@ mod tests {
         assert_eq!(before.scope, ProjectScope::Repository);
         assert_eq!(after.global_options().output, OutputFormat::Json);
         assert_eq!(after.scope, ProjectScope::Current);
+    }
+
+    #[test]
+    fn protocol_is_argument_free_and_named_protocol() {
+        let cli = Cli::try_parse_from(["relay", "protocol"]).unwrap();
+
+        assert!(matches!(&cli.command, Command::Protocol));
+        assert_eq!(cli.command.name(), "protocol");
+    }
+
+    #[test]
+    fn protocol_accepts_global_options_on_either_side() {
+        let before =
+            Cli::try_parse_from(["relay", "--json", "--scope", "repository", "protocol"]).unwrap();
+        let after =
+            Cli::try_parse_from(["relay", "protocol", "--json", "--scope", "repository"]).unwrap();
+
+        for cli in [before, after] {
+            assert!(matches!(&cli.command, Command::Protocol));
+            assert_eq!(cli.command.name(), "protocol");
+            assert_eq!(
+                cli.global_options(),
+                GlobalOptions {
+                    output: OutputFormat::Json,
+                    scope: ProjectScope::Repository,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_rejects_unexpected_arguments() {
+        assert!(Cli::try_parse_from(["relay", "protocol", "unexpected"]).is_err());
     }
 
     #[test]
@@ -351,6 +451,135 @@ mod tests {
     }
 
     #[test]
+    fn history_navigation_defaults_are_preserved() {
+        let cli = Cli::try_parse_from(["relay", "history"]).unwrap();
+
+        let Command::History(args) = cli.command else {
+            panic!("expected history command");
+        };
+        assert!(!args.reverse);
+        assert_eq!(args.since, None);
+        assert_eq!(args.until, None);
+        assert_eq!(args.limit, 100);
+    }
+
+    #[test]
+    fn parses_history_navigation_and_normalizes_offsets_to_utc() {
+        let cli = Cli::try_parse_from([
+            "relay",
+            "history",
+            "--reverse",
+            "--since",
+            "2025-01-02T03:04:05+02:30",
+            "--until",
+            "2025-01-03T03:04:05-04:00",
+        ])
+        .unwrap();
+
+        let Command::History(args) = cli.command else {
+            panic!("expected history command");
+        };
+        assert!(args.reverse);
+        assert_eq!(
+            args.since.unwrap().to_rfc3339(),
+            "2025-01-02T00:34:05+00:00"
+        );
+        assert_eq!(
+            args.until.unwrap().to_rfc3339(),
+            "2025-01-03T07:04:05+00:00"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_history_timestamp_during_argument_parsing() {
+        let error =
+            Cli::try_parse_from(["relay", "history", "--since", "January 2, 2025"]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("invalid RFC3339 timestamp"));
+        assert!(message.contains("2025-01-02T03:04:05Z"));
+    }
+
+    #[test]
+    fn search_defaults_are_preserved() {
+        let cli = Cli::try_parse_from(["relay", "search", "needle"]).unwrap();
+
+        let Command::Search(args) = cli.command else {
+            panic!("expected search command");
+        };
+        assert_eq!(args.query, "needle");
+        assert_eq!(args.session, None);
+        assert_eq!(args.event_type, None);
+        assert_eq!(args.category, None);
+        assert!(!args.reverse);
+        assert_eq!(args.since, None);
+        assert_eq!(args.until, None);
+        assert_eq!(args.limit, 100);
+    }
+
+    #[test]
+    fn parses_every_search_field_and_normalizes_offsets_to_utc() {
+        let cli = Cli::try_parse_from([
+            "relay",
+            "search",
+            "payload needle",
+            "--session",
+            "latest",
+            "--type",
+            "note",
+            "--category",
+            "next_action",
+            "--reverse",
+            "--since",
+            "2025-01-02T03:04:05+02:30",
+            "--until",
+            "2025-01-03T03:04:05-04:00",
+            "--limit",
+            "7",
+        ])
+        .unwrap();
+
+        let Command::Search(args) = cli.command else {
+            panic!("expected search command");
+        };
+        assert_eq!(args.query, "payload needle");
+        assert_eq!(args.session.as_deref(), Some("latest"));
+        assert_eq!(args.event_type.as_deref(), Some("note"));
+        assert_eq!(args.category, Some(NoteCategory::NextAction));
+        assert!(args.reverse);
+        assert_eq!(
+            args.since.unwrap().to_rfc3339(),
+            "2025-01-02T00:34:05+00:00"
+        );
+        assert_eq!(
+            args.until.unwrap().to_rfc3339(),
+            "2025-01-03T07:04:05+00:00"
+        );
+        assert_eq!(args.limit, 7);
+    }
+
+    #[test]
+    fn rejects_blank_search_query() {
+        let error = Cli::try_parse_from(["relay", "search", " \t "]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("search query must not be blank or whitespace-only")
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_search_timestamp_during_argument_parsing() {
+        let error =
+            Cli::try_parse_from(["relay", "search", "needle", "--until", "tomorrow"]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("invalid RFC3339 timestamp"));
+        assert!(message.contains("2025-01-02T03:04:05Z"));
+    }
+
+    #[test]
     fn completion_scripts_are_nonempty_and_include_current_commands() {
         for shell in [Shell::Bash, Shell::Zsh, Shell::Fish] {
             let mut command = Cli::command();
@@ -359,7 +588,14 @@ mod tests {
             let script = String::from_utf8(script).unwrap();
 
             assert!(!script.is_empty());
-            for command in ["start", "doctor", "context", "completions"] {
+            for command in [
+                "start",
+                "doctor",
+                "context",
+                "search",
+                "protocol",
+                "completions",
+            ] {
                 assert!(script.contains(command), "{shell:?} omitted {command}");
             }
         }

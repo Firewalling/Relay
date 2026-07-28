@@ -5,6 +5,68 @@ use uuid::Uuid;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+pub const OUTPUT_SCHEMA_VERSION: u32 = 1;
+pub const ORCHESTRATION_PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolManifest {
+    pub protocol_version: u32,
+    pub relay_version: String,
+    pub transport: ProtocolTransport,
+    pub state: ProtocolState,
+    pub orchestrator: ProtocolComponent,
+    pub workflow: ProtocolComponent,
+    pub operations: Vec<ProtocolOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolTransport {
+    pub kind: String,
+    pub invocation: String,
+    pub framing: String,
+    pub shell: bool,
+    pub invocation_prefix: Vec<String>,
+    pub success_stream: String,
+    pub error_stream: String,
+    pub output_schema_version: u32,
+    pub one_document: bool,
+    pub success_exit_code: u32,
+    pub failure_exit_code_nonzero: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolState {
+    pub owner: String,
+    pub schema_version: u32,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolComponent {
+    pub owner: String,
+    pub implemented: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolOperation {
+    pub name: String,
+    pub argv_template: Vec<String>,
+    pub mutating: bool,
+    pub stdin: ProtocolStdin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolStdin {
+    None,
+    Utf8Note,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {

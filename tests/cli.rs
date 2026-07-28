@@ -1,4 +1,4 @@
-use relay::model::{Event, Session, SessionState};
+use relay::model::{Checkpoint, Event, ProtocolManifest, Session, SessionState};
 use std::{
     ffi::OsStr,
     fs,
@@ -81,15 +81,159 @@ fn completion_commands_emit_current_cli_without_project_state() {
         assert!(output.stderr.is_empty());
         let script = stdout(&output);
         assert!(!script.is_empty());
-        for command in ["start", "doctor", "context", "completions"] {
+        for command in ["start", "doctor", "context", "completions", "protocol"] {
             assert!(script.contains(command), "{shell} omitted {command}");
         }
         assert!(!directory.path().join(".relay").exists());
     }
 }
 
+#[test]
+fn protocol_manifest_is_versioned_project_independent_and_stable() {
+    const HUMAN_OUTPUT: &str = concat!(
+        "Relay orchestration protocol: 1\n",
+        "Transport: direct argv, one JSON document per process\n",
+        "Output schema: 1\n",
+        "State owner: Rust (schema 1)\n",
+        "Agent/workflow process launch: no\n",
+        "Go orchestrator: not implemented\n",
+        "Lua workflow: not implemented\n",
+        "Operations: status, context, note, checkpoint, handoff, finish\n",
+    );
+
+    let expected_data: serde_json::Value =
+        serde_json::from_str(include_str!("../protocol/manifest-v1.json")).unwrap();
+    assert_eq!(expected_data["relay_version"], "0.2.0");
+    let mut expected_runtime_data = expected_data.clone();
+    expected_runtime_data["relay_version"] = env!("CARGO_PKG_VERSION").into();
+    let directory = tempfile::tempdir().unwrap();
+    let sentinel = directory.path().join("sentinel");
+    fs::write(&sentinel, b"unchanged\n").unwrap();
+    let mut entries_before = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    entries_before.sort();
+
+    let human = relay(directory.path(), &["protocol"]);
+    assert_success(&human);
+    assert!(human.stderr.is_empty());
+    assert_eq!(human.stdout, HUMAN_OUTPUT.as_bytes());
+
+    let json_before = relay_with_env(
+        directory.path(),
+        &["--json", "--scope", "repository", "protocol"],
+        "GIT_CEILING_DIRECTORIES",
+        directory.path().to_str().unwrap(),
+    );
+    assert_success(&json_before);
+    assert!(json_before.stderr.is_empty());
+    let json_repeat = relay_with_env(
+        directory.path(),
+        &["--json", "--scope", "repository", "protocol"],
+        "GIT_CEILING_DIRECTORIES",
+        directory.path().to_str().unwrap(),
+    );
+    assert_success(&json_repeat);
+    assert!(json_repeat.stderr.is_empty());
+    assert_eq!(json_repeat.stdout, json_before.stdout);
+
+    let json_after = relay_with_env(
+        directory.path(),
+        &["protocol", "--scope", "repository", "--json"],
+        "GIT_CEILING_DIRECTORIES",
+        directory.path().to_str().unwrap(),
+    );
+    assert_success(&json_after);
+    assert!(json_after.stderr.is_empty());
+    assert_eq!(json_after.stdout, json_before.stdout);
+
+    let document: serde_json::Value = serde_json::from_slice(&json_before.stdout).unwrap();
+    assert_eq!(
+        document,
+        serde_json::json!({
+            "command": "protocol",
+            "data": expected_runtime_data.clone(),
+            "ok": true,
+            "output_schema_version": 1
+        })
+    );
+    let manifest: ProtocolManifest =
+        serde_json::from_value(document["data"].clone()).expect("deserialize protocol manifest");
+    assert_eq!(
+        serde_json::to_value(manifest).expect("serialize protocol manifest"),
+        expected_runtime_data
+    );
+    let mut unknown_data = expected_runtime_data.clone();
+    unknown_data
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::Value::Null);
+    assert!(serde_json::from_value::<ProtocolManifest>(unknown_data).is_err());
+
+    let mut entries_after = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    entries_after.sort();
+    assert_eq!(entries_after, entries_before);
+    assert_eq!(fs::read(&sentinel).unwrap(), b"unchanged\n");
+    assert!(!directory.path().join(".relay").exists());
+
+    #[cfg(unix)]
+    {
+        let symlink_project = tempfile::tempdir().unwrap();
+        let symlink_target = tempfile::tempdir().unwrap();
+        let target_sentinel = symlink_target.path().join("sentinel");
+        fs::write(&target_sentinel, b"target unchanged\n").unwrap();
+        std::os::unix::fs::symlink(symlink_target.path(), symlink_project.path().join(".relay"))
+            .unwrap();
+
+        let output = relay_with_env(
+            symlink_project.path(),
+            &["protocol", "--json", "--scope", "repository"],
+            "GIT_CEILING_DIRECTORIES",
+            symlink_project.path().to_str().unwrap(),
+        );
+        assert_success(&output);
+        assert!(output.stderr.is_empty());
+        assert_eq!(output.stdout, json_before.stdout);
+        assert_eq!(
+            fs::read_link(symlink_project.path().join(".relay")).unwrap(),
+            symlink_target.path()
+        );
+        assert_eq!(fs::read(&target_sentinel).unwrap(), b"target unchanged\n");
+        assert_eq!(fs::read_dir(symlink_project.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(symlink_target.path()).unwrap().count(), 1);
+    }
+}
+
 fn assert_success(output: &Output) {
     assert!(output.status.success(), "relay failed: {}", stderr(output));
+}
+
+fn json_success_data(output: &Output) -> serde_json::Value {
+    assert_success(output);
+    assert!(output.stderr.is_empty());
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_json_object_has_required_keys(
+        &document,
+        &["command", "data", "ok", "output_schema_version"],
+    );
+    assert_eq!(document["output_schema_version"], 1);
+    assert_eq!(document["ok"], true);
+    assert!(document["data"].is_object());
+    document["data"].clone()
+}
+
+fn assert_json_object_has_required_keys(value: &serde_json::Value, required: &[&str]) {
+    let object = value.as_object().expect("JSON value is an object");
+    for key in required {
+        assert!(
+            object.contains_key(*key),
+            "JSON object is missing required key `{key}`"
+        );
+    }
 }
 
 fn init_repository() -> tempfile::TempDir {
@@ -756,33 +900,333 @@ fn list_recovers_older_supported_legacy_session_from_events() {
 }
 
 #[test]
+fn mutation_results_do_not_rescan_corrupt_unrelated_session_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+
+    assert_success(&relay(project, &["start", "completed historical work"]));
+    assert_success(&relay(project, &["finish"]));
+    let old_session = read_session(project);
+    assert_eq!(old_session.state, SessionState::Completed);
+    assert_success(&relay(project, &["start", "current typed results"]));
+    let current_session = read_session(project);
+    assert_eq!(current_session.state, SessionState::Active);
+    assert_ne!(current_session.id, old_session.id);
+    let current_record: Session = serde_json::from_slice(
+        &fs::read(project.join(format!(".relay/sessions/{}.json", current_session.id))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(current_record, current_session);
+
+    let old_record = project.join(format!(".relay/sessions/{}.json", old_session.id));
+    let corrupt_bytes = b"{ unrelated historical corruption\n";
+    fs::write(&old_record, corrupt_bytes).unwrap();
+
+    let note_text = "Typed results use the completed mutation";
+    let note = relay(project, &["note", "progress", note_text]);
+    assert_success(&note);
+    assert!(note.stderr.is_empty());
+    assert_eq!(
+        stdout(&note).trim_end(),
+        format!("Recorded progress note for session {}", current_session.id)
+    );
+    let note_event = read_events(project).pop().unwrap();
+    assert_eq!(note_event.session_id, current_session.id);
+    assert_eq!(note_event.event_type, "note.recorded");
+    assert_eq!(
+        note_event.payload,
+        serde_json::json!({"category": "progress", "text": note_text})
+    );
+    assert_eq!(fs::read(&old_record).unwrap(), corrupt_bytes);
+
+    let checkpoint_output = relay(project, &["--json", "checkpoint", "typed checkpoint"]);
+    let checkpoint_data = json_success_data(&checkpoint_output);
+    assert_json_object_has_required_keys(&checkpoint_data, &["checkpoint", "path", "session"]);
+    let checkpoint_session: Session =
+        serde_json::from_value(checkpoint_data["session"].clone()).unwrap();
+    assert_eq!(checkpoint_session, current_session);
+    let checkpoint: Checkpoint =
+        serde_json::from_value(checkpoint_data["checkpoint"].clone()).unwrap();
+    assert_eq!(checkpoint.session_id, current_session.id);
+    assert_eq!(checkpoint.message.as_deref(), Some("typed checkpoint"));
+    let checkpoint_path = checkpoint_data["path"].as_str().unwrap();
+    assert!(Path::new(checkpoint_path).is_relative());
+    let saved_checkpoint: Checkpoint =
+        serde_json::from_slice(&fs::read(project.join(checkpoint_path)).unwrap()).unwrap();
+    assert_eq!(saved_checkpoint, checkpoint);
+    let checkpoint_event = read_events(project).pop().unwrap();
+    assert_eq!(checkpoint_event.session_id, current_session.id);
+    assert_eq!(checkpoint_event.event_type, "checkpoint.created");
+    assert_eq!(
+        checkpoint_event.payload["checkpoint"],
+        checkpoint_data["checkpoint"]
+    );
+    assert_eq!(checkpoint_event.payload["path"], checkpoint_data["path"]);
+    assert_eq!(fs::read(&old_record).unwrap(), corrupt_bytes);
+
+    let handoff_output = relay(
+        project,
+        &[
+            "--json",
+            "handoff",
+            "next-agent",
+            "--completed-work",
+            "Returned the durable handoff",
+            "--next-action",
+            "Finish the current session",
+        ],
+    );
+    let handoff_data = json_success_data(&handoff_output);
+    assert_json_object_has_required_keys(&handoff_data, &["markdown", "path", "session"]);
+    let handed_off_session: Session =
+        serde_json::from_value(handoff_data["session"].clone()).unwrap();
+    assert_eq!(handed_off_session.id, current_session.id);
+    assert_eq!(handed_off_session.last_agent.as_deref(), Some("next-agent"));
+    assert_eq!(handed_off_session, read_session(project));
+    let handoff_path = handoff_data["path"].as_str().unwrap();
+    assert!(Path::new(handoff_path).is_relative());
+    assert_eq!(
+        fs::read(project.join(handoff_path)).unwrap(),
+        handoff_data["markdown"].as_str().unwrap().as_bytes()
+    );
+    assert_eq!(fs::read(&old_record).unwrap(), corrupt_bytes);
+
+    let finish_output = relay(project, &["--json", "finish"]);
+    let finish_data = json_success_data(&finish_output);
+    assert_json_object_has_required_keys(&finish_data, &["session", "summary_path"]);
+    let finished_session: Session = serde_json::from_value(finish_data["session"].clone()).unwrap();
+    assert_eq!(finished_session.id, current_session.id);
+    assert_eq!(finished_session.state, SessionState::Completed);
+    assert_eq!(finished_session, read_session(project));
+    let summary_path = finish_data["summary_path"].as_str().unwrap();
+    assert!(Path::new(summary_path).is_relative());
+    assert!(project.join(summary_path).is_file());
+    let finish_event = read_events(project).pop().unwrap();
+    assert_eq!(finish_event.event_type, "session.finished");
+    assert_eq!(finish_event.session_id, current_session.id);
+    assert_eq!(
+        finish_event.payload["summary_path"],
+        finish_data["summary_path"]
+    );
+    assert_eq!(fs::read(&old_record).unwrap(), corrupt_bytes);
+}
+
+#[test]
+fn parser_failures_honor_json_mode_without_mutating_project_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+
+    let assert_json_argument_error = |args: &[&str], message_fragments: &[&str]| {
+        let output = relay(project, args);
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            output.stderr.iter().filter(|&&byte| byte == b'\n').count(),
+            1,
+            "JSON parser failure must be exactly one newline-terminated document"
+        );
+        assert_eq!(output.stderr.last(), Some(&b'\n'));
+
+        let document: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_json_object_has_required_keys(
+            &document,
+            &["command", "error", "ok", "output_schema_version"],
+        );
+        assert_eq!(document.as_object().unwrap().len(), 4);
+        assert_json_object_has_required_keys(&document["error"], &["code", "message"]);
+        assert_eq!(document["error"].as_object().unwrap().len(), 2);
+        assert_eq!(document["output_schema_version"], 1);
+        assert_eq!(document["ok"], false);
+        assert_eq!(document["command"], "cli");
+        assert_eq!(document["error"]["code"], "argument_error");
+
+        let message = document["error"]["message"].as_str().unwrap();
+        assert!(!message.starts_with("error: "));
+        for fragment in message_fragments {
+            assert!(
+                message.contains(*fragment),
+                "argument error message omitted actionable fragment `{fragment}`: {message}"
+            );
+        }
+        assert!(!project.join(".relay").exists());
+    };
+
+    assert_json_argument_error(
+        &["--json", "--scope", "not-a-scope", "status"],
+        &["invalid value", "not-a-scope", "--scope"],
+    );
+    assert_json_argument_error(
+        &["status", "--json", "--scope", "not-a-scope"],
+        &["invalid value", "not-a-scope", "--scope"],
+    );
+    assert_json_argument_error(
+        &["--json", "not-a-command"],
+        &["unrecognized subcommand", "not-a-command"],
+    );
+    assert_json_argument_error(
+        &["completions", "--json"],
+        &["required arguments", "<SHELL>"],
+    );
+
+    let human = relay(project, &["--scope", "not-a-scope", "status"]);
+    assert_eq!(human.status.code(), Some(2));
+    assert!(human.stdout.is_empty());
+    let human_error = stderr(&human);
+    assert!(human_error.starts_with("error: "));
+    assert!(human_error.contains("invalid value"));
+    assert!(human_error.contains("not-a-scope"));
+    assert!(human_error.contains("--scope"));
+    assert!(serde_json::from_slice::<serde_json::Value>(&human.stderr).is_err());
+    assert!(!project.join(".relay").exists());
+
+    let help = relay(project, &["--json", "--help"]);
+    assert_success(&help);
+    assert!(help.stderr.is_empty());
+    let help_text = stdout(&help);
+    assert!(help_text.contains("Usage: relay"));
+    assert!(help_text.contains("--json"));
+    assert!(serde_json::from_slice::<serde_json::Value>(&help.stdout).is_err());
+    assert!(!project.join(".relay").exists());
+
+    let after_delimiter = relay(project, &["protocol", "--", "--json"]);
+    assert_eq!(after_delimiter.status.code(), Some(2));
+    assert!(after_delimiter.stdout.is_empty());
+    let after_delimiter_error = stderr(&after_delimiter);
+    assert!(after_delimiter_error.starts_with("error: "));
+    assert!(after_delimiter_error.contains("--json"));
+    assert!(serde_json::from_slice::<serde_json::Value>(&after_delimiter.stderr).is_err());
+    assert!(!project.join(".relay").exists());
+    #[cfg(unix)]
+    {
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+        let closed_stdio = || {
+            let (stream, peer) = UnixStream::pair().unwrap();
+            drop(peer);
+            Stdio::from(OwnedFd::from(stream))
+        };
+
+        let json_closed_stderr = Command::new(env!("CARGO_BIN_EXE_relay"))
+            .args(["--json", "--scope", "not-a-scope", "status"])
+            .current_dir(project)
+            .stderr(closed_stdio())
+            .output()
+            .expect("run relay binary with closed stderr");
+        assert_eq!(json_closed_stderr.status.code(), Some(2));
+        assert!(json_closed_stderr.stdout.is_empty());
+        assert!(!project.join(".relay").exists());
+
+        let human_closed_stderr = Command::new(env!("CARGO_BIN_EXE_relay"))
+            .args(["--scope", "not-a-scope", "status"])
+            .current_dir(project)
+            .stderr(closed_stdio())
+            .output()
+            .expect("run relay binary with closed stderr");
+        assert_eq!(human_closed_stderr.status.code(), Some(2));
+        assert!(human_closed_stderr.stdout.is_empty());
+
+        let help_closed_stdout = Command::new(env!("CARGO_BIN_EXE_relay"))
+            .arg("--help")
+            .current_dir(project)
+            .stdout(closed_stdio())
+            .output()
+            .expect("run relay binary with closed stdout");
+        assert_eq!(help_closed_stdout.status.code(), Some(0));
+        assert!(help_closed_stdout.stderr.is_empty());
+    }
+}
+
+#[test]
 fn json_envelopes_are_single_typed_documents_and_failures_stay_on_stderr() {
     let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+
+    let started = relay(project, &["--json", "start", "json goal"]);
+    let start_data = json_success_data(&started);
+    assert_json_object_has_required_keys(
+        &start_data,
+        &["event_count", "git", "project", "session"],
+    );
+    let started_session: Session = serde_json::from_value(start_data["session"].clone()).unwrap();
+    assert_eq!(started_session, read_session(project));
+    assert_eq!(
+        start_data["git"],
+        serde_json::to_value(&started_session.initial_git).unwrap()
+    );
+    assert_eq!(start_data["event_count"], 1);
+    assert_eq!(start_data["project"], ".");
+    assert!(!String::from_utf8_lossy(&started.stdout).contains(project.to_string_lossy().as_ref()));
+
+    let note = relay(project, &["--json", "note", "decision", "Keep typed data"]);
+    let note_data = json_success_data(&note);
+    assert_json_object_has_required_keys(&note_data, &["note", "session"]);
+    let note_session: Session = serde_json::from_value(note_data["session"].clone()).unwrap();
+    assert_eq!(note_session, read_session(project));
+    assert_json_object_has_required_keys(&note_data["note"], &["category", "text"]);
+    assert_eq!(
+        note_data["note"],
+        serde_json::json!({"category": "decision", "text": "Keep typed data"})
+    );
+    assert_eq!(
+        read_events(project).last().unwrap().payload,
+        note_data["note"]
+    );
+
     for args in [
-        vec!["--json", "start", "json goal"],
         vec!["--json", "status"],
         vec!["--json", "checkpoint", "typed"],
         vec!["--json", "handoff", "codex"],
         vec!["--json", "list"],
         vec!["--json", "history", "--limit", "2"],
-        vec!["--json", "finish"],
     ] {
-        let output = relay(directory.path(), &args);
-        assert_success(&output);
-        assert!(output.stderr.is_empty());
-        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(document["output_schema_version"], 1);
-        assert_eq!(document["ok"], true);
-        assert!(document["data"].is_object());
+        let output = relay(project, &args);
+        let data = json_success_data(&output);
         assert!(
-            !String::from_utf8_lossy(&output.stdout)
-                .contains(directory.path().to_string_lossy().as_ref())
+            !String::from_utf8_lossy(&output.stdout).contains(project.to_string_lossy().as_ref())
         );
+        assert!(data.is_object());
     }
-    let failed = relay(directory.path(), &["--json", "finish"]);
+
+    let finished = relay(project, &["--json", "finish"]);
+    let finish_data = json_success_data(&finished);
+    let completed_session: Session =
+        serde_json::from_value(finish_data["session"].clone()).unwrap();
+    assert_eq!(completed_session.state, SessionState::Completed);
+    assert!(
+        !String::from_utf8_lossy(&finished.stdout).contains(project.to_string_lossy().as_ref())
+    );
+
+    let completed_id = completed_session.id.to_string();
+    let resumed = relay(project, &["--json", "resume", &completed_id]);
+    let resume_data = json_success_data(&resumed);
+    assert_json_object_has_required_keys(
+        &resume_data,
+        &["event_count", "git", "project", "session"],
+    );
+    let resumed_session: Session = serde_json::from_value(resume_data["session"].clone()).unwrap();
+    assert_eq!(resumed_session, read_session(project));
+    assert_eq!(resumed_session.resumed_from, Some(completed_session.id));
+    assert_eq!(
+        resume_data["git"],
+        serde_json::to_value(&resumed_session.initial_git).unwrap()
+    );
+    assert_eq!(resume_data["event_count"], 1);
+    assert_eq!(resume_data["project"], ".");
+    assert!(!String::from_utf8_lossy(&resumed.stdout).contains(project.to_string_lossy().as_ref()));
+
+    assert_success(&relay(project, &["finish"]));
+    let failed = relay(project, &["--json", "finish"]);
     assert!(!failed.status.success());
     assert!(failed.stdout.is_empty());
     let document: serde_json::Value = serde_json::from_slice(&failed.stderr).unwrap();
+    assert_json_object_has_required_keys(
+        &document,
+        &["command", "error", "ok", "output_schema_version"],
+    );
+    assert_json_object_has_required_keys(&document["error"], &["code", "message"]);
+    assert_eq!(document["output_schema_version"], 1);
+    assert_eq!(document["command"], "finish");
     assert_eq!(document["ok"], false);
     assert_eq!(document["error"]["code"], "lifecycle_error");
 }
@@ -963,6 +1407,119 @@ fn context_filters_deterministically_respects_item_budget_and_preserves_privacy(
 }
 
 #[test]
+fn context_renders_structured_handoff_details_without_duplicating_separate_items() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+    let project_path = project.to_string_lossy().into_owned();
+    let note_text = "Documented renderer progress";
+    let checkpoint_message = "Captured renderer checkpoint";
+    let target_agent = "context-specialist";
+    let completed_work = "Rendered structured handoff details";
+    let decision = format!("Keep artifacts under {project_path}");
+    let redacted_decision = "Keep artifacts under [project root]";
+    let failure = "Renderer omitted detail labels";
+    let next_action = "Verify context presentation";
+
+    assert_success(&relay(project, &["start", "structured context"]));
+    assert_success(&relay(project, &["note", "progress", note_text]));
+    assert_success(&relay(project, &["checkpoint", checkpoint_message]));
+    assert_success(&relay(
+        project,
+        &[
+            "handoff",
+            target_agent,
+            "--completed-work",
+            completed_work,
+            "--decision",
+            decision.as_str(),
+            "--failure",
+            failure,
+            "--next-action",
+            next_action,
+        ],
+    ));
+
+    let human_output = relay(
+        project,
+        &[
+            "context",
+            "--notes",
+            "1",
+            "--events",
+            "4",
+            "--checkpoints",
+            "1",
+            "--max-chars",
+            "4000",
+        ],
+    );
+    assert_success(&human_output);
+    let text = stdout(&human_output);
+    assert!(text.contains("handoff.generated"));
+    let labels = [
+        "Target agent",
+        "Completed work",
+        "Decisions",
+        "Failures",
+        "Next actions",
+    ];
+    let label_positions = labels.map(|label| {
+        text.find(label)
+            .unwrap_or_else(|| panic!("missing handoff detail label {label}"))
+    });
+    assert!(
+        label_positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "handoff detail labels are not in semantic order"
+    );
+    for value in [
+        target_agent,
+        completed_work,
+        redacted_decision,
+        failure,
+        next_action,
+    ] {
+        assert!(text.contains(value), "missing handoff detail value {value}");
+    }
+    assert!(!text.contains(project_path.as_str()));
+    assert!(text.contains("[project root]"));
+    assert_eq!(text.matches(note_text).count(), 1);
+    assert_eq!(text.matches(checkpoint_message).count(), 1);
+
+    let json_output = relay(
+        project,
+        &[
+            "--json",
+            "context",
+            "--notes",
+            "1",
+            "--events",
+            "4",
+            "--checkpoints",
+            "1",
+            "--max-chars",
+            "4000",
+        ],
+    );
+    assert_success(&json_output);
+    let document: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let handoff_event = document["data"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "handoff.generated")
+        .expect("handoff event is present");
+    let payload = &handoff_event["payload"];
+    assert_eq!(payload["agent"], target_agent);
+    assert_eq!(
+        payload["completed_work"],
+        serde_json::json!([completed_work])
+    );
+    assert_eq!(payload["decisions"], serde_json::json!([decision]));
+    assert_eq!(payload["failures"], serde_json::json!([failure]));
+    assert_eq!(payload["next_action"], next_action);
+}
+
+#[test]
 fn context_limits_keep_latest_items_in_recorded_order() {
     let directory = tempfile::tempdir().unwrap();
     assert_success(&relay(directory.path(), &["start", "recent context"]));
@@ -1031,4 +1588,1153 @@ fn context_limits_keep_latest_items_in_recorded_order() {
     assert!(!text.contains("oldest note"));
     assert!(!text.contains("middle note"));
     assert!(!text.contains("checkpoint 0"));
+}
+
+#[test]
+fn context_strict_character_budget_is_deterministic_and_reports_omission_causes() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+    let goal = format!(
+        "GOAL_UNICODE_界🙂é {}",
+        "A deliberately long session goal 界🙂é ".repeat(24)
+    );
+    let notes = [
+        format!(
+            "NOTE_ALPHA_界🙂é {}",
+            "alpha content with Unicode 界🙂é ".repeat(12)
+        ),
+        format!(
+            "NOTE_BETA_界🙂é {}",
+            "beta content with Unicode 界🙂é ".repeat(12)
+        ),
+        format!(
+            "NOTE_GAMMA_界🙂é {}",
+            "gamma content with Unicode 界🙂é ".repeat(12)
+        ),
+    ];
+    let checkpoints = [
+        format!(
+            "CHECKPOINT_ALPHA_界🙂é {}",
+            "alpha checkpoint detail 界🙂é ".repeat(10)
+        ),
+        format!(
+            "CHECKPOINT_BETA_界🙂é {}",
+            "beta checkpoint detail 界🙂é ".repeat(10)
+        ),
+        format!(
+            "CHECKPOINT_GAMMA_界🙂é {}",
+            "gamma checkpoint detail 界🙂é ".repeat(10)
+        ),
+    ];
+    let next_action = format!(
+        "NEXT_ACTION_界🙂é {}",
+        "finish the deterministic budget review 界🙂é ".repeat(12)
+    );
+
+    assert_success(&relay(project, &["start", goal.as_str()]));
+    for (category, note) in ["progress", "decision", "next_action"]
+        .into_iter()
+        .zip(notes.iter())
+    {
+        assert_success(&relay(project, &["note", category, note.as_str()]));
+    }
+    for checkpoint in &checkpoints {
+        assert_success(&relay(project, &["checkpoint", checkpoint.as_str()]));
+    }
+    assert_success(&relay(
+        project,
+        &[
+            "handoff",
+            "budget-reviewer",
+            "--next-action",
+            next_action.as_str(),
+        ],
+    ));
+
+    let limited_args = [
+        "context",
+        "--notes",
+        "2",
+        "--checkpoints",
+        "2",
+        "--events",
+        "3",
+        "--max-chars",
+        "64",
+    ];
+    let minimum = relay(project, &limited_args);
+    let repeated_minimum = relay(project, &limited_args);
+    assert_success(&minimum);
+    assert_success(&repeated_minimum);
+    assert_eq!(minimum.stdout, repeated_minimum.stdout);
+    let minimum_text = stdout(&minimum);
+    assert!(
+        minimum_text.chars().count() <= 64,
+        "64-character output used {} characters:\n{minimum_text}",
+        minimum_text.chars().count()
+    );
+    assert_eq!(
+        minimum_text,
+        "# Relay\nTruncated: yes\nCount N/C/E: 1/1/5\nBudget N/C/E: 2/2/3\n\n"
+    );
+    for value in [
+        goal.as_str(),
+        notes[1].as_str(),
+        notes[2].as_str(),
+        checkpoints[1].as_str(),
+        checkpoints[2].as_str(),
+        next_action.as_str(),
+    ] {
+        assert!(
+            !minimum_text.contains(value),
+            "minimum output unexpectedly contained a budget-omitted item"
+        );
+    }
+
+    let generous_args = [
+        "context",
+        "--notes",
+        "2",
+        "--checkpoints",
+        "2",
+        "--events",
+        "3",
+        "--max-chars",
+        "12000",
+    ];
+    let generous = relay(project, &generous_args);
+    assert_success(&generous);
+    let generous_text = stdout(&generous);
+    let exact_budget = generous_text.chars().count();
+    assert!(exact_budget < 12000);
+    for line in [
+        "Count-omitted notes: 1",
+        "Count-omitted checkpoints: 1",
+        "Count-omitted events: 5",
+        "Budget-omitted notes: 0",
+        "Budget-omitted checkpoints: 0",
+        "Budget-omitted events: 0",
+    ] {
+        assert!(
+            generous_text.lines().any(|actual| actual == line),
+            "missing detailed omission metadata {line:?}:\n{generous_text}"
+        );
+    }
+
+    let exact_budget_arg = exact_budget.to_string();
+    let exact = relay(
+        project,
+        &[
+            "context",
+            "--notes",
+            "2",
+            "--checkpoints",
+            "2",
+            "--events",
+            "3",
+            "--max-chars",
+            exact_budget_arg.as_str(),
+        ],
+    );
+    assert_success(&exact);
+    assert_eq!(exact.stdout, generous.stdout);
+
+    let one_less_budget = (exact_budget - 1).to_string();
+    let one_less = relay(
+        project,
+        &[
+            "context",
+            "--notes",
+            "2",
+            "--checkpoints",
+            "2",
+            "--events",
+            "3",
+            "--max-chars",
+            one_less_budget.as_str(),
+        ],
+    );
+    assert_success(&one_less);
+    let one_less_text = stdout(&one_less);
+    assert!(one_less_text.chars().count() < exact_budget);
+    assert_ne!(one_less.stdout, generous.stdout);
+    for line in [
+        "Count-omitted notes: 1",
+        "Count-omitted checkpoints: 1",
+        "Count-omitted events: 5",
+        "Budget-omitted notes: 0",
+        "Budget-omitted checkpoints: 0",
+        "Budget-omitted events: 1",
+    ] {
+        assert!(
+            one_less_text.lines().any(|actual| actual == line),
+            "missing one-less omission metadata {line:?}:\n{one_less_text}"
+        );
+    }
+    let indivisible_values = [
+        ("NOTE_BETA_", notes[1].as_str()),
+        ("NOTE_GAMMA_", notes[2].as_str()),
+        ("CHECKPOINT_BETA_", checkpoints[1].as_str()),
+        ("CHECKPOINT_GAMMA_", checkpoints[2].as_str()),
+        ("NEXT_ACTION_", next_action.as_str()),
+    ];
+    for (marker, value) in indivisible_values {
+        let normalized_value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            one_less_text.contains(marker),
+            one_less_text.contains(&normalized_value),
+            "item beginning with {marker:?} was rendered partially"
+        );
+    }
+    assert!(
+        indivisible_values
+            .iter()
+            .any(|(marker, _)| !one_less_text.contains(marker)),
+        "one-less output did not omit a whole item"
+    );
+
+    let minimum_json = relay(
+        project,
+        &[
+            "--json",
+            "context",
+            "--notes",
+            "2",
+            "--checkpoints",
+            "2",
+            "--events",
+            "3",
+            "--max-chars",
+            "64",
+        ],
+    );
+    assert_success(&minimum_json);
+    assert!(
+        String::from_utf8(minimum_json.stdout.clone())
+            .unwrap()
+            .chars()
+            .count()
+            > 64,
+        "--max-chars unexpectedly bounded the JSON envelope"
+    );
+    let document: serde_json::Value = serde_json::from_slice(&minimum_json.stdout).unwrap();
+    let data = &document["data"];
+    assert_eq!(data["notes"].as_array().unwrap().len(), 2);
+    assert_eq!(data["notes"][0]["text"], notes[1]);
+    assert_eq!(data["notes"][1]["text"], notes[2]);
+    assert_eq!(data["checkpoints"].as_array().unwrap().len(), 2);
+    assert_eq!(data["checkpoints"][0]["message"], checkpoints[1]);
+    assert_eq!(data["checkpoints"][1]["message"], checkpoints[2]);
+    assert_eq!(data["events"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        data["omitted"],
+        serde_json::json!({"notes": 1, "checkpoints": 1, "events": 5})
+    );
+    assert_eq!(
+        data["budget_omitted"],
+        serde_json::json!({"notes": 2, "checkpoints": 2, "events": 3})
+    );
+    assert_eq!(data["budget_truncated"], true);
+    assert_eq!(data["truncated"], true);
+    assert_eq!(data["max_chars"], 64);
+    let handoff_event = data["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "handoff.generated")
+        .expect("count-limited events retain the handoff");
+    assert_eq!(handoff_event["payload"]["next_action"], next_action);
+    assert!(handoff_event["payload"]["next_action"].is_string());
+
+    let generous_json = relay(
+        project,
+        &[
+            "--json",
+            "context",
+            "--notes",
+            "2",
+            "--checkpoints",
+            "2",
+            "--events",
+            "3",
+            "--max-chars",
+            exact_budget_arg.as_str(),
+        ],
+    );
+    assert_success(&generous_json);
+    let document: serde_json::Value = serde_json::from_slice(&generous_json.stdout).unwrap();
+    let data = &document["data"];
+    assert_eq!(
+        data["omitted"],
+        serde_json::json!({"notes": 1, "checkpoints": 1, "events": 5})
+    );
+    assert_eq!(
+        data["budget_omitted"],
+        serde_json::json!({"notes": 0, "checkpoints": 0, "events": 0})
+    );
+    assert_eq!(data["budget_truncated"], false);
+    assert_eq!(data["truncated"], true);
+}
+
+#[test]
+fn navigation_is_deterministic_across_history_and_shared_session_selectors() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+
+    assert_success(&relay(project, &["start", "first navigation session"]));
+    let first = read_session(project);
+    assert_success(&relay(project, &["note", "progress", "first oldest note"]));
+    assert_success(&relay(project, &["checkpoint", "first checkpoint"]));
+    assert_success(&relay(project, &["note", "decision", "first newest note"]));
+    assert_success(&relay(project, &["finish"]));
+
+    let resumed = relay(project, &["--json", "resume", "LaTeSt"]);
+    let resumed_data = json_success_data(&resumed);
+    let second = read_session(project);
+    assert_eq!(resumed_data["session"]["id"], second.id.to_string());
+    assert_eq!(second.resumed_from, Some(first.id));
+    assert_success(&relay(project, &["note", "progress", "second oldest note"]));
+    assert_success(&relay(project, &["checkpoint", "second checkpoint"]));
+    assert_success(&relay(project, &["note", "decision", "second newest note"]));
+    assert_success(&relay(project, &["finish"]));
+
+    let events_path = project.join(".relay/events.jsonl");
+    let original_bytes = fs::read(&events_path).unwrap();
+    assert_eq!(original_bytes.last(), Some(&b'\n'));
+    let generated_events = read_events(project);
+    assert_eq!(generated_events.len(), 10);
+    let event_kinds = generated_events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>();
+    for kind in ["note.recorded", "checkpoint.created", "session.finished"] {
+        assert!(event_kinds.contains(&kind));
+    }
+
+    let original_values = String::from_utf8(original_bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(original_values.len(), generated_events.len());
+    let fixed_timestamps = (0..original_values.len())
+        .map(|index| format!("2024-01-02T03:04:{index:02}Z"))
+        .collect::<Vec<_>>();
+    let mut fixed_values = original_values.clone();
+    for ((before, after), timestamp) in original_values
+        .iter()
+        .zip(&mut fixed_values)
+        .zip(&fixed_timestamps)
+    {
+        after["timestamp"] = serde_json::Value::String(timestamp.clone());
+        let mut before_without_timestamp = before.clone();
+        let mut after_without_timestamp = after.clone();
+        before_without_timestamp
+            .as_object_mut()
+            .unwrap()
+            .remove("timestamp");
+        after_without_timestamp
+            .as_object_mut()
+            .unwrap()
+            .remove("timestamp");
+        assert_eq!(after_without_timestamp, before_without_timestamp);
+    }
+    let mut fixed_bytes = Vec::new();
+    for event in &fixed_values {
+        serde_json::to_writer(&mut fixed_bytes, event).unwrap();
+        fixed_bytes.push(b'\n');
+    }
+    fs::write(&events_path, &fixed_bytes).unwrap();
+    assert_eq!(fixed_bytes.last(), Some(&b'\n'));
+
+    let fixed_events = read_events(project);
+    assert_eq!(fixed_events.len(), generated_events.len());
+    for ((before, after), timestamp) in generated_events
+        .iter()
+        .zip(&fixed_events)
+        .zip(&fixed_timestamps)
+    {
+        assert_eq!(after.schema_version, before.schema_version);
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(after.event_type, before.event_type);
+        assert_eq!(after.payload, before.payload);
+        assert_eq!(
+            serde_json::to_value(after.timestamp).unwrap(),
+            serde_json::json!(timestamp)
+        );
+    }
+
+    let newest = if first.started_at > second.started_at
+        || (first.started_at == second.started_at && first.id > second.id)
+    {
+        &first
+    } else {
+        &second
+    };
+    let other = if newest.id == first.id {
+        &second
+    } else {
+        &first
+    };
+    let newest_id = newest.id.to_string();
+    let other_id = other.id.to_string();
+    let prefix_len = (8..=newest_id.len())
+        .find(|&length| !other_id.starts_with(&newest_id[..length]))
+        .unwrap();
+    let newest_prefix = &newest_id[..prefix_len];
+    let newest_events = fixed_events
+        .iter()
+        .filter(|event| event.session_id == newest.id)
+        .collect::<Vec<_>>();
+    assert_eq!(newest_events.len(), 5);
+
+    let default_json = relay(
+        project,
+        &[
+            "--json",
+            "history",
+            "--session",
+            newest_prefix,
+            "--limit",
+            "2",
+        ],
+    );
+    let default_data = json_success_data(&default_json);
+    assert_json_object_has_required_keys(
+        &default_data,
+        &["events", "truncated", "order", "since", "until", "limit"],
+    );
+    assert_eq!(default_data["events"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        default_data["events"][0]["id"],
+        newest_events[0].id.to_string()
+    );
+    assert_eq!(
+        default_data["events"][1]["id"],
+        newest_events[1].id.to_string()
+    );
+    assert_eq!(default_data["truncated"], true);
+    assert_eq!(default_data["order"], "oldest_first");
+    assert!(default_data["since"].is_null());
+    assert!(default_data["until"].is_null());
+    assert_eq!(default_data["limit"], 2);
+
+    let default_human = relay(
+        project,
+        &["history", "--session", newest_prefix, "--limit", "2"],
+    );
+    assert_success(&default_human);
+    let default_text = stdout(&default_human);
+    let default_lines = default_text.lines().collect::<Vec<_>>();
+    assert_eq!(default_lines.len(), 3);
+    for (line, event) in default_lines[..2].iter().zip(&newest_events[..2]) {
+        assert_eq!(
+            *line,
+            format!(
+                "{}  {}  {}  {}",
+                event.timestamp.to_rfc3339(),
+                event.session_id,
+                event.event_type,
+                event.id
+            )
+        );
+    }
+    assert_eq!(default_lines[2], "Truncated: yes");
+
+    let reverse_json = relay(
+        project,
+        &[
+            "--json",
+            "history",
+            "--session",
+            newest_prefix,
+            "--reverse",
+            "--limit",
+            "2",
+        ],
+    );
+    let reverse_data = json_success_data(&reverse_json);
+    assert_json_object_has_required_keys(
+        &reverse_data,
+        &["events", "truncated", "order", "since", "until", "limit"],
+    );
+    assert_eq!(reverse_data["events"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        reverse_data["events"][0]["id"],
+        newest_events[4].id.to_string()
+    );
+    assert_eq!(
+        reverse_data["events"][1]["id"],
+        newest_events[3].id.to_string()
+    );
+    assert_eq!(reverse_data["truncated"], true);
+    assert_eq!(reverse_data["order"], "newest_first");
+    assert!(reverse_data["since"].is_null());
+    assert!(reverse_data["until"].is_null());
+    assert_eq!(reverse_data["limit"], 2);
+
+    let since = fixed_timestamps[fixed_events
+        .iter()
+        .position(|event| event.id == newest_events[1].id)
+        .unwrap()]
+    .clone();
+    let until = fixed_timestamps[fixed_events
+        .iter()
+        .position(|event| event.id == newest_events[3].id)
+        .unwrap()]
+    .clone();
+    assert_eq!(newest_events[1].event_type, "note.recorded");
+    assert_eq!(newest_events[3].event_type, "note.recorded");
+    let bounded_json = relay(
+        project,
+        &[
+            "--json",
+            "history",
+            "--session",
+            newest_prefix,
+            "--type",
+            "note.recorded",
+            "--since",
+            &since,
+            "--until",
+            &until,
+            "--limit",
+            "2",
+        ],
+    );
+    let bounded_data = json_success_data(&bounded_json);
+    assert_json_object_has_required_keys(
+        &bounded_data,
+        &["events", "truncated", "order", "since", "until", "limit"],
+    );
+    assert_eq!(bounded_data["events"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        bounded_data["events"][0]["id"],
+        newest_events[1].id.to_string()
+    );
+    assert_eq!(
+        bounded_data["events"][1]["id"],
+        newest_events[3].id.to_string()
+    );
+    assert_eq!(bounded_data["truncated"], false);
+    assert_eq!(bounded_data["order"], "oldest_first");
+    assert_eq!(bounded_data["since"].as_str(), Some(since.as_str()));
+    assert_eq!(bounded_data["until"].as_str(), Some(until.as_str()));
+    assert_eq!(bounded_data["limit"], 2);
+
+    let bytes_before_invalid_bounds = fs::read(&events_path).unwrap();
+    let invalid_bounds = relay(
+        project,
+        &[
+            "history",
+            "--session",
+            newest_prefix,
+            "--since",
+            &until,
+            "--until",
+            &since,
+        ],
+    );
+    assert!(!invalid_bounds.status.success());
+    let invalid_error = stderr(&invalid_bounds);
+    assert!(invalid_error.contains("--since"));
+    assert!(invalid_error.contains("--until"));
+    assert_eq!(fs::read(&events_path).unwrap(), bytes_before_invalid_bounds);
+
+    let shown = relay(project, &["--json", "show", "LATEST"]);
+    let shown_data = json_success_data(&shown);
+    assert_eq!(shown_data["session"]["id"], newest_id);
+
+    let context = relay(
+        project,
+        &[
+            "--json",
+            "context",
+            "--session",
+            "laTESt",
+            "--notes",
+            "10",
+            "--events",
+            "10",
+            "--checkpoints",
+            "10",
+        ],
+    );
+    let context_data = json_success_data(&context);
+    assert_eq!(context_data["session"]["id"], newest.id.to_string());
+    assert_eq!(context_data["events"].as_array().unwrap().len(), 5);
+    assert!(
+        context_data["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["session_id"].as_str() == Some(newest_id.as_str()))
+    );
+
+    let latest_history = relay(
+        project,
+        &["--json", "history", "--session", "lAtEsT", "--limit", "100"],
+    );
+    let latest_history_data = json_success_data(&latest_history);
+    assert_eq!(
+        latest_history_data["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        newest_events
+            .iter()
+            .map(|event| event.id.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn search_is_deterministic_filterable_and_read_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+    let project_path = project.to_string_lossy().into_owned();
+    let goal = "first needle-goal for resumed search";
+    let progress_text = format!(
+        "needle-human progress\npath {project_path}\twith collapsed whitespace \u{1b}control"
+    );
+    let checkpoint_message = "nested checkpoint needle-checkpoint message";
+    let completed_match = "needle-handoff completed array element";
+    let later_completed_match = "needle-handoff alphabetically-earlier later array element";
+    let decision_match = "second needle-decision note";
+
+    assert_success(&relay(project, &["start", goal]));
+    let first = read_session(project);
+    assert_success(&relay_with_stdin(
+        project,
+        &["note", "progress", "--stdin"],
+        progress_text.as_bytes(),
+    ));
+    assert_success(&relay(project, &["checkpoint", checkpoint_message]));
+    assert_success(&relay(
+        project,
+        &[
+            "handoff",
+            "search-reader",
+            "--completed-work",
+            "plain completed array element",
+            "--completed-work",
+            completed_match,
+            "--completed-work",
+            later_completed_match,
+            "--decision",
+            "needle-handoff later decision array element",
+            "--failure",
+            "Needle-handoff mixed-case decoy",
+            "--next-action",
+            "plain next action",
+        ],
+    ));
+    assert_success(&relay(project, &["finish"]));
+
+    assert_success(&relay(project, &["resume", "latest"]));
+    let resumed = read_session(project);
+    assert_eq!(resumed.resumed_from, Some(first.id));
+    assert_success(&relay(project, &["note", "decision", decision_match]));
+    assert_success(&relay(project, &["finish"]));
+
+    let relay_root = project.join(".relay");
+    let sessions_root = relay_root.join("sessions");
+    let first_session_path = sessions_root.join(format!("{}.json", first.id));
+    let resumed_session_path = sessions_root.join(format!("{}.json", resumed.id));
+    let current_session_path = relay_root.join("session.json");
+    let original_completed_first: Session =
+        serde_json::from_slice(&fs::read(&first_session_path).unwrap()).unwrap();
+    let original_completed_resumed: Session =
+        serde_json::from_slice(&fs::read(&resumed_session_path).unwrap()).unwrap();
+    let original_current_session: Session =
+        serde_json::from_slice(&fs::read(&current_session_path).unwrap()).unwrap();
+    assert_eq!(original_completed_first.state, SessionState::Completed);
+    assert_eq!(original_completed_resumed.state, SessionState::Completed);
+    assert_eq!(original_completed_resumed.id, resumed.id);
+    assert_eq!(original_completed_resumed.resumed_from, Some(first.id));
+    assert_eq!(original_current_session, original_completed_resumed);
+
+    let earlier_started_at = "2024-02-01T00:00:00Z".parse().unwrap();
+    let later_started_at = "2024-02-02T00:00:00Z".parse().unwrap();
+    let mut fixed_first_session = original_completed_first.clone();
+    let mut fixed_resumed_session = original_completed_resumed.clone();
+    let mut fixed_current_session = original_current_session.clone();
+    fixed_first_session.started_at = earlier_started_at;
+    fixed_resumed_session.started_at = later_started_at;
+    fixed_current_session.started_at = later_started_at;
+    for (path, session) in [
+        (&first_session_path, &fixed_first_session),
+        (&resumed_session_path, &fixed_resumed_session),
+        (&current_session_path, &fixed_current_session),
+    ] {
+        let mut bytes = serde_json::to_vec_pretty(session).unwrap();
+        bytes.push(b'\n');
+        fs::write(path, bytes).unwrap();
+    }
+
+    let completed_first: Session =
+        serde_json::from_slice(&fs::read(&first_session_path).unwrap()).unwrap();
+    let completed_resumed: Session =
+        serde_json::from_slice(&fs::read(&resumed_session_path).unwrap()).unwrap();
+    let current_session: Session =
+        serde_json::from_slice(&fs::read(&current_session_path).unwrap()).unwrap();
+    assert_eq!(completed_first, fixed_first_session);
+    assert_eq!(completed_resumed, fixed_resumed_session);
+    assert_eq!(current_session, fixed_current_session);
+    assert_eq!(
+        [completed_first.id, completed_resumed.id],
+        [first.id, resumed.id]
+    );
+    assert!(completed_first.started_at < completed_resumed.started_at);
+    assert_eq!(current_session.id, resumed.id);
+    assert_eq!(current_session.started_at, completed_resumed.started_at);
+
+    let events_path = project.join(".relay/events.jsonl");
+    let original_bytes = fs::read(&events_path).unwrap();
+    assert_eq!(original_bytes.last(), Some(&b'\n'));
+    let generated_events = read_events(project);
+    assert_eq!(
+        generated_events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "session.started",
+            "note.recorded",
+            "checkpoint.created",
+            "handoff.generated",
+            "session.finished",
+            "session.resumed",
+            "note.recorded",
+            "session.finished",
+        ]
+    );
+
+    let original_values = String::from_utf8(original_bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(original_values.len(), generated_events.len());
+    let fixed_timestamps = (0..original_values.len())
+        .map(|index| format!("2024-02-03T04:05:{index:02}Z"))
+        .collect::<Vec<_>>();
+    let mut fixed_values = original_values.clone();
+    for ((before, after), timestamp) in original_values
+        .iter()
+        .zip(&mut fixed_values)
+        .zip(&fixed_timestamps)
+    {
+        after["timestamp"] = serde_json::Value::String(timestamp.clone());
+        let mut before_without_timestamp = before.clone();
+        let mut after_without_timestamp = after.clone();
+        before_without_timestamp
+            .as_object_mut()
+            .unwrap()
+            .remove("timestamp");
+        after_without_timestamp
+            .as_object_mut()
+            .unwrap()
+            .remove("timestamp");
+        assert_eq!(after_without_timestamp, before_without_timestamp);
+    }
+    let mut fixed_bytes = Vec::new();
+    for event in &fixed_values {
+        serde_json::to_writer(&mut fixed_bytes, event).unwrap();
+        fixed_bytes.push(b'\n');
+    }
+    fs::write(&events_path, &fixed_bytes).unwrap();
+    assert_eq!(fixed_bytes.last(), Some(&b'\n'));
+
+    let fixed_events = read_events(project);
+    assert_eq!(fixed_events.len(), generated_events.len());
+    for ((before, after), timestamp) in generated_events
+        .iter()
+        .zip(&fixed_events)
+        .zip(&fixed_timestamps)
+    {
+        assert_eq!(after.schema_version, before.schema_version);
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(after.event_type, before.event_type);
+        assert_eq!(after.payload, before.payload);
+        assert_eq!(
+            serde_json::to_value(after.timestamp).unwrap(),
+            serde_json::json!(timestamp)
+        );
+    }
+
+    let lock_before = fs::read(relay_root.join("lock")).unwrap();
+    let snapshot_directory = |path: &Path| {
+        let mut files = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    };
+    let directory_names = |path: &Path| {
+        let mut names = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let relay_entries_before = directory_names(&relay_root);
+    let current_session_before = fs::read(relay_root.join("session.json")).unwrap();
+    let sessions_before = snapshot_directory(&relay_root.join("sessions"));
+    let checkpoints_before = snapshot_directory(&relay_root.join("checkpoints"));
+    let handoffs_before = snapshot_directory(&relay_root.join("handoffs"));
+    let operations_before = snapshot_directory(&relay_root.join("operations"));
+    let first_summary_path = relay_root.join(format!("summary-{}.md", first.id));
+    let resumed_summary_path = relay_root.join(format!("summary-{}.md", resumed.id));
+    let first_summary_before = fs::read(&first_summary_path).unwrap();
+    let resumed_summary_before = fs::read(&resumed_summary_path).unwrap();
+    assert_eq!(sessions_before.len(), 2);
+    assert_eq!(checkpoints_before.len(), 1);
+    assert_eq!(handoffs_before.len(), 1);
+
+    let default_search = relay(project, &["--json", "search", "needle"]);
+    let default_data = json_success_data(&default_search);
+    let repeated_default = relay(project, &["--json", "search", "needle"]);
+    assert_success(&repeated_default);
+    assert!(repeated_default.stderr.is_empty());
+    assert_eq!(repeated_default.stdout, default_search.stdout);
+    let mut data_keys = default_data
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    data_keys.sort_unstable();
+    assert_eq!(
+        data_keys,
+        [
+            "category",
+            "limit",
+            "matches",
+            "order",
+            "query",
+            "session",
+            "since",
+            "truncated",
+            "type",
+            "until",
+        ]
+    );
+    assert_eq!(default_data["query"], "needle");
+    assert_eq!(default_data["order"], "oldest_first");
+    assert_eq!(default_data["truncated"], false);
+    assert!(default_data["session"].is_null());
+    assert!(default_data["type"].is_null());
+    assert!(default_data["category"].is_null());
+    assert!(default_data["since"].is_null());
+    assert!(default_data["until"].is_null());
+    assert_eq!(default_data["limit"], 100);
+
+    let matches = default_data["matches"].as_array().unwrap();
+    let expected_matches = [
+        (0, "/payload/goal", goal),
+        (1, "/payload/text", progress_text.as_str()),
+        (2, "/payload/checkpoint/message", checkpoint_message),
+        (3, "/payload/completed_work/1", completed_match),
+        (5, "/payload/goal", goal),
+        (6, "/payload/text", decision_match),
+    ];
+    assert_eq!(matches.len(), expected_matches.len());
+    for (matched, (event_index, field, text)) in matches.iter().zip(expected_matches) {
+        let mut match_keys = matched
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        match_keys.sort_unstable();
+        assert_eq!(match_keys, ["event", "field", "text"]);
+        assert_eq!(
+            matched["event"],
+            serde_json::to_value(&fixed_events[event_index]).unwrap()
+        );
+        assert_eq!(matched["field"], field);
+        assert_eq!(matched["text"], text);
+    }
+
+    let type_precedence = json_success_data(&relay(project, &["--json", "search", "note"]));
+    let type_matches = type_precedence["matches"].as_array().unwrap();
+    assert_eq!(type_matches.len(), 2);
+    for (matched, event_index) in type_matches.iter().zip([1, 6]) {
+        assert_eq!(
+            matched["event"],
+            serde_json::to_value(&fixed_events[event_index]).unwrap()
+        );
+        assert_eq!(matched["field"], "type");
+        assert_eq!(matched["text"], "note.recorded");
+    }
+
+    let exact_type = json_success_data(&relay(
+        project,
+        &[
+            "--json",
+            "search",
+            "needle",
+            "--type",
+            "checkpoint.created",
+            "--limit",
+            "1",
+        ],
+    ));
+    assert_eq!(exact_type["type"], "checkpoint.created");
+    assert_eq!(exact_type["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        exact_type["matches"][0]["event"],
+        serde_json::to_value(&fixed_events[2]).unwrap()
+    );
+    assert_eq!(
+        exact_type["matches"][0]["field"],
+        "/payload/checkpoint/message"
+    );
+    assert_eq!(exact_type["truncated"], false);
+
+    let latest = json_success_data(&relay(
+        project,
+        &["--json", "search", "needle", "--session", "latest"],
+    ));
+    assert_eq!(latest["session"], resumed.id.to_string());
+    assert_eq!(
+        latest["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|matched| matched["event"]["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            fixed_events[5].id.to_string(),
+            fixed_events[6].id.to_string()
+        ]
+    );
+
+    let categorized = json_success_data(&relay(
+        project,
+        &[
+            "--json",
+            "search",
+            "needle",
+            "--session",
+            "LaTeSt",
+            "--category",
+            "decision",
+            "--limit",
+            "1",
+        ],
+    ));
+    assert_eq!(categorized["session"], resumed.id.to_string());
+    assert_eq!(categorized["category"], "decision");
+    assert_eq!(categorized["limit"], 1);
+    assert_eq!(categorized["truncated"], false);
+    assert_eq!(categorized["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        categorized["matches"][0]["event"],
+        serde_json::to_value(&fixed_events[6]).unwrap()
+    );
+    assert_eq!(categorized["matches"][0]["field"], "/payload/text");
+
+    let bounded = json_success_data(&relay(
+        project,
+        &[
+            "--json",
+            "search",
+            "needle",
+            "--since",
+            &fixed_timestamps[2],
+            "--until",
+            &fixed_timestamps[5],
+            "--limit",
+            "3",
+        ],
+    ));
+    assert_eq!(bounded["since"], fixed_timestamps[2]);
+    assert_eq!(bounded["until"], fixed_timestamps[5]);
+    assert_eq!(bounded["truncated"], false);
+    assert_eq!(
+        bounded["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|matched| matched["event"]["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            fixed_events[2].id.to_string(),
+            fixed_events[3].id.to_string(),
+            fixed_events[5].id.to_string(),
+        ]
+    );
+
+    let reversed = json_success_data(&relay(
+        project,
+        &["--json", "search", "needle", "--reverse", "--limit", "2"],
+    ));
+    assert_eq!(reversed["order"], "newest_first");
+    assert_eq!(reversed["limit"], 2);
+    assert_eq!(reversed["truncated"], true);
+    assert_eq!(
+        reversed["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|matched| matched["event"]["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            fixed_events[6].id.to_string(),
+            fixed_events[5].id.to_string()
+        ]
+    );
+
+    let zero_limit = json_success_data(&relay(
+        project,
+        &["--json", "search", "needle", "--limit", "0"],
+    ));
+    assert!(zero_limit["matches"].as_array().unwrap().is_empty());
+    assert_eq!(zero_limit["limit"], 0);
+    assert_eq!(zero_limit["truncated"], true);
+
+    let case_mismatch = json_success_data(&relay(project, &["--json", "search", "NEEDLE"]));
+    assert!(case_mismatch["matches"].as_array().unwrap().is_empty());
+    assert_eq!(case_mismatch["truncated"], false);
+
+    let empty_human = relay(project, &["search", "needle", "--type", "session"]);
+    assert_success(&empty_human);
+    assert!(empty_human.stderr.is_empty());
+    assert_eq!(empty_human.stdout, b"Truncated: no\n");
+
+    let safe_human = relay(project, &["search", "needle-human"]);
+    assert_success(&safe_human);
+    assert!(safe_human.stderr.is_empty());
+    let safe_lines = stdout(&safe_human)
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        safe_lines,
+        [
+            format!(
+                "{}  {}  note.recorded  /payload/text  needle-human progress path [project root] with collapsed whitespace \\u{{1b}}control",
+                fixed_events[1].timestamp.to_rfc3339(),
+                first.id,
+            ),
+            "Truncated: no".to_owned(),
+        ]
+    );
+    assert!(!safe_lines[0].contains(project_path.as_str()));
+    assert!(!safe_lines[0].contains('\t'));
+    assert!(safe_lines[0].contains("\\u{1b}"));
+    assert!(!safe_lines[0].contains('\u{1b}'));
+
+    assert_eq!(fs::read(&events_path).unwrap(), fixed_bytes);
+    assert_eq!(fs::read(relay_root.join("lock")).unwrap(), lock_before);
+    assert_eq!(
+        fs::read(relay_root.join("session.json")).unwrap(),
+        current_session_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("sessions")),
+        sessions_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("checkpoints")),
+        checkpoints_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("handoffs")),
+        handoffs_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("operations")),
+        operations_before
+    );
+    assert_eq!(fs::read(&first_summary_path).unwrap(), first_summary_before);
+    assert_eq!(
+        fs::read(&resumed_summary_path).unwrap(),
+        resumed_summary_before
+    );
+    assert_eq!(directory_names(&relay_root), relay_entries_before);
+
+    let invalid_range = relay(
+        project,
+        &[
+            "search",
+            "needle",
+            "--since",
+            &fixed_timestamps[5],
+            "--until",
+            &fixed_timestamps[2],
+        ],
+    );
+    assert!(!invalid_range.status.success());
+    assert!(invalid_range.stdout.is_empty());
+    assert!(stderr(&invalid_range).contains(
+        "`--since` must be earlier than or equal to `--until`; use an earlier `--since` or a later `--until`"
+    ));
+    assert_eq!(fs::read(&events_path).unwrap(), fixed_bytes);
+    assert_eq!(fs::read(relay_root.join("lock")).unwrap(), lock_before);
+    assert_eq!(
+        fs::read(relay_root.join("session.json")).unwrap(),
+        current_session_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("sessions")),
+        sessions_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("checkpoints")),
+        checkpoints_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("handoffs")),
+        handoffs_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("operations")),
+        operations_before
+    );
+    assert_eq!(fs::read(&first_summary_path).unwrap(), first_summary_before);
+    assert_eq!(
+        fs::read(&resumed_summary_path).unwrap(),
+        resumed_summary_before
+    );
+    assert_eq!(directory_names(&relay_root), relay_entries_before);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_session_path = outside.path().join("session.json");
+        let mut outside_session = fixed_current_session.clone();
+        outside_session.started_at = "2024-02-04T00:00:00Z".parse().unwrap();
+        let mut outside_bytes = serde_json::to_vec_pretty(&outside_session).unwrap();
+        outside_bytes.push(b'\n');
+        fs::write(&outside_session_path, &outside_bytes).unwrap();
+
+        let unsafe_session_path = sessions_root.join("unsafe.json");
+        symlink(&outside_session_path, &unsafe_session_path).unwrap();
+        let unsafe_search = relay(project, &["search", "needle", "--session", "latest"]);
+        assert!(!unsafe_search.status.success());
+        assert!(unsafe_search.stdout.is_empty());
+        let unsafe_error = stderr(&unsafe_search);
+        assert!(unsafe_error.contains("refusing to use symlinked Relay state path"));
+        assert!(unsafe_error.contains(".relay/sessions/unsafe.json"));
+        assert_eq!(fs::read(&outside_session_path).unwrap(), outside_bytes);
+
+        fs::remove_file(&unsafe_session_path).unwrap();
+        assert_eq!(fs::read(&outside_session_path).unwrap(), outside_bytes);
+    }
 }
