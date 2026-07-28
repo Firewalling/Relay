@@ -137,9 +137,10 @@ relay context \
 ```
 
 Categories and event kinds are repeatable filters. Counts default to 20 notes,
-20 events, and 5 checkpoints; the character budget defaults to 12,000 and must
-be at least 64. Ordering is deterministic. Relay truncates only at item
-boundaries and reports truncation plus omitted counts. It does not query model
+20 events, and 5 checkpoints. Each count keeps the most recent matching items
+while preserving their recorded order. The character budget defaults to 12,000
+and must be at least 64. Relay truncates only at item boundaries and reports
+truncation plus omitted counts. It does not query model
 providers, scan source files, read agent conversations, or infer unrecorded
 facts. Paths in generated output are project-relative, and absolute project
 paths found in recorded text are redacted.
