@@ -123,6 +123,9 @@ were not recorded.
 Markdown is the default; `relay --json context` returns the same categories as
 typed data. Context contains only the selected session, recorded notes and
 events, checkpoints, continuation lineage, and current scoped Git facts.
+Human Markdown keeps note and checkpoint content in their dedicated items, while
+handoff events include recorded target, completed work, decisions, failures,
+and next actions when present.
 
 ```sh
 relay context \

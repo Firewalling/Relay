@@ -963,6 +963,119 @@ fn context_filters_deterministically_respects_item_budget_and_preserves_privacy(
 }
 
 #[test]
+fn context_renders_structured_handoff_details_without_duplicating_separate_items() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+    let project_path = project.to_string_lossy().into_owned();
+    let note_text = "Documented renderer progress";
+    let checkpoint_message = "Captured renderer checkpoint";
+    let target_agent = "context-specialist";
+    let completed_work = "Rendered structured handoff details";
+    let decision = format!("Keep artifacts under {project_path}");
+    let redacted_decision = "Keep artifacts under [project root]";
+    let failure = "Renderer omitted detail labels";
+    let next_action = "Verify context presentation";
+
+    assert_success(&relay(project, &["start", "structured context"]));
+    assert_success(&relay(project, &["note", "progress", note_text]));
+    assert_success(&relay(project, &["checkpoint", checkpoint_message]));
+    assert_success(&relay(
+        project,
+        &[
+            "handoff",
+            target_agent,
+            "--completed-work",
+            completed_work,
+            "--decision",
+            decision.as_str(),
+            "--failure",
+            failure,
+            "--next-action",
+            next_action,
+        ],
+    ));
+
+    let human_output = relay(
+        project,
+        &[
+            "context",
+            "--notes",
+            "1",
+            "--events",
+            "4",
+            "--checkpoints",
+            "1",
+            "--max-chars",
+            "4000",
+        ],
+    );
+    assert_success(&human_output);
+    let text = stdout(&human_output);
+    assert!(text.contains("handoff.generated"));
+    let labels = [
+        "Target agent",
+        "Completed work",
+        "Decisions",
+        "Failures",
+        "Next actions",
+    ];
+    let label_positions = labels.map(|label| {
+        text.find(label)
+            .unwrap_or_else(|| panic!("missing handoff detail label {label}"))
+    });
+    assert!(
+        label_positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "handoff detail labels are not in semantic order"
+    );
+    for value in [
+        target_agent,
+        completed_work,
+        redacted_decision,
+        failure,
+        next_action,
+    ] {
+        assert!(text.contains(value), "missing handoff detail value {value}");
+    }
+    assert!(!text.contains(project_path.as_str()));
+    assert!(text.contains("[project root]"));
+    assert_eq!(text.matches(note_text).count(), 1);
+    assert_eq!(text.matches(checkpoint_message).count(), 1);
+
+    let json_output = relay(
+        project,
+        &[
+            "--json",
+            "context",
+            "--notes",
+            "1",
+            "--events",
+            "4",
+            "--checkpoints",
+            "1",
+            "--max-chars",
+            "4000",
+        ],
+    );
+    assert_success(&json_output);
+    let document: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let handoff_event = document["data"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "handoff.generated")
+        .expect("handoff event is present");
+    let payload = &handoff_event["payload"];
+    assert_eq!(payload["agent"], target_agent);
+    assert_eq!(
+        payload["completed_work"],
+        serde_json::json!([completed_work])
+    );
+    assert_eq!(payload["decisions"], serde_json::json!([decision]));
+    assert_eq!(payload["failures"], serde_json::json!([failure]));
+    assert_eq!(payload["next_action"], next_action);
+}
+
+#[test]
 fn context_limits_keep_latest_items_in_recorded_order() {
     let directory = tempfile::tempdir().unwrap();
     assert_success(&relay(directory.path(), &["start", "recent context"]));

@@ -956,6 +956,60 @@ fn retain_latest<T>(items: &mut Vec<T>, limit: usize) -> usize {
     omitted
 }
 
+fn render_context_event(project: &Path, event: &Event) -> String {
+    let mut rendered = format!(
+        "\n- Event {} — {}",
+        event.timestamp.to_rfc3339(),
+        event.event_type
+    );
+    if event.event_type != "handoff.generated" {
+        return rendered;
+    }
+
+    if let Some(agent) = event.payload.get("agent").and_then(Value::as_str) {
+        let agent = safe_markdown_value(project, agent);
+        if !agent.is_empty() {
+            rendered.push_str("\n  - Target agent: ");
+            rendered.push_str(&agent);
+        }
+    }
+
+    for (key, label) in [
+        ("completed_work", "Completed work"),
+        ("decisions", "Decisions"),
+        ("failures", "Failures"),
+    ] {
+        let Some(values) = event.payload.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        let mut wrote_label = false;
+        for value in values.iter().filter_map(Value::as_str) {
+            let value = safe_markdown_value(project, value);
+            if value.is_empty() {
+                continue;
+            }
+            if !wrote_label {
+                rendered.push_str("\n  - ");
+                rendered.push_str(label);
+                rendered.push(':');
+                wrote_label = true;
+            }
+            rendered.push_str("\n    - ");
+            rendered.push_str(&value);
+        }
+    }
+
+    if let Some(next_action) = event.payload.get("next_action").and_then(Value::as_str) {
+        let next_action = safe_markdown_value(project, next_action);
+        if !next_action.is_empty() {
+            rendered.push_str("\n  - Next actions:\n    - ");
+            rendered.push_str(&next_action);
+        }
+    }
+
+    rendered
+}
+
 fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
     if args.max_chars < 64 {
         return Err(AppError::Lifecycle(
@@ -1036,13 +1090,11 @@ fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
                 )
             )
         }))
-        .chain(events.iter().map(|event| {
-            format!(
-                "\n- Event {} — {}",
-                event.timestamp.to_rfc3339(),
-                event.event_type
-            )
-        }))
+        .chain(
+            events
+                .iter()
+                .map(|event| render_context_event(project, event)),
+        )
     {
         if markdown.chars().count() + item.chars().count() + 64 <= args.max_chars {
             markdown.push_str(&item);
