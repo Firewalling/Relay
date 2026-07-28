@@ -79,13 +79,16 @@ Relay supports these commands:
   recorded.
 - `finish` saves a final Markdown summary and completes the active session.
 - `list` lists all known sessions.
-- `show <SESSION>` shows a session selected by full UUID or an unambiguous UUID
-  prefix.
-- `history [--session <SESSION>] [--type <EVENT_TYPE>] [--limit <N>]` reads
-  matching append-only events in recorded order.
+- `show <SESSION>` shows a session selected by full UUID, an unambiguous UUID
+  prefix, or `latest`.
+- `history [--session <SESSION>] [--type <EVENT_TYPE>] [--since <RFC3339>]
+  [--until <RFC3339>] [--reverse] [--limit <N>]` filters append-only events,
+  then displays the earliest matches by default or newest matches with
+  `--reverse`; both time bounds are inclusive and the limit follows that order.
 - `resume <SESSION>` starts a new active continuation of a completed session,
-  preserving its goal and recording lineage. It does not reopen or modify the
-  source session, and it fails if a session is already active.
+  preserving its goal and recording lineage. It accepts the same selectors,
+  including `latest`, does not modify the source, and fails if a session is
+  already active.
 - `note <CATEGORY> [TEXT]` records `progress`, `decision`, `blocker`,
   `observation`, or `next_action`.
 - `context` emits bounded, recorded agent context; its filters are described
@@ -141,6 +144,8 @@ relay context \
   --checkpoints 3 \
   --max-chars 8000
 ```
+
+`--session` accepts a full UUID, an unambiguous prefix, or `latest`.
 
 Categories and event kinds are repeatable filters. Counts default to 20 notes,
 20 events, and 5 checkpoints. Each count keeps the most recent matching items

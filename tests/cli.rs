@@ -1629,3 +1629,318 @@ fn context_strict_character_budget_is_deterministic_and_reports_omission_causes(
     assert_eq!(data["budget_truncated"], false);
     assert_eq!(data["truncated"], true);
 }
+
+#[test]
+fn navigation_is_deterministic_across_history_and_shared_session_selectors() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+
+    assert_success(&relay(project, &["start", "first navigation session"]));
+    let first = read_session(project);
+    assert_success(&relay(project, &["note", "progress", "first oldest note"]));
+    assert_success(&relay(project, &["checkpoint", "first checkpoint"]));
+    assert_success(&relay(project, &["note", "decision", "first newest note"]));
+    assert_success(&relay(project, &["finish"]));
+
+    let resumed = relay(project, &["--json", "resume", "LaTeSt"]);
+    let resumed_data = json_success_data(&resumed);
+    let second = read_session(project);
+    assert_eq!(resumed_data["session"]["id"], second.id.to_string());
+    assert_eq!(second.resumed_from, Some(first.id));
+    assert_success(&relay(project, &["note", "progress", "second oldest note"]));
+    assert_success(&relay(project, &["checkpoint", "second checkpoint"]));
+    assert_success(&relay(project, &["note", "decision", "second newest note"]));
+    assert_success(&relay(project, &["finish"]));
+
+    let events_path = project.join(".relay/events.jsonl");
+    let original_bytes = fs::read(&events_path).unwrap();
+    assert_eq!(original_bytes.last(), Some(&b'\n'));
+    let generated_events = read_events(project);
+    assert_eq!(generated_events.len(), 10);
+    let event_kinds = generated_events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect::<Vec<_>>();
+    for kind in ["note.recorded", "checkpoint.created", "session.finished"] {
+        assert!(event_kinds.contains(&kind));
+    }
+
+    let original_values = String::from_utf8(original_bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(original_values.len(), generated_events.len());
+    let fixed_timestamps = (0..original_values.len())
+        .map(|index| format!("2024-01-02T03:04:{index:02}Z"))
+        .collect::<Vec<_>>();
+    let mut fixed_values = original_values.clone();
+    for ((before, after), timestamp) in original_values
+        .iter()
+        .zip(&mut fixed_values)
+        .zip(&fixed_timestamps)
+    {
+        after["timestamp"] = serde_json::Value::String(timestamp.clone());
+        let mut before_without_timestamp = before.clone();
+        let mut after_without_timestamp = after.clone();
+        before_without_timestamp
+            .as_object_mut()
+            .unwrap()
+            .remove("timestamp");
+        after_without_timestamp
+            .as_object_mut()
+            .unwrap()
+            .remove("timestamp");
+        assert_eq!(after_without_timestamp, before_without_timestamp);
+    }
+    let mut fixed_bytes = Vec::new();
+    for event in &fixed_values {
+        serde_json::to_writer(&mut fixed_bytes, event).unwrap();
+        fixed_bytes.push(b'\n');
+    }
+    fs::write(&events_path, &fixed_bytes).unwrap();
+    assert_eq!(fixed_bytes.last(), Some(&b'\n'));
+
+    let fixed_events = read_events(project);
+    assert_eq!(fixed_events.len(), generated_events.len());
+    for ((before, after), timestamp) in generated_events
+        .iter()
+        .zip(&fixed_events)
+        .zip(&fixed_timestamps)
+    {
+        assert_eq!(after.schema_version, before.schema_version);
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(after.event_type, before.event_type);
+        assert_eq!(after.payload, before.payload);
+        assert_eq!(
+            serde_json::to_value(after.timestamp).unwrap(),
+            serde_json::json!(timestamp)
+        );
+    }
+
+    let newest = if first.started_at > second.started_at
+        || (first.started_at == second.started_at && first.id > second.id)
+    {
+        &first
+    } else {
+        &second
+    };
+    let other = if newest.id == first.id {
+        &second
+    } else {
+        &first
+    };
+    let newest_id = newest.id.to_string();
+    let other_id = other.id.to_string();
+    let prefix_len = (8..=newest_id.len())
+        .find(|&length| !other_id.starts_with(&newest_id[..length]))
+        .unwrap();
+    let newest_prefix = &newest_id[..prefix_len];
+    let newest_events = fixed_events
+        .iter()
+        .filter(|event| event.session_id == newest.id)
+        .collect::<Vec<_>>();
+    assert_eq!(newest_events.len(), 5);
+
+    let default_json = relay(
+        project,
+        &[
+            "--json",
+            "history",
+            "--session",
+            newest_prefix,
+            "--limit",
+            "2",
+        ],
+    );
+    let default_data = json_success_data(&default_json);
+    assert_json_object_has_required_keys(
+        &default_data,
+        &["events", "truncated", "order", "since", "until", "limit"],
+    );
+    assert_eq!(default_data["events"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        default_data["events"][0]["id"],
+        newest_events[0].id.to_string()
+    );
+    assert_eq!(
+        default_data["events"][1]["id"],
+        newest_events[1].id.to_string()
+    );
+    assert_eq!(default_data["truncated"], true);
+    assert_eq!(default_data["order"], "oldest_first");
+    assert!(default_data["since"].is_null());
+    assert!(default_data["until"].is_null());
+    assert_eq!(default_data["limit"], 2);
+
+    let default_human = relay(
+        project,
+        &["history", "--session", newest_prefix, "--limit", "2"],
+    );
+    assert_success(&default_human);
+    let default_text = stdout(&default_human);
+    let default_lines = default_text.lines().collect::<Vec<_>>();
+    assert_eq!(default_lines.len(), 3);
+    for (line, event) in default_lines[..2].iter().zip(&newest_events[..2]) {
+        assert_eq!(
+            *line,
+            format!(
+                "{}  {}  {}  {}",
+                event.timestamp.to_rfc3339(),
+                event.session_id,
+                event.event_type,
+                event.id
+            )
+        );
+    }
+    assert_eq!(default_lines[2], "Truncated: yes");
+
+    let reverse_json = relay(
+        project,
+        &[
+            "--json",
+            "history",
+            "--session",
+            newest_prefix,
+            "--reverse",
+            "--limit",
+            "2",
+        ],
+    );
+    let reverse_data = json_success_data(&reverse_json);
+    assert_json_object_has_required_keys(
+        &reverse_data,
+        &["events", "truncated", "order", "since", "until", "limit"],
+    );
+    assert_eq!(reverse_data["events"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        reverse_data["events"][0]["id"],
+        newest_events[4].id.to_string()
+    );
+    assert_eq!(
+        reverse_data["events"][1]["id"],
+        newest_events[3].id.to_string()
+    );
+    assert_eq!(reverse_data["truncated"], true);
+    assert_eq!(reverse_data["order"], "newest_first");
+    assert!(reverse_data["since"].is_null());
+    assert!(reverse_data["until"].is_null());
+    assert_eq!(reverse_data["limit"], 2);
+
+    let since = fixed_timestamps[fixed_events
+        .iter()
+        .position(|event| event.id == newest_events[1].id)
+        .unwrap()]
+    .clone();
+    let until = fixed_timestamps[fixed_events
+        .iter()
+        .position(|event| event.id == newest_events[3].id)
+        .unwrap()]
+    .clone();
+    assert_eq!(newest_events[1].event_type, "note.recorded");
+    assert_eq!(newest_events[3].event_type, "note.recorded");
+    let bounded_json = relay(
+        project,
+        &[
+            "--json",
+            "history",
+            "--session",
+            newest_prefix,
+            "--type",
+            "note.recorded",
+            "--since",
+            &since,
+            "--until",
+            &until,
+            "--limit",
+            "2",
+        ],
+    );
+    let bounded_data = json_success_data(&bounded_json);
+    assert_json_object_has_required_keys(
+        &bounded_data,
+        &["events", "truncated", "order", "since", "until", "limit"],
+    );
+    assert_eq!(bounded_data["events"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        bounded_data["events"][0]["id"],
+        newest_events[1].id.to_string()
+    );
+    assert_eq!(
+        bounded_data["events"][1]["id"],
+        newest_events[3].id.to_string()
+    );
+    assert_eq!(bounded_data["truncated"], false);
+    assert_eq!(bounded_data["order"], "oldest_first");
+    assert_eq!(bounded_data["since"].as_str(), Some(since.as_str()));
+    assert_eq!(bounded_data["until"].as_str(), Some(until.as_str()));
+    assert_eq!(bounded_data["limit"], 2);
+
+    let bytes_before_invalid_bounds = fs::read(&events_path).unwrap();
+    let invalid_bounds = relay(
+        project,
+        &[
+            "history",
+            "--session",
+            newest_prefix,
+            "--since",
+            &until,
+            "--until",
+            &since,
+        ],
+    );
+    assert!(!invalid_bounds.status.success());
+    let invalid_error = stderr(&invalid_bounds);
+    assert!(invalid_error.contains("--since"));
+    assert!(invalid_error.contains("--until"));
+    assert_eq!(fs::read(&events_path).unwrap(), bytes_before_invalid_bounds);
+
+    let shown = relay(project, &["--json", "show", "LATEST"]);
+    let shown_data = json_success_data(&shown);
+    assert_eq!(shown_data["session"]["id"], newest_id);
+
+    let context = relay(
+        project,
+        &[
+            "--json",
+            "context",
+            "--session",
+            "laTESt",
+            "--notes",
+            "10",
+            "--events",
+            "10",
+            "--checkpoints",
+            "10",
+        ],
+    );
+    let context_data = json_success_data(&context);
+    assert_eq!(context_data["session"]["id"], newest.id.to_string());
+    assert_eq!(context_data["events"].as_array().unwrap().len(), 5);
+    assert!(
+        context_data["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["session_id"].as_str() == Some(newest_id.as_str()))
+    );
+
+    let latest_history = relay(
+        project,
+        &["--json", "history", "--session", "lAtEsT", "--limit", "100"],
+    );
+    let latest_history_data = json_success_data(&latest_history);
+    assert_eq!(
+        latest_history_data["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        newest_events
+            .iter()
+            .map(|event| event.id.to_string())
+            .collect::<Vec<_>>()
+    );
+}

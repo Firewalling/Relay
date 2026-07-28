@@ -293,3 +293,78 @@ cargo test --all-targets --all-features                   PASS (54 tests)
 1. Add an inspected deterministic subset of context/history navigation, such as latest-session selection, reverse display, or time bounds, without changing existing defaults.
 2. Add deterministic local search across sessions, event types, note categories, times, and plain substrings without embeddings, hosted services, or inferred relevance.
 3. Define the first versioned Rust/Go orchestration protocol boundary before implementing any external-process scheduler or Lua workflow runtime.
+
+## Cycle 5 — deterministic history navigation
+
+### Repository baseline
+
+- The working tree was clean on `feat/relay-daily-driver` at `50cc5b7` before this cycle. The local branch was three verified cycles ahead of `origin/feat/relay-daily-driver`.
+- Session selectors accepted only full UUIDs or unambiguous prefixes. History always displayed earliest matching events first, had no time bounds, and applied its limit only to that fixed order.
+- This cycle implements one inspected navigation subset: a shared latest-session alias plus reversible, inclusive time-bounded history. It does not add search, cursors, persistence, Go orchestration, or Lua workflows.
+
+### Selected improvement and rationale
+
+Add deterministic terminal navigation without changing existing defaults. Operators and agents need to address the newest session without copying UUIDs, retrieve newest history under a bound, and select an exact recorded time window while retaining Relay's append-order semantics.
+
+### Focused implementation plan
+
+1. Extend central session selection with a case-insensitive `latest` alias based on Relay's existing `started_at`/UUID deterministic sort.
+2. Add `history --reverse`, inclusive RFC3339 `--since`, and inclusive RFC3339 `--until` arguments with UTC normalization and actionable parsing.
+3. Apply session, type, and time filters before order and limit; preserve oldest-first defaults while making reverse limits select newest matches.
+4. Retain existing history fields and human lines while adding order/bound/limit metadata to JSON.
+5. Prove default compatibility, fixed-time boundary inclusion, reverse truncation, invalid-range safety, UUID prefixes, and shared latest selection.
+
+### Cycle outcome
+
+#### Implemented
+
+- Full UUIDs and unambiguous UUID prefixes remain supported. The reserved case-insensitive `latest` selector now resolves the first session from the existing deterministic latest-first sort and is shared by show, resume, history, and context.
+- History accepts `--reverse`, `--since <RFC3339>`, and `--until <RFC3339>`. Offset timestamps normalize to UTC, both bounds are inclusive, and malformed values fail during argument parsing with RFC3339 guidance.
+- A since value after until fails with an actionable lifecycle error before state access or mutation.
+- History applies session, event-type, and time filters first. It reverses the complete matching sequence only when requested, computes truncation against that ordered sequence, and then applies the limit. Existing default oldest-first and earliest-limit behavior is unchanged.
+- Human event lines and the final `Truncated` line remain unchanged. JSON retains `events` and `truncated` and adds `order`, normalized `since`, normalized `until`, and `limit`.
+- README command guidance documents the shared latest alias, inclusive time bounds, and order-before-limit behavior.
+- No persistence field, storage schema, dependency, migration, or mutation behavior changed.
+
+#### Architectural decisions
+
+- `latest` is resolved centrally instead of separately in commands, preventing selector drift. Its tie-break remains the existing descending UUID after descending start time.
+- Time navigation is based only on stored event timestamps and explicit inclusive comparisons. Relay does not infer relative recency or semantic relevance.
+- Reverse ordering is a presentation/selection option over the matching append-only records; no event bytes or durable order are changed.
+
+#### Verification
+
+The focused regression passed:
+
+```text
+cargo test --test cli navigation_is_deterministic_across_history_and_shared_session_selectors -- --exact  PASS (1 test)
+```
+
+The test records two sessions and ten events, rewrites only top-level event timestamps to fixed increasing valid RFC3339 values, and confirms every other field plus newline-terminated JSONL remains unchanged. It covers default earliest selection, reverse newest-two selection, inclusive note boundaries, post-filter truncation, invalid-range byte preservation, additive JSON metadata, mixed-case latest across resume/show/context/history, and UUID-prefix compatibility.
+
+`cargo build --quiet` passed. A direct isolated workflow created a completed session and a latest resumed session, then confirmed latest selection, default and reverse ordering, newest-two truncation, inclusive note bounds, and invalid-range rejection.
+
+The first canonical Clippy run found one needless borrow in the new timestamp-preservation assertion. An isolated correction passed the copyable timestamp directly without changing coverage. Independent core review found the selector, bounds, ordering, truncation, help, and metadata contracts correct.
+
+The complete canonical suite then passed in order:
+
+```text
+cargo fmt --check                                         PASS
+cargo clippy --all-targets --all-features -- -D warnings PASS
+cargo test --all-targets --all-features                   PASS (58 tests)
+```
+
+#### Known limitations and remaining technical debt
+
+- Navigation has no cursor or pagination token. Large histories still use an explicit numeric limit over deterministic order.
+- Bounds are absolute RFC3339 instants; Relay does not parse relative phrases such as `2h ago`.
+- `latest` means the newest started session, whether active or completed. Resume still applies its existing lifecycle rules after selection.
+- Deterministic local search remains unimplemented.
+- Relay still has no versioned Rust/Go orchestration protocol, external-process scheduler, or sandboxed Lua workflow language.
+- This is not the final completion cycle, so the branch is committed locally but not pushed again and no draft pull request is created in this cycle.
+
+#### Strongest next-cycle candidates
+
+1. Add deterministic local search across sessions, event types, note categories, times, and plain substrings without embeddings, hosted services, or inferred relevance.
+2. Define the first versioned Rust/Go orchestration protocol boundary before implementing any external-process scheduler or Lua workflow runtime.
+3. Design the sandboxed Lua workflow surface against that versioned protocol without adding execution until validation and security boundaries are explicit.

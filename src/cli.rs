@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use std::io;
@@ -237,13 +238,13 @@ pub struct HandoffArgs {
 
 #[derive(Debug, Args)]
 pub struct SessionSelectorArgs {
-    /// Exact session UUID or an unambiguous UUID prefix.
+    /// Exact session UUID, an unambiguous UUID prefix, or the reserved `latest` alias.
     pub session: String,
 }
 
 #[derive(Debug, Args)]
 pub struct HistoryArgs {
-    /// Restrict history to a session UUID or unambiguous prefix.
+    /// Restrict history to a session UUID, unambiguous prefix, or the reserved `latest` alias.
     #[arg(long)]
     pub session: Option<String>,
 
@@ -251,9 +252,30 @@ pub struct HistoryArgs {
     #[arg(long = "type")]
     pub event_type: Option<String>,
 
+    /// Display matching events newest first.
+    #[arg(long)]
+    pub reverse: bool,
+
+    /// Include events at or after this inclusive RFC3339 timestamp.
+    #[arg(long, value_parser = parse_rfc3339_utc)]
+    pub since: Option<DateTime<Utc>>,
+
+    /// Include events at or before this inclusive RFC3339 timestamp.
+    #[arg(long, value_parser = parse_rfc3339_utc)]
+    pub until: Option<DateTime<Utc>>,
+
     /// Maximum number of matching events to display.
     #[arg(long, default_value_t = 100)]
     pub limit: usize,
+}
+
+fn parse_rfc3339_utc(value: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| {
+            "invalid RFC3339 timestamp; expected a value such as 2025-01-02T03:04:05Z or 2025-01-02T03:04:05+02:00"
+                .to_owned()
+        })
 }
 
 fn parse_goal(value: &str) -> Result<String, String> {
@@ -348,6 +370,56 @@ mod tests {
                 .to_string()
                 .contains("target agent must not be blank or whitespace-only")
         );
+    }
+
+    #[test]
+    fn history_navigation_defaults_are_preserved() {
+        let cli = Cli::try_parse_from(["relay", "history"]).unwrap();
+
+        let Command::History(args) = cli.command else {
+            panic!("expected history command");
+        };
+        assert!(!args.reverse);
+        assert_eq!(args.since, None);
+        assert_eq!(args.until, None);
+        assert_eq!(args.limit, 100);
+    }
+
+    #[test]
+    fn parses_history_navigation_and_normalizes_offsets_to_utc() {
+        let cli = Cli::try_parse_from([
+            "relay",
+            "history",
+            "--reverse",
+            "--since",
+            "2025-01-02T03:04:05+02:30",
+            "--until",
+            "2025-01-03T03:04:05-04:00",
+        ])
+        .unwrap();
+
+        let Command::History(args) = cli.command else {
+            panic!("expected history command");
+        };
+        assert!(args.reverse);
+        assert_eq!(
+            args.since.unwrap().to_rfc3339(),
+            "2025-01-02T00:34:05+00:00"
+        );
+        assert_eq!(
+            args.until.unwrap().to_rfc3339(),
+            "2025-01-03T07:04:05+00:00"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_history_timestamp_during_argument_parsing() {
+        let error =
+            Cli::try_parse_from(["relay", "history", "--since", "January 2, 2025"]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("invalid RFC3339 timestamp"));
+        assert!(message.contains("2025-01-02T03:04:05Z"));
     }
 
     #[test]

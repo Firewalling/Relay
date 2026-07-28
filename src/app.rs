@@ -329,6 +329,18 @@ fn show_output(project: &Path, args: SessionSelectorArgs) -> Result<RunOutput, A
 }
 
 fn history_output(project: &Path, args: HistoryArgs) -> Result<RunOutput, AppError> {
+    if args
+        .since
+        .as_ref()
+        .zip(args.until.as_ref())
+        .is_some_and(|(since, until)| since > until)
+    {
+        return Err(AppError::Lifecycle(
+            "`--since` must be earlier than or equal to `--until`; use an earlier `--since` or a later `--until`"
+                .into(),
+        ));
+    }
+
     let paths = Paths::new(project);
     let all = read_events(&paths.events)?;
     let selected_id = args
@@ -346,7 +358,23 @@ fn history_output(project: &Path, args: HistoryArgs) -> Result<RunOutput, AppErr
                 .as_deref()
                 .is_none_or(|kind| event.event_type == kind)
         })
+        .filter(|event| {
+            args.since
+                .as_ref()
+                .is_none_or(|since| &event.timestamp >= since)
+        })
+        .filter(|event| {
+            args.until
+                .as_ref()
+                .is_none_or(|until| &event.timestamp <= until)
+        })
         .collect::<Vec<_>>();
+    let order = if args.reverse {
+        events.reverse();
+        "newest_first"
+    } else {
+        "oldest_first"
+    };
     let truncated = events.len() > args.limit;
     events.truncate(args.limit);
     let mut lines = events
@@ -367,7 +395,14 @@ fn history_output(project: &Path, args: HistoryArgs) -> Result<RunOutput, AppErr
     ));
     Ok(RunOutput {
         human: lines.join("\n"),
-        data: json!({"events": events, "truncated": truncated}),
+        data: json!({
+            "events": events,
+            "truncated": truncated,
+            "order": order,
+            "since": args.since,
+            "until": args.until,
+            "limit": args.limit,
+        }),
     })
 }
 
@@ -2093,6 +2128,12 @@ fn read_all_sessions(paths: &Paths) -> Result<Vec<Session>, AppError> {
 
 fn select_session<'a>(sessions: &'a [Session], selector: &str) -> Result<&'a Session, AppError> {
     let selector = selector.to_ascii_lowercase();
+    if selector == "latest" {
+        return sessions
+            .first()
+            .ok_or_else(|| AppError::Lifecycle(format!("no Relay session matches `{selector}`")));
+    }
+
     let matches = sessions
         .iter()
         .filter(|session| session.id.to_string().starts_with(&selector))
