@@ -185,13 +185,13 @@ pub struct ContextArgs {
     /// Include only these event kinds.
     #[arg(long = "kind")]
     pub kinds: Vec<String>,
-    /// Maximum notes.
+    /// Maximum recent matching notes to include.
     #[arg(long, default_value_t = 20)]
     pub notes: usize,
-    /// Maximum events.
+    /// Maximum recent matching events to include.
     #[arg(long, default_value_t = 20)]
     pub events: usize,
-    /// Maximum checkpoints.
+    /// Maximum recent checkpoints to include.
     #[arg(long, default_value_t = 5)]
     pub checkpoints: usize,
     /// Maximum output characters; items are never split.

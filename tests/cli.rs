@@ -961,3 +961,74 @@ fn context_filters_deterministically_respects_item_budget_and_preserves_privacy(
             .contains(directory.path().to_string_lossy().as_ref())
     );
 }
+
+#[test]
+fn context_limits_keep_latest_items_in_recorded_order() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", "recent context"]));
+    assert_success(&relay(
+        directory.path(),
+        &["note", "progress", "oldest note"],
+    ));
+    for index in 0..7 {
+        let message = format!("checkpoint {index}");
+        assert_success(&relay(directory.path(), &["checkpoint", &message]));
+    }
+    assert_success(&relay(
+        directory.path(),
+        &["note", "progress", "middle note"],
+    ));
+    assert_success(&relay(
+        directory.path(),
+        &["note", "progress", "newest note"],
+    ));
+
+    let json_output = relay(
+        directory.path(),
+        &[
+            "--json",
+            "context",
+            "--notes",
+            "2",
+            "--events",
+            "2",
+            "--checkpoints",
+            "6",
+        ],
+    );
+    assert_success(&json_output);
+    let document: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    let data = &document["data"];
+    assert_eq!(data["notes"].as_array().unwrap().len(), 2);
+    assert_eq!(data["notes"][0]["text"], "middle note");
+    assert_eq!(data["notes"][1]["text"], "newest note");
+    assert_eq!(data["events"].as_array().unwrap().len(), 2);
+    assert_eq!(data["events"][0]["payload"]["text"], "middle note");
+    assert_eq!(data["events"][1]["payload"]["text"], "newest note");
+    assert_eq!(data["checkpoints"].as_array().unwrap().len(), 6);
+    assert_eq!(data["checkpoints"][0]["message"], "checkpoint 1");
+    assert_eq!(data["checkpoints"][5]["message"], "checkpoint 6");
+    assert_eq!(data["omitted"]["notes"], 1);
+    assert_eq!(data["omitted"]["events"], 9);
+    assert_eq!(data["omitted"]["checkpoints"], 1);
+
+    let human_output = relay(
+        directory.path(),
+        &[
+            "context",
+            "--notes",
+            "1",
+            "--events",
+            "0",
+            "--checkpoints",
+            "1",
+        ],
+    );
+    assert_success(&human_output);
+    let text = stdout(&human_output);
+    assert!(text.contains("newest note"));
+    assert!(text.contains("checkpoint 6"));
+    assert!(!text.contains("oldest note"));
+    assert!(!text.contains("middle note"));
+    assert!(!text.contains("checkpoint 0"));
+}

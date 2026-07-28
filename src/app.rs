@@ -425,7 +425,7 @@ fn handoff(project: &Path, args: HandoffArgs) -> Result<String, AppError> {
 
     let timestamp = Utc::now();
     let live_git = git::capture(project)?;
-    let checkpoints = relevant_checkpoints(&events, session.id)?;
+    let (checkpoints, _) = relevant_checkpoints(&events, session.id, 5)?;
     let session_notes = recorded_notes(&events, session.id);
     let markdown = render_handoff(
         project,
@@ -490,15 +490,18 @@ fn handoff(project: &Path, args: HandoffArgs) -> Result<String, AppError> {
     Ok(format!("{markdown}\nSaved: {relative}"))
 }
 
-fn relevant_checkpoints(events: &[Event], session_id: Uuid) -> Result<Vec<Checkpoint>, AppError> {
-    let checkpoint_events = events
+fn relevant_checkpoints(
+    events: &[Event],
+    session_id: Uuid,
+    limit: usize,
+) -> Result<(Vec<Checkpoint>, usize), AppError> {
+    let mut checkpoint_events = events
         .iter()
         .filter(|event| event.session_id == session_id && event.event_type == "checkpoint.created")
-        .rev()
-        .take(5)
         .collect::<Vec<_>>();
+    let omitted = retain_latest(&mut checkpoint_events, limit);
     let mut checkpoints = Vec::with_capacity(checkpoint_events.len());
-    for event in checkpoint_events.into_iter().rev() {
+    for event in checkpoint_events {
         let checkpoint: Checkpoint =
             serde_json::from_value(event.payload.get("checkpoint").cloned().ok_or_else(|| {
                 AppError::Lifecycle(
@@ -514,7 +517,7 @@ fn relevant_checkpoints(events: &[Event], session_id: Uuid) -> Result<Vec<Checkp
         validate_git_version(&checkpoint.git)?;
         checkpoints.push(checkpoint);
     }
-    Ok(checkpoints)
+    Ok((checkpoints, omitted))
 }
 
 fn render_handoff(
@@ -947,6 +950,12 @@ fn recorded_notes(
         .collect()
 }
 
+fn retain_latest<T>(items: &mut Vec<T>, limit: usize) -> usize {
+    let omitted = items.len().saturating_sub(limit);
+    drop(items.drain(..omitted));
+    omitted
+}
+
 fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
     if args.max_chars < 64 {
         return Err(AppError::Lifecycle(
@@ -970,21 +979,17 @@ fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
             selected_categories.is_empty() || selected_categories.contains(category.as_str())
         })
         .collect::<Vec<_>>();
-    let omitted_notes = notes.len().saturating_sub(args.notes);
-    notes.truncate(args.notes);
+    let omitted_notes = retain_latest(&mut notes, args.notes);
     let mut events = all_events
         .iter()
         .filter(|event| event.session_id == session.id)
         .filter(|event| {
             selected_kinds.is_empty() || selected_kinds.contains(event.event_type.as_str())
         })
-        .cloned()
         .collect::<Vec<_>>();
-    let omitted_events = events.len().saturating_sub(args.events);
-    events.truncate(args.events);
-    let mut checkpoints = relevant_checkpoints(&all_events, session.id)?;
-    let omitted_checkpoints = checkpoints.len().saturating_sub(args.checkpoints);
-    checkpoints.truncate(args.checkpoints);
+    let omitted_events = retain_latest(&mut events, args.events);
+    let (checkpoints, omitted_checkpoints) =
+        relevant_checkpoints(&all_events, session.id, args.checkpoints)?;
     let live_git = git::capture(project)?;
 
     let mut markdown = format!(
