@@ -446,3 +446,84 @@ cargo test --all-targets --all-features                   PASS (63 tests)
 1. Define the first versioned Rust/Go orchestration protocol boundary before implementing any external-process scheduler or Lua workflow runtime.
 2. Implement the minimal Rust-side orchestration request/status boundary with explicit schema validation and no implicit process launch.
 3. Design the sandboxed Lua workflow surface against the accepted protocol before adding execution.
+
+## Cycle 7 — versioned orchestration process boundary
+
+### Repository baseline
+
+- The working tree was clean on `feat/relay-daily-driver` at `349b2bb` before this cycle. The local branch was five verified cycles ahead of `origin/feat/relay-daily-driver`.
+- Relay already emitted output-schema-v1 JSON per CLI invocation, but no machine-readable contract identified the safe orchestration operation subset, framing, independent protocol/state/output versions, or Rust/Go/Lua ownership boundary.
+- The workstation had no `go` executable and the repository had no Go module or files. This cycle therefore defines and fully verifies the prerequisite Rust-side process contract without adding unverifiable Go code, speculative CI, a scheduler, run files, or Lua.
+
+### Selected improvement and rationale
+
+Define orchestration protocol v1 as an inspectable capability manifest over Relay's existing direct-argv JSON CLI. A future Go process supervisor can negotiate exact versions, operations, streams, and ownership before invoking Rust state operations, while the manifest makes the current non-implementation of Go and Lua explicit.
+
+### Focused implementation plan
+
+1. Add independent output-schema and orchestration-protocol constants plus strict typed manifest structures.
+2. Add a project-independent, read-only `relay protocol` command that emits the manifest through the existing human/JSON output path.
+3. Define exact direct-argv transport, application-response framing, six allowed operations, stdin behavior, and Rust/Go/Lua ownership.
+4. Pin a canonical v1 data fixture and prove exact runtime agreement without coupling future crate-version bumps to protocol-version changes.
+5. Document security, compatibility, evolution, and current non-implementation boundaries without adding process execution.
+
+### Cycle outcome
+
+#### Implemented
+
+- Added `relay protocol`, a unit command that reports compiled capabilities without querying the current directory, discovering a project, reading or validating `.relay`, invoking Git, acquiring a lock, or creating files.
+- Added public, independent `OUTPUT_SCHEMA_VERSION` and `ORCHESTRATION_PROTOCOL_VERSION` constants. Existing success and error envelopes now use the output constant instead of duplicate literals.
+- Added strict serde manifest types for transport, Rust-owned state, future component ownership, operations, and stdin behavior. Object types reject unknown fields.
+- Protocol v1 declares direct argv, no shell, one process per operation, application-response JSON framing, stdout success, stderr application errors, output schema v1, state schema v1, and a fixed `--json --scope current` prefix.
+- The allowed ordered subset is status, context, note via UTF-8 stdin, checkpoint, handoff, and finish. Each manifest entry declares an argv template and whether it mutates Rust-owned state.
+- Go is declared the unimplemented future orchestration owner; Lua is declared the unimplemented future workflow owner. Relay provides no agent/workflow process launcher. Existing Git-aware commands may still invoke `git`, and interactive note editing remains outside protocol v1.
+- Added `protocol/manifest-v1.json` as the canonical v1 data fixture. It pins the release that introduced the protocol while a running binary reports its current crate version.
+- Added `docs/orchestration-protocol.md` with negotiation, framing, allowed operations, direct-argv rules, stream/exit behavior, placeholders, ownership, security requirements, version evolution, compatibility, and explicit current limitations.
+- README now lists and links the protocol and accurately scopes JSON envelope guarantees to parsed operations that reach application handling.
+- No dependency, Go file/module, Lua file/runtime, CI workflow, storage schema, persisted record, migration, or existing operation behavior changed.
+
+#### Architectural decisions
+
+- Protocol v1 formalizes existing one-shot CLI processes instead of introducing FFI, a daemon, or a second generic command-dispatch protocol.
+- The Rust command special-cases capability negotiation before current-directory and project discovery because the manifest is compiled metadata and must remain safe even beside a symlinked `.relay`.
+- Protocol, output, state, and Relay package versions evolve independently. Contract changes require a new fixture/version; package releases alone do not.
+- `one_document` describes successfully parsed application-response framing. Clap parse failures and failures before envelope-producing startup remain nonzero protocol failures but may be plain text.
+- Argument-template placeholders are documentation only. A future supervisor must validate and substitute separate argv elements and must never invoke a shell.
+
+#### Verification
+
+Focused protocol coverage passed:
+
+```text
+cargo test --test cli protocol_manifest_is_versioned_project_independent_and_stable -- --exact  PASS (1 test)
+cargo test cli::tests::protocol -- --nocapture                                      PASS (3 tests)
+```
+
+The black-box regression verifies exact fixture data and envelope keys, strict unknown-field rejection, historical fixture/runtime version separation, exact human output, repeatable bytes, global options on either side, forced repository-discovery bypass, no `.relay` creation, and success without following or mutating a symlinked `.relay` target. Parser tests verify the argument-free command, name, global options, and unexpected-argument rejection.
+
+`cargo build --quiet` passed. A direct isolated negotiation used repository scope with a Git ceiling and a symlinked `.relay`, then confirmed exact fixture output, ordered operations, unimplemented Go/Lua components, no target mutation, and the scoped no-agent/workflow-launch guarantee.
+
+Parallel isolated writers implemented typed models/CLI, runtime/main dispatch, and fixtures/tests/documentation. Independent core review found the implementation contract-correct. Security review found four contract defects: an overbroad no-subprocess claim despite Git/editor subprocesses, package-version coupling in fixture equality, an overbroad JSON-error guarantee for parse/startup failures, and a repository-bypass test without a forced-failure precondition. All were corrected and focused verification rerun.
+
+The complete canonical suite then passed in order:
+
+```text
+cargo fmt --check                                         PASS
+cargo clippy --all-targets --all-features -- -D warnings PASS
+cargo test --all-targets --all-features                   PASS (67 tests)
+```
+
+#### Known limitations and remaining technical debt
+
+- This is capability negotiation only. There is no Go protocol client, scheduler, process supervisor, run-file schema, status/log stream, cancellation, timeout, retry, or resume implementation.
+- There is no Lua parser, validator, graph preview, sandbox, workflow runtime, or policy API.
+- Protocol v1 exposes only six operations and one-shot application responses. It has no long-lived stream, multiplexing, or orchestration request file.
+- Parse and pre-envelope startup failures are nonzero protocol failures but are not guaranteed to be JSON envelopes.
+- The current workstation has no Go toolchain, so no Go code or Go verification was attempted or claimed.
+- This is not the final completion cycle, so the branch is committed locally but not pushed again and no draft pull request is created in this cycle.
+
+#### Strongest next-cycle candidates
+
+1. With a verified Go toolchain available, implement the strict protocol-v1 decoder, a minimal versioned Go-owned run-file schema, and canonical Go CI gates before scheduling.
+2. Add bounded dependency-aware Go scheduling, direct-argv supervision, cancellation/timeouts, explicit retries, filtered environments, and bounded logs against that schema.
+3. Define and validate the sandboxed Lua workflow surface only after the Go run-state and execution-safety boundaries are executable and tested.

@@ -1,4 +1,4 @@
-use relay::model::{Checkpoint, Event, Session, SessionState};
+use relay::model::{Checkpoint, Event, ProtocolManifest, Session, SessionState};
 use std::{
     ffi::OsStr,
     fs,
@@ -81,10 +81,130 @@ fn completion_commands_emit_current_cli_without_project_state() {
         assert!(output.stderr.is_empty());
         let script = stdout(&output);
         assert!(!script.is_empty());
-        for command in ["start", "doctor", "context", "completions"] {
+        for command in ["start", "doctor", "context", "completions", "protocol"] {
             assert!(script.contains(command), "{shell} omitted {command}");
         }
         assert!(!directory.path().join(".relay").exists());
+    }
+}
+
+#[test]
+fn protocol_manifest_is_versioned_project_independent_and_stable() {
+    const HUMAN_OUTPUT: &str = concat!(
+        "Relay orchestration protocol: 1\n",
+        "Transport: direct argv, one JSON document per process\n",
+        "Output schema: 1\n",
+        "State owner: Rust (schema 1)\n",
+        "Agent/workflow process launch: no\n",
+        "Go orchestrator: not implemented\n",
+        "Lua workflow: not implemented\n",
+        "Operations: status, context, note, checkpoint, handoff, finish\n",
+    );
+
+    let expected_data: serde_json::Value =
+        serde_json::from_str(include_str!("../protocol/manifest-v1.json")).unwrap();
+    assert_eq!(expected_data["relay_version"], "0.2.0");
+    let mut expected_runtime_data = expected_data.clone();
+    expected_runtime_data["relay_version"] = env!("CARGO_PKG_VERSION").into();
+    let directory = tempfile::tempdir().unwrap();
+    let sentinel = directory.path().join("sentinel");
+    fs::write(&sentinel, b"unchanged\n").unwrap();
+    let mut entries_before = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    entries_before.sort();
+
+    let human = relay(directory.path(), &["protocol"]);
+    assert_success(&human);
+    assert!(human.stderr.is_empty());
+    assert_eq!(human.stdout, HUMAN_OUTPUT.as_bytes());
+
+    let json_before = relay_with_env(
+        directory.path(),
+        &["--json", "--scope", "repository", "protocol"],
+        "GIT_CEILING_DIRECTORIES",
+        directory.path().to_str().unwrap(),
+    );
+    assert_success(&json_before);
+    assert!(json_before.stderr.is_empty());
+    let json_repeat = relay_with_env(
+        directory.path(),
+        &["--json", "--scope", "repository", "protocol"],
+        "GIT_CEILING_DIRECTORIES",
+        directory.path().to_str().unwrap(),
+    );
+    assert_success(&json_repeat);
+    assert!(json_repeat.stderr.is_empty());
+    assert_eq!(json_repeat.stdout, json_before.stdout);
+
+    let json_after = relay_with_env(
+        directory.path(),
+        &["protocol", "--scope", "repository", "--json"],
+        "GIT_CEILING_DIRECTORIES",
+        directory.path().to_str().unwrap(),
+    );
+    assert_success(&json_after);
+    assert!(json_after.stderr.is_empty());
+    assert_eq!(json_after.stdout, json_before.stdout);
+
+    let document: serde_json::Value = serde_json::from_slice(&json_before.stdout).unwrap();
+    assert_eq!(
+        document,
+        serde_json::json!({
+            "command": "protocol",
+            "data": expected_runtime_data.clone(),
+            "ok": true,
+            "output_schema_version": 1
+        })
+    );
+    let manifest: ProtocolManifest =
+        serde_json::from_value(document["data"].clone()).expect("deserialize protocol manifest");
+    assert_eq!(
+        serde_json::to_value(manifest).expect("serialize protocol manifest"),
+        expected_runtime_data
+    );
+    let mut unknown_data = expected_runtime_data.clone();
+    unknown_data
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::Value::Null);
+    assert!(serde_json::from_value::<ProtocolManifest>(unknown_data).is_err());
+
+    let mut entries_after = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    entries_after.sort();
+    assert_eq!(entries_after, entries_before);
+    assert_eq!(fs::read(&sentinel).unwrap(), b"unchanged\n");
+    assert!(!directory.path().join(".relay").exists());
+
+    #[cfg(unix)]
+    {
+        let symlink_project = tempfile::tempdir().unwrap();
+        let symlink_target = tempfile::tempdir().unwrap();
+        let target_sentinel = symlink_target.path().join("sentinel");
+        fs::write(&target_sentinel, b"target unchanged\n").unwrap();
+        std::os::unix::fs::symlink(symlink_target.path(), symlink_project.path().join(".relay"))
+            .unwrap();
+
+        let output = relay_with_env(
+            symlink_project.path(),
+            &["protocol", "--json", "--scope", "repository"],
+            "GIT_CEILING_DIRECTORIES",
+            symlink_project.path().to_str().unwrap(),
+        );
+        assert_success(&output);
+        assert!(output.stderr.is_empty());
+        assert_eq!(output.stdout, json_before.stdout);
+        assert_eq!(
+            fs::read_link(symlink_project.path().join(".relay")).unwrap(),
+            symlink_target.path()
+        );
+        assert_eq!(fs::read(&target_sentinel).unwrap(), b"target unchanged\n");
+        assert_eq!(fs::read_dir(symlink_project.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(symlink_target.path()).unwrap().count(), 1);
     }
 }
 

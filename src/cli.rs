@@ -53,6 +53,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Prints the negotiated, versioned Rust/Go process contract and launches nothing.
+    Protocol,
     /// Start a session with a goal.
     Start(StartArgs),
     /// Show the current session.
@@ -86,6 +88,7 @@ pub enum Command {
 impl Command {
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Protocol => "protocol",
             Self::Start(_) => "start",
             Self::Status => "status",
             Self::Checkpoint(_) => "checkpoint",
@@ -368,6 +371,39 @@ mod tests {
     }
 
     #[test]
+    fn protocol_is_argument_free_and_named_protocol() {
+        let cli = Cli::try_parse_from(["relay", "protocol"]).unwrap();
+
+        assert!(matches!(&cli.command, Command::Protocol));
+        assert_eq!(cli.command.name(), "protocol");
+    }
+
+    #[test]
+    fn protocol_accepts_global_options_on_either_side() {
+        let before =
+            Cli::try_parse_from(["relay", "--json", "--scope", "repository", "protocol"]).unwrap();
+        let after =
+            Cli::try_parse_from(["relay", "protocol", "--json", "--scope", "repository"]).unwrap();
+
+        for cli in [before, after] {
+            assert!(matches!(&cli.command, Command::Protocol));
+            assert_eq!(cli.command.name(), "protocol");
+            assert_eq!(
+                cli.global_options(),
+                GlobalOptions {
+                    output: OutputFormat::Json,
+                    scope: ProjectScope::Repository,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_rejects_unexpected_arguments() {
+        assert!(Cli::try_parse_from(["relay", "protocol", "unexpected"]).is_err());
+    }
+
+    #[test]
     fn parses_handoff_notes() {
         let cli = Cli::try_parse_from([
             "relay",
@@ -552,7 +588,14 @@ mod tests {
             let script = String::from_utf8(script).unwrap();
 
             assert!(!script.is_empty());
-            for command in ["start", "doctor", "context", "search", "completions"] {
+            for command in [
+                "start",
+                "doctor",
+                "context",
+                "search",
+                "protocol",
+                "completions",
+            ] {
                 assert!(script.contains(command), "{shell:?} omitted {command}");
             }
         }

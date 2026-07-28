@@ -102,11 +102,22 @@ Relay supports these commands:
   below.
 - `doctor [--repair]` diagnoses storage consistency.
 - `completions <SHELL>` prints a Bash, Zsh, or Fish completion script.
+- `protocol` reports the project-independent, read-only orchestration process
+  contract compiled into Relay.
+
+See the [orchestration process protocol](docs/orchestration-protocol.md) for
+the exact versioned manifest, transport, operation subset, and security
+requirements. Relay does not yet include a Go orchestrator, Lua workflow
+runtime, or agent/workflow process launcher. Allowed Git-aware operations may
+invoke `git`; existing note editor behavior is outside protocol v1.
 
 `--json` and `--scope auto|current|repository` are global options and work
-before or after a subcommand. Human output remains the default. `--json` emits
-one versioned success document on stdout, or one versioned error document on
-stderr; `output_schema_version` is separate from the on-disk schema version.
+before or after a subcommand. Human output remains the default. For a parsed
+invocation that reaches application handling, `--json` emits one versioned
+success document on stdout, or one versioned error document on stderr;
+`output_schema_version` is separate from the on-disk schema version. Clap parse
+errors and failures before envelope-producing application startup may be plain
+text or another non-document diagnostic; they remain nonzero failures.
 For mutating commands, human and JSON output are rendered from the operation's
 typed result; Relay does not reconstruct a completed mutation by rescanning
 unrelated historical records.

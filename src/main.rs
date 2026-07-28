@@ -2,7 +2,7 @@ use clap::Parser;
 use relay::{
     app,
     cli::{Cli, Command, generate_completions},
-    model::{ErrorEnvelope, OutputError, SuccessEnvelope},
+    model::{ErrorEnvelope, OUTPUT_SCHEMA_VERSION, OutputError, SuccessEnvelope},
     project,
 };
 use std::{env, process::ExitCode};
@@ -12,6 +12,9 @@ fn main() -> ExitCode {
     if let Command::Completions(args) = &cli.command {
         generate_completions(args.shell);
         return ExitCode::SUCCESS;
+    }
+    if matches!(&cli.command, Command::Protocol) {
+        return emit_success(cli.json, cli.command.name(), app::protocol_output());
     }
     let json_output = cli.json;
     let command_name = cli.command.name();
@@ -35,23 +38,7 @@ fn main() -> ExitCode {
         }
     };
     match app::run(cli.command, &project.relay_project_root) {
-        Ok(output) => {
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string(&SuccessEnvelope {
-                        output_schema_version: 1,
-                        ok: true,
-                        command: command_name.into(),
-                        data: output.data,
-                    })
-                    .expect("serializing a Relay output envelope cannot fail")
-                );
-            } else {
-                println!("{}", output.human);
-            }
-            ExitCode::SUCCESS
-        }
+        Ok(output) => emit_success(json_output, command_name, output),
         Err(error) => {
             emit_error(
                 json_output,
@@ -64,12 +51,30 @@ fn main() -> ExitCode {
     }
 }
 
+fn emit_success(json_output: bool, command: &str, output: app::RunOutput) -> ExitCode {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&SuccessEnvelope {
+                output_schema_version: OUTPUT_SCHEMA_VERSION,
+                ok: true,
+                command: command.into(),
+                data: output.data,
+            })
+            .expect("serializing a Relay output envelope cannot fail")
+        );
+    } else {
+        println!("{}", output.human);
+    }
+    ExitCode::SUCCESS
+}
+
 fn emit_error(json_output: bool, command: &str, code: &str, message: &str) {
     if json_output {
         eprintln!(
             "{}",
             serde_json::to_string(&ErrorEnvelope {
-                output_schema_version: 1,
+                output_schema_version: OUTPUT_SCHEMA_VERSION,
                 ok: false,
                 command: command.into(),
                 error: OutputError {

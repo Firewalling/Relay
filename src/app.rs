@@ -6,8 +6,10 @@ use crate::{
     git,
     lock::{self, ProjectLock},
     model::{
-        Checkpoint, Diagnostic, DiagnosticSeverity, Event, GitSnapshot, OperationEffect,
-        OperationMarker, SCHEMA_VERSION, Session, SessionState,
+        Checkpoint, Diagnostic, DiagnosticSeverity, Event, GitSnapshot,
+        ORCHESTRATION_PROTOCOL_VERSION, OUTPUT_SCHEMA_VERSION, OperationEffect, OperationMarker,
+        ProtocolComponent, ProtocolManifest, ProtocolOperation, ProtocolState, ProtocolStdin,
+        ProtocolTransport, SCHEMA_VERSION, Session, SessionState,
     },
     storage::{self, StorageError},
 };
@@ -64,6 +66,108 @@ pub struct RunOutput {
 
 trait IntoRunOutput {
     fn into_run_output(self) -> RunOutput;
+}
+
+#[derive(Debug)]
+struct ProtocolResult {
+    manifest: ProtocolManifest,
+}
+
+impl IntoRunOutput for ProtocolResult {
+    fn into_run_output(self) -> RunOutput {
+        RunOutput {
+            human: format!(
+                "Relay orchestration protocol: {}\n\
+                 Transport: direct argv, one JSON document per process\n\
+                 Output schema: {}\n\
+                 State owner: Rust (schema {})\n\
+                 Agent/workflow process launch: no\n\
+                 Go orchestrator: not implemented\n\
+                 Lua workflow: not implemented\n\
+                 Operations: status, context, note, checkpoint, handoff, finish",
+                ORCHESTRATION_PROTOCOL_VERSION, OUTPUT_SCHEMA_VERSION, SCHEMA_VERSION,
+            ),
+            data: json!(self.manifest),
+        }
+    }
+}
+
+pub fn protocol_output() -> RunOutput {
+    ProtocolResult {
+        manifest: ProtocolManifest {
+            protocol_version: ORCHESTRATION_PROTOCOL_VERSION,
+            relay_version: env!("CARGO_PKG_VERSION").into(),
+            transport: ProtocolTransport {
+                kind: "process".into(),
+                invocation: "direct_argv".into(),
+                framing: "one_json_document_per_process".into(),
+                shell: false,
+                invocation_prefix: vec!["--json".into(), "--scope".into(), "current".into()],
+                success_stream: "stdout".into(),
+                error_stream: "stderr".into(),
+                output_schema_version: OUTPUT_SCHEMA_VERSION,
+                one_document: true,
+                success_exit_code: 0,
+                failure_exit_code_nonzero: true,
+            },
+            state: ProtocolState {
+                owner: "rust".into(),
+                schema_version: SCHEMA_VERSION,
+                root: ".relay".into(),
+            },
+            orchestrator: ProtocolComponent {
+                owner: "go".into(),
+                implemented: false,
+            },
+            workflow: ProtocolComponent {
+                owner: "lua".into(),
+                implemented: false,
+            },
+            operations: vec![
+                ProtocolOperation {
+                    name: "status".into(),
+                    argv_template: vec!["status".into()],
+                    mutating: false,
+                    stdin: ProtocolStdin::None,
+                },
+                ProtocolOperation {
+                    name: "context".into(),
+                    argv_template: vec!["context".into(), "<options...>".into()],
+                    mutating: false,
+                    stdin: ProtocolStdin::None,
+                },
+                ProtocolOperation {
+                    name: "note".into(),
+                    argv_template: vec!["note".into(), "<category>".into(), "--stdin".into()],
+                    mutating: true,
+                    stdin: ProtocolStdin::Utf8Note,
+                },
+                ProtocolOperation {
+                    name: "checkpoint".into(),
+                    argv_template: vec!["checkpoint".into(), "[message]".into()],
+                    mutating: true,
+                    stdin: ProtocolStdin::None,
+                },
+                ProtocolOperation {
+                    name: "handoff".into(),
+                    argv_template: vec![
+                        "handoff".into(),
+                        "<agent>".into(),
+                        "<detail-options...>".into(),
+                    ],
+                    mutating: true,
+                    stdin: ProtocolStdin::None,
+                },
+                ProtocolOperation {
+                    name: "finish".into(),
+                    argv_template: vec!["finish".into()],
+                    mutating: true,
+                    stdin: ProtocolStdin::None,
+                },
+            ],
+        },
+    }
+    .into_run_output()
 }
 
 #[derive(Debug)]
@@ -258,7 +362,9 @@ pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
     if let Command::Search(args) = &command {
         validate_search_bounds(args)?;
     }
-    validate_state_paths(&Paths::new(project))?;
+    if !matches!(&command, Command::Protocol) {
+        validate_state_paths(&Paths::new(project))?;
+    }
     if is_mutating(&command)
         && !matches!(command, Command::Start(_))
         && !project.join(".relay").exists()
@@ -289,6 +395,7 @@ pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
         Command::Doctor(args) => doctor(project, args)?.into_run_output(),
         Command::Note(args) => note(project, args)?.into_run_output(),
         Command::Context(args) => context(project, args)?,
+        Command::Protocol => protocol_output(),
         Command::Completions(_) => unreachable!("completions are handled before project discovery"),
     };
     Ok(output)
@@ -609,6 +716,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Doctor(_) => "doctor",
         Command::Note(_) => "note",
         Command::Context(_) => "context",
+        Command::Protocol => "protocol",
         Command::Completions(_) => "completions",
     }
 }
