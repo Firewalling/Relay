@@ -368,3 +368,81 @@ cargo test --all-targets --all-features                   PASS (58 tests)
 1. Add deterministic local search across sessions, event types, note categories, times, and plain substrings without embeddings, hosted services, or inferred relevance.
 2. Define the first versioned Rust/Go orchestration protocol boundary before implementing any external-process scheduler or Lua workflow runtime.
 3. Design the sandboxed Lua workflow surface against that versioned protocol without adding execution until validation and security boundaries are explicit.
+
+## Cycle 6 — deterministic local event search
+
+### Repository baseline
+
+- The working tree was clean on `feat/relay-daily-driver` at `0b5f947` before this cycle. The local branch was four verified cycles ahead of `origin/feat/relay-daily-driver`.
+- Relay could navigate stored sessions and time-bounded event history, but finding a recorded fact still required reading complete history or context output. It had no local query command.
+- This cycle implements only deterministic, read-only search over stored event types and payload strings. It does not add an index, fuzzy or semantic ranking, source-tree scanning, provider access, persistence, orchestration, or Lua.
+
+### Selected improvement and rationale
+
+Add an inspectable `relay search` command so operators and agents can locate recorded goals, notes, checkpoint messages, handoff details, and event kinds with explicit session/type/category/time filters. Exact matching and stable traversal keep results reproducible and explainable without introducing external services or inferred relevance.
+
+### Focused implementation plan
+
+1. Add a required nonblank search query plus shared session selection, exact event type, note category, inclusive RFC3339 time, reverse-order, and numeric-limit arguments.
+2. Match event type first, then recursively nested payload strings using lexicographically sorted object keys and recorded array order.
+3. Return at most one first match per event with an unambiguous RFC6901 pointer, deterministic order, explicit truncation, safe human rows, and typed JSON events.
+4. Keep search read-only, bound retained matches to the requested limit plus one truncation sentinel, and reject nested session-record symlinks during selector resolution.
+5. Prove filtering, ordering, exact case sensitivity, traversal, privacy, limit behavior, read-only state, and invalid-input safety.
+
+### Cycle outcome
+
+#### Implemented
+
+- Added `search <QUERY>` with `--session`, exact `--type`, `--category`, inclusive `--since`/`--until`, `--reverse`, and `--limit`. The query is a required, case-sensitive, nonblank plain substring.
+- Search filters append-only events before matching. Note categories accept the existing typed categories and match only `note.recorded` payloads; session selectors retain full UUID, unambiguous prefix, and case-insensitive `latest` behavior.
+- Each event produces at most one result. Event type has precedence; payload object keys are traversed lexicographically, arrays in recorded order, and nested fields use RFC6901 escaping under `/payload`.
+- Default results preserve oldest-first event order. Reverse changes traversal to newest-first before the limit. Search retains at most `limit + 1` owned matches, uses the extra result only to determine truncation, and correctly handles a zero limit.
+- Human rows contain timestamp, session, event type, match field, and matched text. All recorded string columns are project-root-redacted, collapsed to one line, and encode remaining control characters rather than emitting terminal controls. JSON retains raw typed events and matched text plus explicit query/filter/order/limit metadata.
+- Invalid time ranges fail before state validation or reads. Successful and failed searches do not acquire the project lock or modify Relay state.
+- Session-filtered search reuses its already loaded event snapshot while resolving stored sessions. Session enumeration now rejects nested `.relay/sessions/*.json` symlinks without following them.
+- README command guidance and examples describe exact matching, stable first-match traversal, filter/order semantics, local-only behavior, and the limited session-record read used for selector resolution.
+- No storage schema, dependency, migration, event representation, or existing command output changed.
+
+#### Architectural decisions
+
+- Search scans the canonical append-only JSONL event log rather than creating a second persisted index whose consistency would need recovery and migration.
+- Matching is deliberately case-sensitive `str::contains`. Relay does not tokenize, normalize, score, fuzzy-match, embed, or infer relevance.
+- Results preserve complete typed events in JSON while match metadata identifies the exact first field and raw matched string. Human-only sanitization never rewrites stored data.
+- The existing session selector remains authoritative. A preloaded-event helper avoids rescanning history during selector resolution while retaining legacy session reconstruction compatibility.
+
+#### Verification
+
+The focused regression passed:
+
+```text
+cargo test --test cli search_is_deterministic_filterable_and_read_only -- --exact  PASS (1 test)
+```
+
+The regression creates two completed/continued sessions, fixes session and event times deterministically, and covers exact output schemas, repeated-byte determinism, event-type precedence, sorted object and recorded array traversal, one result per event, full/latest session selection, exact type and category filters, inclusive bounds, reverse-before-limit behavior, zero-limit truncation, case sensitivity, no matches, path/newline/control sanitization, invalid-range byte preservation, lock immutability, artifact/session/event immutability, and refusal to follow a nested session-record symlink.
+
+`cargo build --quiet` passed. A direct isolated workflow recorded a note and checkpoint, then confirmed inclusive bounds, latest/category filtering, reverse truncation, case sensitivity, path/control sanitization, invalid-range rejection, and byte-preserved event state.
+
+Parallel implementation used isolated CLI, engine, and black-box coverage writers. Independent core, test-strength, and security reviewers found and drove corrections for dynamic-column/control sanitization, redact-before-normalize ordering, bounded match retention, duplicate event-log reads, nested session symlinks, lock-file assertions, deterministic latest fixtures, exact type discrimination, and recorded array-order coverage. A mistaken intermediate test expectation briefly allowed two hits for one event; the focused test failed and the assertion was corrected to preserve the one-hit contract. A later selector optimization initially returned a session reference instead of its UUID; compilation failed and the typed ID mapping was restored before verification.
+
+The complete canonical suite then passed in order:
+
+```text
+cargo fmt --check                                         PASS
+cargo clippy --all-targets --all-features -- -D warnings PASS
+cargo test --all-targets --all-features                   PASS (63 tests)
+```
+
+#### Known limitations and remaining technical debt
+
+- Search is a linear scan of the event log and loads the typed log before matching. It bounds retained matches but has no cursor or persisted index.
+- Matching covers event types and string-valued payload leaves only. Numeric, Boolean, null, field-name, source-file, and unrecorded content are intentionally excluded.
+- Matching is exact and case-sensitive; Relay has no case-folded, regular-expression, fuzzy, semantic, or ranked mode.
+- A supplied session selector validates recorded sessions and can therefore reject an unrelated malformed session record, consistent with existing shared selector behavior.
+- Relay still has no versioned Rust/Go orchestration protocol, external-process scheduler, or sandboxed Lua workflow language.
+- This is not the final completion cycle, so the branch is committed locally but not pushed again and no draft pull request is created in this cycle.
+
+#### Strongest next-cycle candidates
+
+1. Define the first versioned Rust/Go orchestration protocol boundary before implementing any external-process scheduler or Lua workflow runtime.
+2. Implement the minimal Rust-side orchestration request/status boundary with explicit schema validation and no implicit process launch.
+3. Design the sandboxed Lua workflow surface against the accepted protocol before adding execution.

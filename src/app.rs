@@ -1,7 +1,7 @@
 use crate::{
     cli::{
         CheckpointArgs, Command, ContextArgs, DoctorArgs, HandoffArgs, HistoryArgs, NoteArgs,
-        NoteCategory, SessionSelectorArgs, StartArgs,
+        NoteCategory, SearchArgs, SessionSelectorArgs, StartArgs,
     },
     git,
     lock::{self, ProjectLock},
@@ -255,6 +255,9 @@ impl IntoRunOutput for DoctorResult {
 }
 
 pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
+    if let Command::Search(args) = &command {
+        validate_search_bounds(args)?;
+    }
     validate_state_paths(&Paths::new(project))?;
     if is_mutating(&command)
         && !matches!(command, Command::Start(_))
@@ -281,6 +284,7 @@ pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
         Command::List => list_output(project)?,
         Command::Show(args) => show_output(project, args)?,
         Command::History(args) => history_output(project, args)?,
+        Command::Search(args) => search_output(project, args)?,
         Command::Resume(args) => resume(project, args)?.into_run_output(),
         Command::Doctor(args) => doctor(project, args)?.into_run_output(),
         Command::Note(args) => note(project, args)?.into_run_output(),
@@ -406,6 +410,177 @@ fn history_output(project: &Path, args: HistoryArgs) -> Result<RunOutput, AppErr
     })
 }
 
+fn validate_search_bounds(args: &SearchArgs) -> Result<(), AppError> {
+    if args
+        .since
+        .as_ref()
+        .zip(args.until.as_ref())
+        .is_some_and(|(since, until)| since > until)
+    {
+        return Err(AppError::Lifecycle(
+            "`--since` must be earlier than or equal to `--until`; use an earlier `--since` or a later `--until`"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn search_output(project: &Path, args: SearchArgs) -> Result<RunOutput, AppError> {
+    validate_search_bounds(&args)?;
+
+    let paths = Paths::new(project);
+    let mut events = read_events(&paths.events)?;
+    let selected_id = args
+        .session
+        .as_deref()
+        .map(|selector| {
+            select_session(&read_all_sessions_from_events(&paths, &events)?, selector)
+                .map(|session| session.id)
+        })
+        .transpose()?;
+    let selected_category = args.category.map(NoteCategory::as_str);
+    let order = if args.reverse {
+        events.reverse();
+        "newest_first"
+    } else {
+        "oldest_first"
+    };
+    let mut matches = events
+        .into_iter()
+        .filter(|event| selected_id.is_none_or(|id| event.session_id == id))
+        .filter(|event| {
+            args.event_type
+                .as_deref()
+                .is_none_or(|kind| event.event_type == kind)
+        })
+        .filter(|event| {
+            selected_category.is_none_or(|category| {
+                event.event_type == "note.recorded"
+                    && event.payload.get("category").and_then(Value::as_str) == Some(category)
+            })
+        })
+        .filter(|event| {
+            args.since
+                .as_ref()
+                .is_none_or(|since| &event.timestamp >= since)
+        })
+        .filter(|event| {
+            args.until
+                .as_ref()
+                .is_none_or(|until| &event.timestamp <= until)
+        })
+        .filter_map(|event| {
+            search_event(&event, &args.query).map(|(field, text)| (event, field, text))
+        })
+        .take(args.limit.saturating_add(1))
+        .collect::<Vec<_>>();
+    let truncated = matches.len() > args.limit;
+    matches.truncate(args.limit);
+
+    let mut lines = matches
+        .iter()
+        .map(|(event, field, text)| {
+            format!(
+                "{}  {}  {}  {}  {}",
+                event.timestamp.to_rfc3339(),
+                event.session_id,
+                safe_markdown_value(project, &event.event_type),
+                safe_markdown_value(project, field),
+                safe_markdown_value(project, text)
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.push(format!(
+        "Truncated: {}",
+        if truncated { "yes" } else { "no" }
+    ));
+    let json_matches = matches
+        .iter()
+        .map(|(event, field, text)| {
+            json!({
+                "event": event,
+                "field": field,
+                "text": text,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(RunOutput {
+        human: lines.join("\n"),
+        data: json!({
+            "query": args.query,
+            "matches": json_matches,
+            "truncated": truncated,
+            "order": order,
+            "session": selected_id.map(|id| id.to_string()),
+            "type": args.event_type,
+            "category": selected_category,
+            "since": args.since,
+            "until": args.until,
+            "limit": args.limit,
+        }),
+    })
+}
+
+fn search_event(event: &Event, query: &str) -> Option<(String, String)> {
+    if event.event_type.contains(query) {
+        return Some(("type".into(), event.event_type.clone()));
+    }
+
+    let mut pointer = "/payload".to_owned();
+    search_payload(&event.payload, query, &mut pointer)
+        .map(|(field, text)| (field, text.to_owned()))
+}
+
+fn search_payload<'a>(
+    value: &'a Value,
+    query: &str,
+    pointer: &mut String,
+) -> Option<(String, &'a str)> {
+    match value {
+        Value::String(text) if text.contains(query) => Some((pointer.clone(), text)),
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                let original_len = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&index.to_string());
+                let found = search_payload(value, query, pointer);
+                pointer.truncate(original_len);
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+        Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys {
+                let original_len = pointer.len();
+                push_json_pointer_segment(pointer, key);
+                let found = search_payload(&values[key], query, pointer);
+                pointer.truncate(original_len);
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn push_json_pointer_segment(pointer: &mut String, segment: &str) {
+    pointer.push('/');
+    for character in segment.chars() {
+        match character {
+            '~' => pointer.push_str("~0"),
+            '/' => pointer.push_str("~1"),
+            _ => pointer.push(character),
+        }
+    }
+}
+
 fn is_mutating(command: &Command) -> bool {
     matches!(
         command,
@@ -429,6 +604,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::List => "list",
         Command::Show(_) => "show",
         Command::History(_) => "history",
+        Command::Search(_) => "search",
         Command::Resume(_) => "resume",
         Command::Doctor(_) => "doctor",
         Command::Note(_) => "note",
@@ -801,12 +977,27 @@ fn render_handoff(
 }
 
 fn safe_markdown_value(project: &Path, value: &str) -> String {
-    let concise = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let project_root = project.to_string_lossy();
+    let normalize = |text: &str| {
+        let mut safe = String::with_capacity(text.len());
+        for (index, segment) in text.split_whitespace().enumerate() {
+            if index > 0 {
+                safe.push(' ');
+            }
+            for character in segment.chars() {
+                if character.is_control() {
+                    safe.extend(character.escape_default());
+                } else {
+                    safe.push(character);
+                }
+            }
+        }
+        safe
+    };
     if project_root.is_empty() || project_root == "/" {
-        concise
+        normalize(value)
     } else {
-        concise.replace(project_root.as_ref(), "[project root]")
+        normalize(&value.replace(project_root.as_ref(), "[project root]"))
     }
 }
 
@@ -2016,6 +2207,14 @@ fn push_diagnostic(
 }
 
 fn read_all_sessions(paths: &Paths) -> Result<Vec<Session>, AppError> {
+    let history = read_events(&paths.events)?;
+    read_all_sessions_from_events(paths, &history)
+}
+
+fn read_all_sessions_from_events(
+    paths: &Paths,
+    history: &[Event],
+) -> Result<Vec<Session>, AppError> {
     let mut sessions = Vec::new();
     if paths.sessions.exists() {
         let mut entries = fs::read_dir(&paths.sessions)
@@ -2030,8 +2229,16 @@ fn read_all_sessions(paths: &Paths) -> Result<Vec<Session>, AppError> {
             })?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
-            if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
-                sessions.push(read_session(&entry.path())?);
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                let file_type = entry.file_type().map_err(|source| AppError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                if file_type.is_symlink() {
+                    return Err(AppError::SymlinkState { path });
+                }
+                sessions.push(read_session(&path)?);
             }
         }
     }
@@ -2041,8 +2248,7 @@ fn read_all_sessions(paths: &Paths) -> Result<Vec<Session>, AppError> {
             sessions.push(current);
         }
     }
-    let history = read_events(&paths.events)?;
-    for event in &history {
+    for event in history {
         if sessions
             .iter()
             .any(|session| session.id == event.session_id)

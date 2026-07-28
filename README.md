@@ -64,6 +64,7 @@ relay handoff codex \
   --decision "Use the Git CLI for snapshots" \
   --failure "Offline mirror was unavailable" \
   --next-action "Review the installer smoke test"
+relay search "installer" --category decision --reverse
 relay context --max-chars 8000
 relay finish
 ```
@@ -85,6 +86,12 @@ Relay supports these commands:
   [--until <RFC3339>] [--reverse] [--limit <N>]` filters append-only events,
   then displays the earliest matches by default or newest matches with
   `--reverse`; both time bounds are inclusive and the limit follows that order.
+- `search <QUERY> [--session <SESSION>] [--type <EVENT_TYPE>]
+  [--category <CATEGORY>] [--since <RFC3339>] [--until <RFC3339>] [--reverse]
+  [--limit <N>]` searches stored event types and payload strings for an exact,
+  case-sensitive plain substring. Filters run before matching, results retain
+  append order by default, and `--reverse` selects newest matches before the
+  limit.
 - `resume <SESSION>` starts a new active continuation of a completed session,
   preserving its goal and recording lineage. It accepts the same selectors,
   including `latest`, does not modify the source, and fails if a session is
@@ -123,6 +130,28 @@ text, `--stdin`, and `--editor` is rejected.
 Recorded notes are facts: Relay can include them in handoffs, final summaries,
 and context, but never fills in work, decisions, failures, or next actions that
 were not recorded.
+
+## Deterministic local search
+
+Search matches only Relay's append-only event log. Session records are read
+only to resolve an optional session selector. It does not scan the working
+tree, call model providers, use embeddings, or infer relevance:
+
+```sh
+relay search "installer"
+relay search "review required" --session latest --category blocker
+relay search "timeout" --type handoff.generated --since 2025-01-02T03:04:05Z
+relay --json search "decision" --reverse --limit 20
+```
+
+Matching is an exact, case-sensitive substring over the event type and string
+values nested in its payload. Each event appears at most once, identified by
+the first deterministic match: event type first, then payload object keys in
+lexicographic order and array values in recorded order. Session, exact event
+type, note category, and inclusive RFC3339 time filters are applied before
+matching. Results remain oldest-first by default; `--reverse` reverses all
+matches before applying the limit. Search is read-only and returns stored typed
+events in JSON without adding an index or changing the schema.
 
 ## Bounded agent context
 

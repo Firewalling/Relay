@@ -1944,3 +1944,551 @@ fn navigation_is_deterministic_across_history_and_shared_session_selectors() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn search_is_deterministic_filterable_and_read_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+    let project_path = project.to_string_lossy().into_owned();
+    let goal = "first needle-goal for resumed search";
+    let progress_text = format!(
+        "needle-human progress\npath {project_path}\twith collapsed whitespace \u{1b}control"
+    );
+    let checkpoint_message = "nested checkpoint needle-checkpoint message";
+    let completed_match = "needle-handoff completed array element";
+    let later_completed_match = "needle-handoff alphabetically-earlier later array element";
+    let decision_match = "second needle-decision note";
+
+    assert_success(&relay(project, &["start", goal]));
+    let first = read_session(project);
+    assert_success(&relay_with_stdin(
+        project,
+        &["note", "progress", "--stdin"],
+        progress_text.as_bytes(),
+    ));
+    assert_success(&relay(project, &["checkpoint", checkpoint_message]));
+    assert_success(&relay(
+        project,
+        &[
+            "handoff",
+            "search-reader",
+            "--completed-work",
+            "plain completed array element",
+            "--completed-work",
+            completed_match,
+            "--completed-work",
+            later_completed_match,
+            "--decision",
+            "needle-handoff later decision array element",
+            "--failure",
+            "Needle-handoff mixed-case decoy",
+            "--next-action",
+            "plain next action",
+        ],
+    ));
+    assert_success(&relay(project, &["finish"]));
+
+    assert_success(&relay(project, &["resume", "latest"]));
+    let resumed = read_session(project);
+    assert_eq!(resumed.resumed_from, Some(first.id));
+    assert_success(&relay(project, &["note", "decision", decision_match]));
+    assert_success(&relay(project, &["finish"]));
+
+    let relay_root = project.join(".relay");
+    let sessions_root = relay_root.join("sessions");
+    let first_session_path = sessions_root.join(format!("{}.json", first.id));
+    let resumed_session_path = sessions_root.join(format!("{}.json", resumed.id));
+    let current_session_path = relay_root.join("session.json");
+    let original_completed_first: Session =
+        serde_json::from_slice(&fs::read(&first_session_path).unwrap()).unwrap();
+    let original_completed_resumed: Session =
+        serde_json::from_slice(&fs::read(&resumed_session_path).unwrap()).unwrap();
+    let original_current_session: Session =
+        serde_json::from_slice(&fs::read(&current_session_path).unwrap()).unwrap();
+    assert_eq!(original_completed_first.state, SessionState::Completed);
+    assert_eq!(original_completed_resumed.state, SessionState::Completed);
+    assert_eq!(original_completed_resumed.id, resumed.id);
+    assert_eq!(original_completed_resumed.resumed_from, Some(first.id));
+    assert_eq!(original_current_session, original_completed_resumed);
+
+    let earlier_started_at = "2024-02-01T00:00:00Z".parse().unwrap();
+    let later_started_at = "2024-02-02T00:00:00Z".parse().unwrap();
+    let mut fixed_first_session = original_completed_first.clone();
+    let mut fixed_resumed_session = original_completed_resumed.clone();
+    let mut fixed_current_session = original_current_session.clone();
+    fixed_first_session.started_at = earlier_started_at;
+    fixed_resumed_session.started_at = later_started_at;
+    fixed_current_session.started_at = later_started_at;
+    for (path, session) in [
+        (&first_session_path, &fixed_first_session),
+        (&resumed_session_path, &fixed_resumed_session),
+        (&current_session_path, &fixed_current_session),
+    ] {
+        let mut bytes = serde_json::to_vec_pretty(session).unwrap();
+        bytes.push(b'\n');
+        fs::write(path, bytes).unwrap();
+    }
+
+    let completed_first: Session =
+        serde_json::from_slice(&fs::read(&first_session_path).unwrap()).unwrap();
+    let completed_resumed: Session =
+        serde_json::from_slice(&fs::read(&resumed_session_path).unwrap()).unwrap();
+    let current_session: Session =
+        serde_json::from_slice(&fs::read(&current_session_path).unwrap()).unwrap();
+    assert_eq!(completed_first, fixed_first_session);
+    assert_eq!(completed_resumed, fixed_resumed_session);
+    assert_eq!(current_session, fixed_current_session);
+    assert_eq!(
+        [completed_first.id, completed_resumed.id],
+        [first.id, resumed.id]
+    );
+    assert!(completed_first.started_at < completed_resumed.started_at);
+    assert_eq!(current_session.id, resumed.id);
+    assert_eq!(current_session.started_at, completed_resumed.started_at);
+
+    let events_path = project.join(".relay/events.jsonl");
+    let original_bytes = fs::read(&events_path).unwrap();
+    assert_eq!(original_bytes.last(), Some(&b'\n'));
+    let generated_events = read_events(project);
+    assert_eq!(
+        generated_events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "session.started",
+            "note.recorded",
+            "checkpoint.created",
+            "handoff.generated",
+            "session.finished",
+            "session.resumed",
+            "note.recorded",
+            "session.finished",
+        ]
+    );
+
+    let original_values = String::from_utf8(original_bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(original_values.len(), generated_events.len());
+    let fixed_timestamps = (0..original_values.len())
+        .map(|index| format!("2024-02-03T04:05:{index:02}Z"))
+        .collect::<Vec<_>>();
+    let mut fixed_values = original_values.clone();
+    for ((before, after), timestamp) in original_values
+        .iter()
+        .zip(&mut fixed_values)
+        .zip(&fixed_timestamps)
+    {
+        after["timestamp"] = serde_json::Value::String(timestamp.clone());
+        let mut before_without_timestamp = before.clone();
+        let mut after_without_timestamp = after.clone();
+        before_without_timestamp
+            .as_object_mut()
+            .unwrap()
+            .remove("timestamp");
+        after_without_timestamp
+            .as_object_mut()
+            .unwrap()
+            .remove("timestamp");
+        assert_eq!(after_without_timestamp, before_without_timestamp);
+    }
+    let mut fixed_bytes = Vec::new();
+    for event in &fixed_values {
+        serde_json::to_writer(&mut fixed_bytes, event).unwrap();
+        fixed_bytes.push(b'\n');
+    }
+    fs::write(&events_path, &fixed_bytes).unwrap();
+    assert_eq!(fixed_bytes.last(), Some(&b'\n'));
+
+    let fixed_events = read_events(project);
+    assert_eq!(fixed_events.len(), generated_events.len());
+    for ((before, after), timestamp) in generated_events
+        .iter()
+        .zip(&fixed_events)
+        .zip(&fixed_timestamps)
+    {
+        assert_eq!(after.schema_version, before.schema_version);
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(after.event_type, before.event_type);
+        assert_eq!(after.payload, before.payload);
+        assert_eq!(
+            serde_json::to_value(after.timestamp).unwrap(),
+            serde_json::json!(timestamp)
+        );
+    }
+
+    let lock_before = fs::read(relay_root.join("lock")).unwrap();
+    let snapshot_directory = |path: &Path| {
+        let mut files = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    };
+    let directory_names = |path: &Path| {
+        let mut names = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let relay_entries_before = directory_names(&relay_root);
+    let current_session_before = fs::read(relay_root.join("session.json")).unwrap();
+    let sessions_before = snapshot_directory(&relay_root.join("sessions"));
+    let checkpoints_before = snapshot_directory(&relay_root.join("checkpoints"));
+    let handoffs_before = snapshot_directory(&relay_root.join("handoffs"));
+    let operations_before = snapshot_directory(&relay_root.join("operations"));
+    let first_summary_path = relay_root.join(format!("summary-{}.md", first.id));
+    let resumed_summary_path = relay_root.join(format!("summary-{}.md", resumed.id));
+    let first_summary_before = fs::read(&first_summary_path).unwrap();
+    let resumed_summary_before = fs::read(&resumed_summary_path).unwrap();
+    assert_eq!(sessions_before.len(), 2);
+    assert_eq!(checkpoints_before.len(), 1);
+    assert_eq!(handoffs_before.len(), 1);
+
+    let default_search = relay(project, &["--json", "search", "needle"]);
+    let default_data = json_success_data(&default_search);
+    let repeated_default = relay(project, &["--json", "search", "needle"]);
+    assert_success(&repeated_default);
+    assert!(repeated_default.stderr.is_empty());
+    assert_eq!(repeated_default.stdout, default_search.stdout);
+    let mut data_keys = default_data
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    data_keys.sort_unstable();
+    assert_eq!(
+        data_keys,
+        [
+            "category",
+            "limit",
+            "matches",
+            "order",
+            "query",
+            "session",
+            "since",
+            "truncated",
+            "type",
+            "until",
+        ]
+    );
+    assert_eq!(default_data["query"], "needle");
+    assert_eq!(default_data["order"], "oldest_first");
+    assert_eq!(default_data["truncated"], false);
+    assert!(default_data["session"].is_null());
+    assert!(default_data["type"].is_null());
+    assert!(default_data["category"].is_null());
+    assert!(default_data["since"].is_null());
+    assert!(default_data["until"].is_null());
+    assert_eq!(default_data["limit"], 100);
+
+    let matches = default_data["matches"].as_array().unwrap();
+    let expected_matches = [
+        (0, "/payload/goal", goal),
+        (1, "/payload/text", progress_text.as_str()),
+        (2, "/payload/checkpoint/message", checkpoint_message),
+        (3, "/payload/completed_work/1", completed_match),
+        (5, "/payload/goal", goal),
+        (6, "/payload/text", decision_match),
+    ];
+    assert_eq!(matches.len(), expected_matches.len());
+    for (matched, (event_index, field, text)) in matches.iter().zip(expected_matches) {
+        let mut match_keys = matched
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        match_keys.sort_unstable();
+        assert_eq!(match_keys, ["event", "field", "text"]);
+        assert_eq!(
+            matched["event"],
+            serde_json::to_value(&fixed_events[event_index]).unwrap()
+        );
+        assert_eq!(matched["field"], field);
+        assert_eq!(matched["text"], text);
+    }
+
+    let type_precedence = json_success_data(&relay(project, &["--json", "search", "note"]));
+    let type_matches = type_precedence["matches"].as_array().unwrap();
+    assert_eq!(type_matches.len(), 2);
+    for (matched, event_index) in type_matches.iter().zip([1, 6]) {
+        assert_eq!(
+            matched["event"],
+            serde_json::to_value(&fixed_events[event_index]).unwrap()
+        );
+        assert_eq!(matched["field"], "type");
+        assert_eq!(matched["text"], "note.recorded");
+    }
+
+    let exact_type = json_success_data(&relay(
+        project,
+        &[
+            "--json",
+            "search",
+            "needle",
+            "--type",
+            "checkpoint.created",
+            "--limit",
+            "1",
+        ],
+    ));
+    assert_eq!(exact_type["type"], "checkpoint.created");
+    assert_eq!(exact_type["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        exact_type["matches"][0]["event"],
+        serde_json::to_value(&fixed_events[2]).unwrap()
+    );
+    assert_eq!(
+        exact_type["matches"][0]["field"],
+        "/payload/checkpoint/message"
+    );
+    assert_eq!(exact_type["truncated"], false);
+
+    let latest = json_success_data(&relay(
+        project,
+        &["--json", "search", "needle", "--session", "latest"],
+    ));
+    assert_eq!(latest["session"], resumed.id.to_string());
+    assert_eq!(
+        latest["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|matched| matched["event"]["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            fixed_events[5].id.to_string(),
+            fixed_events[6].id.to_string()
+        ]
+    );
+
+    let categorized = json_success_data(&relay(
+        project,
+        &[
+            "--json",
+            "search",
+            "needle",
+            "--session",
+            "LaTeSt",
+            "--category",
+            "decision",
+            "--limit",
+            "1",
+        ],
+    ));
+    assert_eq!(categorized["session"], resumed.id.to_string());
+    assert_eq!(categorized["category"], "decision");
+    assert_eq!(categorized["limit"], 1);
+    assert_eq!(categorized["truncated"], false);
+    assert_eq!(categorized["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        categorized["matches"][0]["event"],
+        serde_json::to_value(&fixed_events[6]).unwrap()
+    );
+    assert_eq!(categorized["matches"][0]["field"], "/payload/text");
+
+    let bounded = json_success_data(&relay(
+        project,
+        &[
+            "--json",
+            "search",
+            "needle",
+            "--since",
+            &fixed_timestamps[2],
+            "--until",
+            &fixed_timestamps[5],
+            "--limit",
+            "3",
+        ],
+    ));
+    assert_eq!(bounded["since"], fixed_timestamps[2]);
+    assert_eq!(bounded["until"], fixed_timestamps[5]);
+    assert_eq!(bounded["truncated"], false);
+    assert_eq!(
+        bounded["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|matched| matched["event"]["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            fixed_events[2].id.to_string(),
+            fixed_events[3].id.to_string(),
+            fixed_events[5].id.to_string(),
+        ]
+    );
+
+    let reversed = json_success_data(&relay(
+        project,
+        &["--json", "search", "needle", "--reverse", "--limit", "2"],
+    ));
+    assert_eq!(reversed["order"], "newest_first");
+    assert_eq!(reversed["limit"], 2);
+    assert_eq!(reversed["truncated"], true);
+    assert_eq!(
+        reversed["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|matched| matched["event"]["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            fixed_events[6].id.to_string(),
+            fixed_events[5].id.to_string()
+        ]
+    );
+
+    let zero_limit = json_success_data(&relay(
+        project,
+        &["--json", "search", "needle", "--limit", "0"],
+    ));
+    assert!(zero_limit["matches"].as_array().unwrap().is_empty());
+    assert_eq!(zero_limit["limit"], 0);
+    assert_eq!(zero_limit["truncated"], true);
+
+    let case_mismatch = json_success_data(&relay(project, &["--json", "search", "NEEDLE"]));
+    assert!(case_mismatch["matches"].as_array().unwrap().is_empty());
+    assert_eq!(case_mismatch["truncated"], false);
+
+    let empty_human = relay(project, &["search", "needle", "--type", "session"]);
+    assert_success(&empty_human);
+    assert!(empty_human.stderr.is_empty());
+    assert_eq!(empty_human.stdout, b"Truncated: no\n");
+
+    let safe_human = relay(project, &["search", "needle-human"]);
+    assert_success(&safe_human);
+    assert!(safe_human.stderr.is_empty());
+    let safe_lines = stdout(&safe_human)
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        safe_lines,
+        [
+            format!(
+                "{}  {}  note.recorded  /payload/text  needle-human progress path [project root] with collapsed whitespace \\u{{1b}}control",
+                fixed_events[1].timestamp.to_rfc3339(),
+                first.id,
+            ),
+            "Truncated: no".to_owned(),
+        ]
+    );
+    assert!(!safe_lines[0].contains(project_path.as_str()));
+    assert!(!safe_lines[0].contains('\t'));
+    assert!(safe_lines[0].contains("\\u{1b}"));
+    assert!(!safe_lines[0].contains('\u{1b}'));
+
+    assert_eq!(fs::read(&events_path).unwrap(), fixed_bytes);
+    assert_eq!(fs::read(relay_root.join("lock")).unwrap(), lock_before);
+    assert_eq!(
+        fs::read(relay_root.join("session.json")).unwrap(),
+        current_session_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("sessions")),
+        sessions_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("checkpoints")),
+        checkpoints_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("handoffs")),
+        handoffs_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("operations")),
+        operations_before
+    );
+    assert_eq!(fs::read(&first_summary_path).unwrap(), first_summary_before);
+    assert_eq!(
+        fs::read(&resumed_summary_path).unwrap(),
+        resumed_summary_before
+    );
+    assert_eq!(directory_names(&relay_root), relay_entries_before);
+
+    let invalid_range = relay(
+        project,
+        &[
+            "search",
+            "needle",
+            "--since",
+            &fixed_timestamps[5],
+            "--until",
+            &fixed_timestamps[2],
+        ],
+    );
+    assert!(!invalid_range.status.success());
+    assert!(invalid_range.stdout.is_empty());
+    assert!(stderr(&invalid_range).contains(
+        "`--since` must be earlier than or equal to `--until`; use an earlier `--since` or a later `--until`"
+    ));
+    assert_eq!(fs::read(&events_path).unwrap(), fixed_bytes);
+    assert_eq!(fs::read(relay_root.join("lock")).unwrap(), lock_before);
+    assert_eq!(
+        fs::read(relay_root.join("session.json")).unwrap(),
+        current_session_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("sessions")),
+        sessions_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("checkpoints")),
+        checkpoints_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("handoffs")),
+        handoffs_before
+    );
+    assert_eq!(
+        snapshot_directory(&relay_root.join("operations")),
+        operations_before
+    );
+    assert_eq!(fs::read(&first_summary_path).unwrap(), first_summary_before);
+    assert_eq!(
+        fs::read(&resumed_summary_path).unwrap(),
+        resumed_summary_before
+    );
+    assert_eq!(directory_names(&relay_root), relay_entries_before);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_session_path = outside.path().join("session.json");
+        let mut outside_session = fixed_current_session.clone();
+        outside_session.started_at = "2024-02-04T00:00:00Z".parse().unwrap();
+        let mut outside_bytes = serde_json::to_vec_pretty(&outside_session).unwrap();
+        outside_bytes.push(b'\n');
+        fs::write(&outside_session_path, &outside_bytes).unwrap();
+
+        let unsafe_session_path = sessions_root.join("unsafe.json");
+        symlink(&outside_session_path, &unsafe_session_path).unwrap();
+        let unsafe_search = relay(project, &["search", "needle", "--session", "latest"]);
+        assert!(!unsafe_search.status.success());
+        assert!(unsafe_search.stdout.is_empty());
+        let unsafe_error = stderr(&unsafe_search);
+        assert!(unsafe_error.contains("refusing to use symlinked Relay state path"));
+        assert!(unsafe_error.contains(".relay/sessions/unsafe.json"));
+        assert_eq!(fs::read(&outside_session_path).unwrap(), outside_bytes);
+
+        fs::remove_file(&unsafe_session_path).unwrap();
+        assert_eq!(fs::read(&outside_session_path).unwrap(), outside_bytes);
+    }
+}
