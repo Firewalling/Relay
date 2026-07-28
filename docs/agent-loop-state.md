@@ -527,3 +527,83 @@ cargo test --all-targets --all-features                   PASS (67 tests)
 1. With a verified Go toolchain available, implement the strict protocol-v1 decoder, a minimal versioned Go-owned run-file schema, and canonical Go CI gates before scheduling.
 2. Add bounded dependency-aware Go scheduling, direct-argv supervision, cancellation/timeouts, explicit retries, filtered environments, and bounded logs against that schema.
 3. Define and validate the sandboxed Lua workflow surface only after the Go run-state and execution-safety boundaries are executable and tested.
+
+## Cycle 8 — complete JSON error envelopes
+
+### Repository baseline
+
+- The working tree was clean on `feat/relay-daily-driver` at `2c7ccb6` before this cycle. The local branch was six verified cycles ahead of `origin/feat/relay-daily-driver`.
+- Protocol v1 required the `--json --scope current` prefix and defined one-document application responses, but Clap argument failures still escaped as plain text even when `--json` was present. A future process supervisor would therefore need two incompatible error decoders at the same process boundary.
+- Failures after successful parsing already used typed application error envelopes except for failure to read the invocation directory. Clap's own help/version output and successful completion-script generation remained intentionally shell-facing text.
+- This is the eighth and final permitted development cycle. The workstation still has no `go` or `gofmt` executable, and the repository still has no Go module, Go source, Lua source, or embedded Lua runtime.
+
+### Selected improvement and rationale
+
+Make JSON error framing begin at argument parsing rather than application dispatch. This closes the remaining Rust-side process-boundary ambiguity without changing protocol v1 data, command semantics, project storage, or the unimplemented Go/Lua ownership boundary.
+
+### Focused implementation plan
+
+1. Collect OS-native argv and detect an exact global `--json` only before a literal `--`.
+2. Replace infallible Clap parsing with explicit error handling that preserves Clap's streams and exit codes.
+3. Emit output-schema-v1 `argument_error` envelopes for JSON-mode parser failures and `current_directory` envelopes for parsed invocation-directory failures.
+4. Preserve successful help/version and completion-script output as shell text, and preserve ordinary Clap diagnostics when JSON was not requested.
+5. Prove exact envelope shape, placement, delimiter semantics, no state mutation, and closed-stream exit behavior in black-box coverage.
+6. Update README and protocol framing documentation without changing the manifest or claiming orchestration implementation.
+
+### Cycle outcome
+
+#### Implemented
+
+- `main` now collects `args_os` and uses `Cli::try_parse_from`, preserving OS-native argument values, including non-UTF-8 data, rather than converting argv lossily.
+- An exact `--json` token before a literal `--` requests parser-stage JSON errors. Clap failures now emit one compact output-schema-v1 error envelope on stderr with `command: "cli"`, `error.code: "argument_error"`, a normalized actionable Clap message, no stdout, and Clap's original nonzero exit code.
+- Without the JSON request, parser failures retain Clap's normal text and stream. Successful help/version requests retain normal Clap text even with `--json`; successful completion-script generation remains shell text.
+- After parsing, inability to read the current directory now uses `error.code: "current_directory"` and the parsed command name through the same output-mode-aware error renderer.
+- Diagnostic writes are fallible and ignored after the intended status is selected. Closed stderr can no longer turn a parser or application failure into a panic, and closed stdout cannot turn Clap help into a panic status.
+- Focused black-box coverage checks JSON placement before and after a subcommand, invalid typed values, unknown commands, missing arguments, exact envelope keys, streams, one trailing newline, exit code 2, normalized messages, human fallback, help behavior, literal-`--` handling, absence of `.relay` mutation, and Unix closed-stream behavior.
+- README and `docs/orchestration-protocol.md` now distinguish parser failures, parsed startup failures, application responses, successful help/version/completion output, and OS process-launch failure.
+- No protocol/output/state schema version, manifest fixture, operation, dependency, storage record, migration, Go/Lua artifact, or CI workflow changed.
+
+#### Architectural decisions
+
+- Parser errors use the stable synthetic command name `cli` because malformed argv may not identify any valid Relay command. Parsed startup and application errors continue to use the actual command name.
+- JSON intent is detected from exact OS-native argv only before `--`; a positional value spelled `--json` cannot silently change framing.
+- Help and version are successful shell inspection requests rather than protocol application responses. Failure to start the Relay executable is outside Relay's process and cannot produce a Relay envelope.
+- Error output deliberately ignores broken-stream writes after selecting the semantic exit code, matching Clap's prior non-panicking behavior and avoiding panic-status substitution.
+
+#### Verification
+
+Focused and direct verification passed:
+
+```text
+cargo test --test cli parser_failures_honor_json_mode_without_mutating_project_state -- --exact  PASS (1 test)
+direct malformed-invocation smoke                                                        PASS
+LSP diagnostics: src/main.rs                                                            OK
+LSP diagnostics: tests/cli.rs                                                           OK
+git diff --check                                                                         PASS
+```
+
+The direct smoke covered JSON before and after the command, unknown-command errors, human fallback, JSON-mode help, literal-`--` handling, and absence of project-state mutation.
+
+Parallel isolated writers implemented runtime handling, black-box coverage, and documentation. Independent core and contract reviews found two concrete defects: diagnostic write failures could replace Clap's intended status with a panic, and README overgeneralized completion output despite malformed completion invocations using parser envelopes. Both were corrected and focused verification rerun.
+
+The complete available Rust suite passed in order:
+
+```text
+cargo fmt --check                                         PASS
+cargo clippy --all-targets --all-features -- -D warnings PASS
+cargo test --all-targets --all-features                   PASS (68 tests)
+```
+
+#### Stop condition and remaining milestone work
+
+- The complete orchestration milestone is not successful: no Go protocol client, run-state model, scheduler, process supervisor, status/log stream, cancellation, timeout, retry, resume, Lua parser, workflow validator, graph preview, sandbox, workflow runtime, or orchestration end-to-end test exists.
+- `go version`, `go test ./...`, and `go vet ./...` fail with exit 127 because `go` is unavailable. `gofmt -l .` likewise fails with exit 127 because `gofmt` is unavailable. There are no Go or Lua files to verify.
+- The mandatory Rust/Go/Lua verification contract therefore cannot pass. Pushing this incomplete branch or creating the required draft pull request would misrepresent the milestone, so neither action is performed.
+- The eight-cycle cap is reached with this coherent Rust cycle committed locally. Per the milestone stop conditions, no ninth cycle may begin in this run.
+- Schema-v1 projects remain compatible: this cycle changes only process-error rendering before project access and does not read, write, reinterpret, or migrate durable state.
+
+#### Recommended continuation
+
+1. In a new authorized run on a workstation with a verified Go toolchain, implement the strict protocol-v1 Go decoder, minimal versioned Go-owned run-state schema, and canonical Go CI gates.
+2. Add bounded dependency-aware direct-argv supervision with filtered environments, bounded secret-safe logs, cancellation/timeouts, explicit retries, child cleanup, and deterministic status/resume.
+3. Only after that execution boundary is verified, add the embedded sandboxed Lua workflow validator/runtime and the required Rust/Go/Lua end-to-end test.

@@ -112,16 +112,28 @@ runtime, or agent/workflow process launcher. Allowed Git-aware operations may
 invoke `git`; existing note editor behavior is outside protocol v1.
 
 `--json` and `--scope auto|current|repository` are global options and work
-before or after a subcommand. Human output remains the default. For a parsed
-invocation that reaches application handling, `--json` emits one versioned
-success document on stdout, or one versioned error document on stderr;
-`output_schema_version` is separate from the on-disk schema version. Clap parse
-errors and failures before envelope-producing application startup may be plain
-text or another non-document diagnostic; they remain nonzero failures.
+before or after a subcommand. Human output remains the default. An exact global
+`--json` anywhere before a literal `--` requests JSON error framing even when
+Clap rejects the arguments: Relay writes one compact output-schema-v1 error
+envelope to stderr, writes nothing to stdout, and retains Clap's nonzero exit
+code. That envelope uses `command: "cli"`, `error.code: "argument_error"`, and
+an actionable normalized Clap message without a redundant leading `error: `.
+Without that request, parser failures remain ordinary Clap stderr text.
+
+After parsing, a failure to read the current directory uses the same JSON error
+envelope shape when requested, with `error.code: "current_directory"` and the
+parsed command name; human output remains unchanged. When JSON was requested,
+application handling likewise emits one versioned success document on stdout
+or one versioned error document on stderr. Successful help and version requests
+remain ordinary shell-facing Clap text, including with `--json`, and
+successful completion-script generation remains shell text. If the operating
+system cannot start the Relay process, Relay
+cannot emit an envelope; the caller must handle that launch failure.
+`output_schema_version` is separate from the on-disk schema version.
+
 For mutating commands, human and JSON output are rendered from the operation's
 typed result; Relay does not reconstruct a completed mutation by rescanning
 unrelated historical records.
-Completions are shell text regardless of global output options.
 
 ## Notes
 

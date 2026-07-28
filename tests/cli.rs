@@ -1012,6 +1012,132 @@ fn mutation_results_do_not_rescan_corrupt_unrelated_session_records() {
 }
 
 #[test]
+fn parser_failures_honor_json_mode_without_mutating_project_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+
+    let assert_json_argument_error = |args: &[&str], message_fragments: &[&str]| {
+        let output = relay(project, args);
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            output.stderr.iter().filter(|&&byte| byte == b'\n').count(),
+            1,
+            "JSON parser failure must be exactly one newline-terminated document"
+        );
+        assert_eq!(output.stderr.last(), Some(&b'\n'));
+
+        let document: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_json_object_has_required_keys(
+            &document,
+            &["command", "error", "ok", "output_schema_version"],
+        );
+        assert_eq!(document.as_object().unwrap().len(), 4);
+        assert_json_object_has_required_keys(&document["error"], &["code", "message"]);
+        assert_eq!(document["error"].as_object().unwrap().len(), 2);
+        assert_eq!(document["output_schema_version"], 1);
+        assert_eq!(document["ok"], false);
+        assert_eq!(document["command"], "cli");
+        assert_eq!(document["error"]["code"], "argument_error");
+
+        let message = document["error"]["message"].as_str().unwrap();
+        assert!(!message.starts_with("error: "));
+        for fragment in message_fragments {
+            assert!(
+                message.contains(*fragment),
+                "argument error message omitted actionable fragment `{fragment}`: {message}"
+            );
+        }
+        assert!(!project.join(".relay").exists());
+    };
+
+    assert_json_argument_error(
+        &["--json", "--scope", "not-a-scope", "status"],
+        &["invalid value", "not-a-scope", "--scope"],
+    );
+    assert_json_argument_error(
+        &["status", "--json", "--scope", "not-a-scope"],
+        &["invalid value", "not-a-scope", "--scope"],
+    );
+    assert_json_argument_error(
+        &["--json", "not-a-command"],
+        &["unrecognized subcommand", "not-a-command"],
+    );
+    assert_json_argument_error(
+        &["completions", "--json"],
+        &["required arguments", "<SHELL>"],
+    );
+
+    let human = relay(project, &["--scope", "not-a-scope", "status"]);
+    assert_eq!(human.status.code(), Some(2));
+    assert!(human.stdout.is_empty());
+    let human_error = stderr(&human);
+    assert!(human_error.starts_with("error: "));
+    assert!(human_error.contains("invalid value"));
+    assert!(human_error.contains("not-a-scope"));
+    assert!(human_error.contains("--scope"));
+    assert!(serde_json::from_slice::<serde_json::Value>(&human.stderr).is_err());
+    assert!(!project.join(".relay").exists());
+
+    let help = relay(project, &["--json", "--help"]);
+    assert_success(&help);
+    assert!(help.stderr.is_empty());
+    let help_text = stdout(&help);
+    assert!(help_text.contains("Usage: relay"));
+    assert!(help_text.contains("--json"));
+    assert!(serde_json::from_slice::<serde_json::Value>(&help.stdout).is_err());
+    assert!(!project.join(".relay").exists());
+
+    let after_delimiter = relay(project, &["protocol", "--", "--json"]);
+    assert_eq!(after_delimiter.status.code(), Some(2));
+    assert!(after_delimiter.stdout.is_empty());
+    let after_delimiter_error = stderr(&after_delimiter);
+    assert!(after_delimiter_error.starts_with("error: "));
+    assert!(after_delimiter_error.contains("--json"));
+    assert!(serde_json::from_slice::<serde_json::Value>(&after_delimiter.stderr).is_err());
+    assert!(!project.join(".relay").exists());
+    #[cfg(unix)]
+    {
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+        let closed_stdio = || {
+            let (stream, peer) = UnixStream::pair().unwrap();
+            drop(peer);
+            Stdio::from(OwnedFd::from(stream))
+        };
+
+        let json_closed_stderr = Command::new(env!("CARGO_BIN_EXE_relay"))
+            .args(["--json", "--scope", "not-a-scope", "status"])
+            .current_dir(project)
+            .stderr(closed_stdio())
+            .output()
+            .expect("run relay binary with closed stderr");
+        assert_eq!(json_closed_stderr.status.code(), Some(2));
+        assert!(json_closed_stderr.stdout.is_empty());
+        assert!(!project.join(".relay").exists());
+
+        let human_closed_stderr = Command::new(env!("CARGO_BIN_EXE_relay"))
+            .args(["--scope", "not-a-scope", "status"])
+            .current_dir(project)
+            .stderr(closed_stdio())
+            .output()
+            .expect("run relay binary with closed stderr");
+        assert_eq!(human_closed_stderr.status.code(), Some(2));
+        assert!(human_closed_stderr.stdout.is_empty());
+
+        let help_closed_stdout = Command::new(env!("CARGO_BIN_EXE_relay"))
+            .arg("--help")
+            .current_dir(project)
+            .stdout(closed_stdio())
+            .output()
+            .expect("run relay binary with closed stdout");
+        assert_eq!(help_closed_stdout.status.code(), Some(0));
+        assert!(help_closed_stdout.stderr.is_empty());
+    }
+}
+
+#[test]
 fn json_envelopes_are_single_typed_documents_and_failures_stay_on_stderr() {
     let directory = tempfile::tempdir().unwrap();
     let project = directory.path();

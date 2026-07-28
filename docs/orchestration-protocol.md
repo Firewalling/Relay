@@ -42,21 +42,33 @@ Examples of complete argument vectors are:
 ["relay", "--json", "--scope", "current", "note", "decision", "--stdin"]
 ```
 
-Each invocation attempts to start one process. For a successfully parsed
-invocation that reaches a started application operation, application-response
-framing is exactly one JSON document; there is no streaming session, JSON Lines
-framing, multiplexing, or persistent process. On success, the process exits
-with code 0, writes exactly one output-schema-v1 success document to stdout,
-and writes nothing to stderr. When such an application operation fails, it
-exits nonzero, writes exactly one output-schema-v1 error document to stderr,
-and does not write a success document to stdout. The manifest's `one_document`
-field describes this application-response framing.
+Each invocation attempts to start one process. Once the operating system has
+started Relay, an exact global `--json` anywhere before a literal `--` requests
+JSON failure framing. If Clap rejects the arguments, Relay exits with Clap's
+nonzero code, writes no stdout, and writes exactly one compact
+output-schema-v1 error envelope to stderr. The envelope has `command: "cli"`,
+`error.code: "argument_error"`, and an actionable normalized Clap diagnostic
+without the redundant leading `error: `. Without that JSON request, argument
+failures remain ordinary Clap stderr text.
 
-Clap argument-parsing failures and failures before envelope-producing
-application startup may instead emit plain text or another non-document
-diagnostic. They remain nonzero protocol failures. Consumers must also treat a
-mismatched exit status, stream, application-response document count, or schema
-version as a protocol failure.
+After parsing, failure to read the current directory produces the same
+output-schema-v1 error envelope shape when JSON was requested, using the parsed
+command name and `error.code: "current_directory"`; human output remains
+unchanged. When JSON was requested, an invocation that reaches an application
+operation has exactly one JSON document of response framing: success exits with
+code 0, writes one output-schema-v1 success document to stdout, and writes
+nothing to stderr;
+application failure exits nonzero, writes one output-schema-v1 error document
+to stderr, and writes no success document to stdout. There is no streaming
+session, JSON Lines framing, multiplexing, or persistent process. The
+manifest's `one_document` field describes this application-response framing.
+
+Successful help and version requests remain ordinary shell-facing Clap text,
+including with `--json`; they are not JSON responses or protocol failures.
+Consumers must still treat a mismatched exit status, stream,
+application-response document count, or schema version as a protocol failure.
+If the operating system fails to start Relay, no Relay process exists to emit
+an envelope, so the consumer must handle that process-API failure separately.
 
 The fixed invocation prefix is:
 
