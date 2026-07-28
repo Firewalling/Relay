@@ -146,3 +146,74 @@ cargo test --all-targets --all-features                   PASS (52 tests)
 1. Harden the strict `--max-chars` contract at the minimum accepted budget, including Unicode and separate character-budget omission accounting.
 2. Make mutating commands return first-class typed results so output cannot fail because unrelated historical records are corrupt.
 3. Add an inspected, deterministic subset of context/history navigation such as latest-session selection, reverse display, or time bounds without changing existing defaults.
+
+## Cycle 3 — strict context character budgets
+
+### Repository baseline
+
+- The working tree was clean on `feat/relay-daily-driver` at `136635e` before this cycle. The local branch was one verified cycle ahead of `origin/feat/relay-daily-driver`.
+- Cycle 2 left `--max-chars` using a magic 64-character footer reservation. Its minimum-budget fallback could exceed the accepted limit, Unicode/footer boundaries were not proved, and `truncated` did not distinguish count-limit omissions from character-budget omissions.
+- This cycle implements only the strongest recorded candidate: harden the existing bounded-context contract. It does not begin typed mutation results, navigation, search, Go orchestration, or Lua workflows.
+
+### Selected improvement and rationale
+
+Make human `relay context --max-chars` deterministic and strictly bounded for every accepted value, including the minimum 64 Unicode characters. Agents need a reliable prompt-size boundary, and operators need to know whether records were excluded by explicit count limits or only from the rendered Markdown because of the character budget.
+
+### Focused implementation plan
+
+1. Replace approximate footer reservation with exact Unicode-scalar accounting for the session header, indivisible items, omission metadata, and the CLI's final transport newline.
+2. Track count-limit and character-budget omissions independently for notes, checkpoints, and events.
+3. Preserve selected typed records in JSON while adding explicit budget omission metadata.
+4. Provide deterministic compact and minimal human fallbacks when the full session header and detailed footer cannot fit.
+5. Cover minimum and exact budgets, Unicode, long content, whole-item behavior, repeated execution, footer accounting, and human/JSON reporting.
+
+### Cycle outcome
+
+#### Implemented
+
+- Context rendering now represents selected notes, checkpoints, and events as typed indivisible items with cached Unicode character counts. Inclusion preserves presentation order and continues trying later items when an earlier one is too large.
+- Detailed footer length is computed from its exact labels, boolean, and decimal counts. A monotone inclusion pass accounts for count-width changes, so the rendered Markdown and CLI-added newline never exceed the requested budget.
+- When the full session header cannot fit, Relay reports a compact `N/C/E` summary for notes, checkpoints, and events. If unusually wide counts make that summary too large, a fixed minimal truncated response remains safely below the accepted minimum.
+- Existing JSON `omitted` counts remain count-limit-only. Additive `budget_omitted` counts and `budget_truncated` identify human character-budget exclusions; selected note, checkpoint, and event arrays remain unchanged.
+- CLI help and the README now scope `--max-chars` to human Markdown Unicode characters, document indivisible items and both omission causes, and clarify that the JSON envelope retains typed selected records rather than being character-bounded.
+- The change adds no dependency, persistence field, schema migration, or storage reinterpretation.
+
+#### Architectural decisions
+
+- Rust remains the sole owner of bounded context selection and rendering. No process boundary or new component is warranted for deterministic local formatting.
+- The application reserves one explicit character for the existing `println!` transport newline instead of changing global output emission behavior for unrelated commands.
+- Budget omission metadata describes presentation only. Count-limited typed records remain available to JSON consumers, preserving the existing machine-readable contract while adding diagnostic fields.
+
+#### Verification
+
+The focused regression passed:
+
+```text
+cargo test --test cli context_strict_character_budget_is_deterministic_and_reports_omission_causes -- --exact  PASS (1 test)
+```
+
+The test covers a long Unicode goal, long Unicode notes and checkpoints, deterministic repeated minimum output, exact-fit and one-character-short budgets, whole-item rendering, detailed and compact footers, count versus budget omissions, and unchanged selected JSON records. Its first run compared a normalized Markdown item with the fixture's raw trailing whitespace and falsely reported a split item; correcting the assertion to use the documented whitespace normalization made the behavior test pass.
+
+`cargo build --quiet` passed. A direct isolated non-Git workflow created two notes and two checkpoints under a long Unicode goal, then ran human and JSON context with one selected item per category at `--max-chars 64`. The repeated human output was identical at 63 of 64 Unicode characters, reported count omissions `1/1/4` and budget omissions `1/1/1`, and JSON reported the same separate causes while retaining one selected typed record per category.
+
+The first canonical Clippy run found one equivalent test comparison written as `count <= budget - 1`; the isolated correction used `count < budget`. The complete canonical suite then passed in order:
+
+```text
+cargo fmt --check                                         PASS
+cargo clippy --all-targets --all-features -- -D warnings PASS
+cargo test --all-targets --all-features                   PASS (53 tests)
+```
+
+#### Known limitations and remaining technical debt
+
+- `--max-chars` bounds human Markdown/stdout; the versioned JSON envelope intentionally remains unbounded and returns the selected typed records plus budget metadata.
+- Extremely wide omission counts may not fit the compact minimum response. Relay then emits only the bounded minimal truncated marker; full counts remain available in JSON.
+- Character budgeting counts Unicode scalar values, matching Rust `chars()`, rather than terminal display columns or encoded bytes.
+- Mutation output assembly can still rescan unrelated historical records after a durable write instead of rendering a typed result returned directly by that operation.
+- This is not the final completion cycle, so the branch is committed locally but not pushed again and no draft pull request is created in this cycle.
+
+#### Strongest next-cycle candidates
+
+1. Make mutating commands return first-class typed results so successful durable writes cannot be reported as failures because unrelated historical records are corrupt.
+2. Add an inspected deterministic subset of context/history navigation, such as latest-session selection, reverse display, or time bounds, without changing existing defaults.
+3. Add deterministic local search across recorded sessions, event types, note categories, times, and plain substrings without hosted services or inferred relevance.

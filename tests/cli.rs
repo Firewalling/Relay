@@ -1145,3 +1145,289 @@ fn context_limits_keep_latest_items_in_recorded_order() {
     assert!(!text.contains("middle note"));
     assert!(!text.contains("checkpoint 0"));
 }
+
+#[test]
+fn context_strict_character_budget_is_deterministic_and_reports_omission_causes() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+    let goal = format!(
+        "GOAL_UNICODE_界🙂é {}",
+        "A deliberately long session goal 界🙂é ".repeat(24)
+    );
+    let notes = [
+        format!(
+            "NOTE_ALPHA_界🙂é {}",
+            "alpha content with Unicode 界🙂é ".repeat(12)
+        ),
+        format!(
+            "NOTE_BETA_界🙂é {}",
+            "beta content with Unicode 界🙂é ".repeat(12)
+        ),
+        format!(
+            "NOTE_GAMMA_界🙂é {}",
+            "gamma content with Unicode 界🙂é ".repeat(12)
+        ),
+    ];
+    let checkpoints = [
+        format!(
+            "CHECKPOINT_ALPHA_界🙂é {}",
+            "alpha checkpoint detail 界🙂é ".repeat(10)
+        ),
+        format!(
+            "CHECKPOINT_BETA_界🙂é {}",
+            "beta checkpoint detail 界🙂é ".repeat(10)
+        ),
+        format!(
+            "CHECKPOINT_GAMMA_界🙂é {}",
+            "gamma checkpoint detail 界🙂é ".repeat(10)
+        ),
+    ];
+    let next_action = format!(
+        "NEXT_ACTION_界🙂é {}",
+        "finish the deterministic budget review 界🙂é ".repeat(12)
+    );
+
+    assert_success(&relay(project, &["start", goal.as_str()]));
+    for (category, note) in ["progress", "decision", "next_action"]
+        .into_iter()
+        .zip(notes.iter())
+    {
+        assert_success(&relay(project, &["note", category, note.as_str()]));
+    }
+    for checkpoint in &checkpoints {
+        assert_success(&relay(project, &["checkpoint", checkpoint.as_str()]));
+    }
+    assert_success(&relay(
+        project,
+        &[
+            "handoff",
+            "budget-reviewer",
+            "--next-action",
+            next_action.as_str(),
+        ],
+    ));
+
+    let limited_args = [
+        "context",
+        "--notes",
+        "2",
+        "--checkpoints",
+        "2",
+        "--events",
+        "3",
+        "--max-chars",
+        "64",
+    ];
+    let minimum = relay(project, &limited_args);
+    let repeated_minimum = relay(project, &limited_args);
+    assert_success(&minimum);
+    assert_success(&repeated_minimum);
+    assert_eq!(minimum.stdout, repeated_minimum.stdout);
+    let minimum_text = stdout(&minimum);
+    assert!(
+        minimum_text.chars().count() <= 64,
+        "64-character output used {} characters:\n{minimum_text}",
+        minimum_text.chars().count()
+    );
+    assert_eq!(
+        minimum_text,
+        "# Relay\nTruncated: yes\nCount N/C/E: 1/1/5\nBudget N/C/E: 2/2/3\n\n"
+    );
+    for value in [
+        goal.as_str(),
+        notes[1].as_str(),
+        notes[2].as_str(),
+        checkpoints[1].as_str(),
+        checkpoints[2].as_str(),
+        next_action.as_str(),
+    ] {
+        assert!(
+            !minimum_text.contains(value),
+            "minimum output unexpectedly contained a budget-omitted item"
+        );
+    }
+
+    let generous_args = [
+        "context",
+        "--notes",
+        "2",
+        "--checkpoints",
+        "2",
+        "--events",
+        "3",
+        "--max-chars",
+        "12000",
+    ];
+    let generous = relay(project, &generous_args);
+    assert_success(&generous);
+    let generous_text = stdout(&generous);
+    let exact_budget = generous_text.chars().count();
+    assert!(exact_budget < 12000);
+    for line in [
+        "Count-omitted notes: 1",
+        "Count-omitted checkpoints: 1",
+        "Count-omitted events: 5",
+        "Budget-omitted notes: 0",
+        "Budget-omitted checkpoints: 0",
+        "Budget-omitted events: 0",
+    ] {
+        assert!(
+            generous_text.lines().any(|actual| actual == line),
+            "missing detailed omission metadata {line:?}:\n{generous_text}"
+        );
+    }
+
+    let exact_budget_arg = exact_budget.to_string();
+    let exact = relay(
+        project,
+        &[
+            "context",
+            "--notes",
+            "2",
+            "--checkpoints",
+            "2",
+            "--events",
+            "3",
+            "--max-chars",
+            exact_budget_arg.as_str(),
+        ],
+    );
+    assert_success(&exact);
+    assert_eq!(exact.stdout, generous.stdout);
+
+    let one_less_budget = (exact_budget - 1).to_string();
+    let one_less = relay(
+        project,
+        &[
+            "context",
+            "--notes",
+            "2",
+            "--checkpoints",
+            "2",
+            "--events",
+            "3",
+            "--max-chars",
+            one_less_budget.as_str(),
+        ],
+    );
+    assert_success(&one_less);
+    let one_less_text = stdout(&one_less);
+    assert!(one_less_text.chars().count() < exact_budget);
+    assert_ne!(one_less.stdout, generous.stdout);
+    for line in [
+        "Count-omitted notes: 1",
+        "Count-omitted checkpoints: 1",
+        "Count-omitted events: 5",
+        "Budget-omitted notes: 0",
+        "Budget-omitted checkpoints: 0",
+        "Budget-omitted events: 1",
+    ] {
+        assert!(
+            one_less_text.lines().any(|actual| actual == line),
+            "missing one-less omission metadata {line:?}:\n{one_less_text}"
+        );
+    }
+    let indivisible_values = [
+        ("NOTE_BETA_", notes[1].as_str()),
+        ("NOTE_GAMMA_", notes[2].as_str()),
+        ("CHECKPOINT_BETA_", checkpoints[1].as_str()),
+        ("CHECKPOINT_GAMMA_", checkpoints[2].as_str()),
+        ("NEXT_ACTION_", next_action.as_str()),
+    ];
+    for (marker, value) in indivisible_values {
+        let normalized_value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            one_less_text.contains(marker),
+            one_less_text.contains(&normalized_value),
+            "item beginning with {marker:?} was rendered partially"
+        );
+    }
+    assert!(
+        indivisible_values
+            .iter()
+            .any(|(marker, _)| !one_less_text.contains(marker)),
+        "one-less output did not omit a whole item"
+    );
+
+    let minimum_json = relay(
+        project,
+        &[
+            "--json",
+            "context",
+            "--notes",
+            "2",
+            "--checkpoints",
+            "2",
+            "--events",
+            "3",
+            "--max-chars",
+            "64",
+        ],
+    );
+    assert_success(&minimum_json);
+    assert!(
+        String::from_utf8(minimum_json.stdout.clone())
+            .unwrap()
+            .chars()
+            .count()
+            > 64,
+        "--max-chars unexpectedly bounded the JSON envelope"
+    );
+    let document: serde_json::Value = serde_json::from_slice(&minimum_json.stdout).unwrap();
+    let data = &document["data"];
+    assert_eq!(data["notes"].as_array().unwrap().len(), 2);
+    assert_eq!(data["notes"][0]["text"], notes[1]);
+    assert_eq!(data["notes"][1]["text"], notes[2]);
+    assert_eq!(data["checkpoints"].as_array().unwrap().len(), 2);
+    assert_eq!(data["checkpoints"][0]["message"], checkpoints[1]);
+    assert_eq!(data["checkpoints"][1]["message"], checkpoints[2]);
+    assert_eq!(data["events"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        data["omitted"],
+        serde_json::json!({"notes": 1, "checkpoints": 1, "events": 5})
+    );
+    assert_eq!(
+        data["budget_omitted"],
+        serde_json::json!({"notes": 2, "checkpoints": 2, "events": 3})
+    );
+    assert_eq!(data["budget_truncated"], true);
+    assert_eq!(data["truncated"], true);
+    assert_eq!(data["max_chars"], 64);
+    let handoff_event = data["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "handoff.generated")
+        .expect("count-limited events retain the handoff");
+    assert_eq!(handoff_event["payload"]["next_action"], next_action);
+    assert!(handoff_event["payload"]["next_action"].is_string());
+
+    let generous_json = relay(
+        project,
+        &[
+            "--json",
+            "context",
+            "--notes",
+            "2",
+            "--checkpoints",
+            "2",
+            "--events",
+            "3",
+            "--max-chars",
+            exact_budget_arg.as_str(),
+        ],
+    );
+    assert_success(&generous_json);
+    let document: serde_json::Value = serde_json::from_slice(&generous_json.stdout).unwrap();
+    let data = &document["data"];
+    assert_eq!(
+        data["omitted"],
+        serde_json::json!({"notes": 1, "checkpoints": 1, "events": 5})
+    );
+    assert_eq!(
+        data["budget_omitted"],
+        serde_json::json!({"notes": 0, "checkpoints": 0, "events": 0})
+    );
+    assert_eq!(data["budget_truncated"], false);
+    assert_eq!(data["truncated"], true);
+}

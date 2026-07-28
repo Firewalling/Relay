@@ -194,7 +194,7 @@ pub struct ContextArgs {
     /// Maximum recent checkpoints to include.
     #[arg(long, default_value_t = 5)]
     pub checkpoints: usize,
-    /// Maximum output characters; items are never split.
+    /// Maximum human Markdown characters; items are never split.
     #[arg(long = "max-chars", default_value_t = 12000)]
     pub max_chars: usize,
 }

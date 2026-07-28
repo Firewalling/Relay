@@ -1010,6 +1010,205 @@ fn render_context_event(project: &Path, event: &Event) -> String {
     rendered
 }
 
+// The CLI writes human output with `println!`, which appends one Unicode character.
+const CONTEXT_TRANSPORT_NEWLINE_CHARS: usize = 1;
+const CONTEXT_FOOTER_TRUNCATED: &str = "\n\nTruncated: ";
+const CONTEXT_FOOTER_COUNT_NOTES: &str = "\nCount-omitted notes: ";
+const CONTEXT_FOOTER_COUNT_CHECKPOINTS: &str = "\nCount-omitted checkpoints: ";
+const CONTEXT_FOOTER_COUNT_EVENTS: &str = "\nCount-omitted events: ";
+const CONTEXT_FOOTER_BUDGET_NOTES: &str = "\nBudget-omitted notes: ";
+const CONTEXT_FOOTER_BUDGET_CHECKPOINTS: &str = "\nBudget-omitted checkpoints: ";
+const CONTEXT_FOOTER_BUDGET_EVENTS: &str = "\nBudget-omitted events: ";
+
+#[derive(Clone, Copy, Default)]
+struct ContextOmissions {
+    notes: usize,
+    checkpoints: usize,
+    events: usize,
+}
+
+impl ContextOmissions {
+    fn any(self) -> bool {
+        self.notes > 0 || self.checkpoints > 0 || self.events > 0
+    }
+
+    fn decrement(&mut self, kind: ContextItemKind) {
+        let count = match kind {
+            ContextItemKind::Note => &mut self.notes,
+            ContextItemKind::Checkpoint => &mut self.checkpoints,
+            ContextItemKind::Event => &mut self.events,
+        };
+        *count = count.saturating_sub(1);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ContextItemKind {
+    Note,
+    Checkpoint,
+    Event,
+}
+
+struct ContextItem {
+    kind: ContextItemKind,
+    rendered: String,
+    chars: usize,
+}
+
+impl ContextItem {
+    fn new(kind: ContextItemKind, rendered: String) -> Self {
+        let chars = rendered.chars().count();
+        Self {
+            kind,
+            rendered,
+            chars,
+        }
+    }
+}
+
+fn decimal_chars(mut value: usize) -> usize {
+    let mut chars = 1;
+    while value >= 10 {
+        value /= 10;
+        chars += 1;
+    }
+    chars
+}
+
+fn context_footer_chars(
+    truncated: bool,
+    count_omitted: ContextOmissions,
+    budget_omitted: ContextOmissions,
+) -> usize {
+    [
+        CONTEXT_FOOTER_TRUNCATED,
+        CONTEXT_FOOTER_COUNT_NOTES,
+        CONTEXT_FOOTER_COUNT_CHECKPOINTS,
+        CONTEXT_FOOTER_COUNT_EVENTS,
+        CONTEXT_FOOTER_BUDGET_NOTES,
+        CONTEXT_FOOTER_BUDGET_CHECKPOINTS,
+        CONTEXT_FOOTER_BUDGET_EVENTS,
+    ]
+    .iter()
+    .map(|text| text.chars().count())
+    .sum::<usize>()
+        + if truncated { 3 } else { 2 }
+        + decimal_chars(count_omitted.notes)
+        + decimal_chars(count_omitted.checkpoints)
+        + decimal_chars(count_omitted.events)
+        + decimal_chars(budget_omitted.notes)
+        + decimal_chars(budget_omitted.checkpoints)
+        + decimal_chars(budget_omitted.events)
+        + 1
+}
+
+fn context_footer(
+    truncated: bool,
+    count_omitted: ContextOmissions,
+    budget_omitted: ContextOmissions,
+) -> String {
+    format!(
+        "{CONTEXT_FOOTER_TRUNCATED}{}{CONTEXT_FOOTER_COUNT_NOTES}{}{CONTEXT_FOOTER_COUNT_CHECKPOINTS}{}{CONTEXT_FOOTER_COUNT_EVENTS}{}{CONTEXT_FOOTER_BUDGET_NOTES}{}{CONTEXT_FOOTER_BUDGET_CHECKPOINTS}{}{CONTEXT_FOOTER_BUDGET_EVENTS}{}\n",
+        if truncated { "yes" } else { "no" },
+        count_omitted.notes,
+        count_omitted.checkpoints,
+        count_omitted.events,
+        budget_omitted.notes,
+        budget_omitted.checkpoints,
+        budget_omitted.events,
+    )
+}
+
+fn compact_context(count_omitted: ContextOmissions, budget_omitted: ContextOmissions) -> String {
+    format!(
+        "# Relay\nTruncated: yes\nCount N/C/E: {}/{}/{}\nBudget N/C/E: {}/{}/{}\n",
+        count_omitted.notes,
+        count_omitted.checkpoints,
+        count_omitted.events,
+        budget_omitted.notes,
+        budget_omitted.checkpoints,
+        budget_omitted.events,
+    )
+}
+
+fn budget_context(
+    header: String,
+    items: &[ContextItem],
+    count_omitted: ContextOmissions,
+    max_chars: usize,
+) -> (String, ContextOmissions, bool) {
+    let mut budget_omitted = ContextOmissions::default();
+    for item in items {
+        match item.kind {
+            ContextItemKind::Note => budget_omitted.notes += 1,
+            ContextItemKind::Checkpoint => budget_omitted.checkpoints += 1,
+            ContextItemKind::Event => budget_omitted.events += 1,
+        }
+    }
+
+    let header_chars = header.chars().count();
+    let footer_chars = context_footer_chars(
+        count_omitted.any() || budget_omitted.any(),
+        count_omitted,
+        budget_omitted,
+    );
+    if header_chars.saturating_add(footer_chars) > max_chars {
+        let compact = compact_context(count_omitted, budget_omitted);
+        let human = if compact.chars().count() <= max_chars {
+            compact
+        } else {
+            "# Relay\nTruncated: yes\n".into()
+        };
+        return (human, budget_omitted, true);
+    }
+
+    let mut included = vec![false; items.len()];
+    let mut included_chars = 0usize;
+    loop {
+        let mut changed = false;
+        for (index, item) in items.iter().enumerate() {
+            if included[index] {
+                continue;
+            }
+            let mut tentative_omitted = budget_omitted;
+            tentative_omitted.decrement(item.kind);
+            let tentative_footer_chars = context_footer_chars(
+                count_omitted.any() || tentative_omitted.any(),
+                count_omitted,
+                tentative_omitted,
+            );
+            let item_chars = item.chars;
+            let total_chars = header_chars
+                .saturating_add(included_chars)
+                .saturating_add(item_chars)
+                .saturating_add(tentative_footer_chars);
+            if total_chars <= max_chars {
+                included[index] = true;
+                included_chars = included_chars.saturating_add(item_chars);
+                budget_omitted = tentative_omitted;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let budget_truncated = budget_omitted.any();
+    let mut markdown = header;
+    for (item, included) in items.iter().zip(included) {
+        if included {
+            markdown.push_str(&item.rendered);
+        }
+    }
+    markdown.push_str(&context_footer(
+        count_omitted.any() || budget_truncated,
+        count_omitted,
+        budget_omitted,
+    ));
+    (markdown, budget_omitted, budget_truncated)
+}
+
 fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
     if args.max_chars < 64 {
         return Err(AppError::Lifecycle(
@@ -1046,7 +1245,7 @@ fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
         relevant_checkpoints(&all_events, session.id, args.checkpoints)?;
     let live_git = git::capture(project)?;
 
-    let mut markdown = format!(
+    let header = format!(
         "# Relay context\n\n## Session\n\n- ID: {}\n- Goal: {}\n- State: {}\n- Resumed from: {}\n- Last agent: {}\n\n## Current Git state\n\n- Branch: {}\n- Commit: {}\n- Clean: {}\n",
         session.id,
         safe_markdown_value(project, &session.goal),
@@ -1069,59 +1268,49 @@ fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
         ),
         display_clean(&live_git),
     );
-    let mut budget_truncated = false;
-    for item in notes
+    let items = notes
         .iter()
         .map(|(category, text, time)| {
-            format!(
-                "\n- Note [{}] {} — {}",
-                category.as_str(),
-                time.to_rfc3339(),
-                safe_markdown_value(project, text)
+            ContextItem::new(
+                ContextItemKind::Note,
+                format!(
+                    "\n- Note [{}] {} — {}",
+                    category.as_str(),
+                    time.to_rfc3339(),
+                    safe_markdown_value(project, text)
+                ),
             )
         })
         .chain(checkpoints.iter().map(|checkpoint| {
-            format!(
-                "\n- Checkpoint {} — {}",
-                checkpoint.timestamp.to_rfc3339(),
-                safe_markdown_value(
-                    project,
-                    checkpoint.message.as_deref().unwrap_or("(no message)")
-                )
+            ContextItem::new(
+                ContextItemKind::Checkpoint,
+                format!(
+                    "\n- Checkpoint {} — {}",
+                    checkpoint.timestamp.to_rfc3339(),
+                    safe_markdown_value(
+                        project,
+                        checkpoint.message.as_deref().unwrap_or("(no message)")
+                    )
+                ),
             )
         }))
-        .chain(
-            events
-                .iter()
-                .map(|event| render_context_event(project, event)),
-        )
-    {
-        if markdown.chars().count() + item.chars().count() + 64 <= args.max_chars {
-            markdown.push_str(&item);
-        } else {
-            budget_truncated = true;
-        }
-    }
-    let mut truncated =
-        budget_truncated || omitted_notes > 0 || omitted_events > 0 || omitted_checkpoints > 0;
-    let mut footer = format!(
-        "\n\nTruncated: {}\nOmitted notes: {}\nOmitted checkpoints: {}\nOmitted events: {}\n",
-        if truncated { "yes" } else { "no" },
-        omitted_notes,
-        omitted_checkpoints,
-        omitted_events
+        .chain(events.iter().map(|event| {
+            ContextItem::new(ContextItemKind::Event, render_context_event(project, event))
+        }))
+        .collect::<Vec<_>>();
+    let count_omitted = ContextOmissions {
+        notes: omitted_notes,
+        checkpoints: omitted_checkpoints,
+        events: omitted_events,
+    };
+    let (markdown, budget_omitted, budget_truncated) = budget_context(
+        header,
+        &items,
+        count_omitted,
+        args.max_chars - CONTEXT_TRANSPORT_NEWLINE_CHARS,
     );
-    if markdown.chars().count() + footer.chars().count() <= args.max_chars {
-        markdown.push_str(&footer);
-    } else {
-        truncated = true;
-        markdown = "# Relay context\n".into();
-        footer = format!(
-            "\nTruncated: yes\nOmitted notes: {}\nOmitted checkpoints: {}\nOmitted events: {}\n",
-            omitted_notes, omitted_checkpoints, omitted_events
-        );
-        markdown.push_str(&footer);
-    }
+    let truncated = count_omitted.any() || budget_truncated;
+
     Ok(RunOutput {
         human: markdown,
         data: json!({
@@ -1132,6 +1321,8 @@ fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
             "events": events,
             "truncated": truncated,
             "omitted": {"notes": omitted_notes, "checkpoints": omitted_checkpoints, "events": omitted_events},
+            "budget_omitted": {"notes": budget_omitted.notes, "checkpoints": budget_omitted.checkpoints, "events": budget_omitted.events},
+            "budget_truncated": budget_truncated,
             "max_chars": args.max_chars,
             "project": ".",
         }),
