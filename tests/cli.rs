@@ -1294,6 +1294,122 @@ fn doctor_repairs_only_a_provably_complete_stale_marker() {
 }
 
 #[test]
+fn doctor_reports_unlistable_state_directories_instead_of_reading_them_as_empty() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", "unreadable state"]));
+    for name in ["sessions", "operations", "checkpoints"] {
+        let path = directory.path().join(".relay").join(name);
+        fs::remove_dir_all(&path).unwrap();
+        fs::write(&path, b"not a directory\n").unwrap();
+    }
+
+    let diagnosed = relay(directory.path(), &["--json", "doctor"]);
+    assert_success(&diagnosed);
+    let document: serde_json::Value = serde_json::from_slice(&diagnosed.stdout).unwrap();
+    assert_eq!(document["data"]["healthy"], false);
+    let codes = document["data"]["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["code"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    for code in [
+        "sessions_unreadable",
+        "operations_unreadable",
+        "artifacts_unreadable",
+    ] {
+        assert!(
+            codes.contains(&code.to_owned()),
+            "missing {code}: {codes:?}"
+        );
+    }
+
+    let refused = relay(directory.path(), &["doctor", "--repair"]);
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("refused repair"));
+}
+
+#[test]
+fn unrecognized_recorded_note_categories_are_reported_by_reading_commands() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", "malformed notes"]));
+    let session = read_session(directory.path());
+    let event = serde_json::json!({
+        "schema_version": 1,
+        "id": uuid::Uuid::new_v4(),
+        "session_id": session.id,
+        "timestamp": session.started_at,
+        "type": "note.recorded",
+        "payload": {"category": "speculation", "text": "unknown category"},
+    });
+    let events = directory.path().join(".relay/events.jsonl");
+    let mut log = fs::read(&events).unwrap();
+    log.extend_from_slice(serde_json::to_string(&event).unwrap().as_bytes());
+    log.push(b'\n');
+    fs::write(&events, &log).unwrap();
+
+    for arguments in [
+        ["--json", "context"].as_slice(),
+        ["--json", "handoff", "codex"].as_slice(),
+        ["--json", "finish"].as_slice(),
+    ] {
+        let output = relay(directory.path(), arguments);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let document: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(document["error"]["code"], "lifecycle_error");
+        let message = document["error"]["message"].as_str().unwrap();
+        assert!(message.contains("unrecognized category"), "{message}");
+    }
+    assert_eq!(fs::read(&events).unwrap(), log);
+}
+
+#[cfg(unix)]
+#[test]
+fn unwritable_stdout_is_reported_as_an_output_failure_without_panicking() {
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+    let directory = tempfile::tempdir().unwrap();
+    let closed_stdout = || {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        Stdio::from(OwnedFd::from(stream))
+    };
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_relay"))
+            .args(arguments)
+            .current_dir(directory.path())
+            .stdout(closed_stdout())
+            .output()
+            .expect("run relay binary with closed stdout")
+    };
+
+    let json = run(&["--json", "protocol"]);
+    assert_eq!(json.status.code(), Some(1));
+    let document: serde_json::Value = serde_json::from_slice(&json.stderr).unwrap();
+    assert_eq!(document["command"], "protocol");
+    assert_eq!(document["ok"], false);
+    assert_eq!(document["error"]["code"], "output_write");
+
+    let human = run(&["protocol"]);
+    assert_eq!(human.status.code(), Some(1));
+    assert!(
+        stderr(&human).starts_with("error: could not write Relay output to stdout"),
+        "{}",
+        stderr(&human)
+    );
+
+    let completions = run(&["completions", "bash"]);
+    assert_eq!(completions.status.code(), Some(1));
+    assert!(
+        stderr(&completions).starts_with("error: could not write Relay output to stdout"),
+        "{}",
+        stderr(&completions)
+    );
+    assert!(!directory.path().join(".relay").exists());
+}
+
+#[test]
 fn categorized_notes_support_argument_stdin_editor_and_generated_artifacts() {
     let directory = tempfile::tempdir().unwrap();
     assert_success(&relay(directory.path(), &["start", "notes"]));

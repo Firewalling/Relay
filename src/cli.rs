@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
-use std::io;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -131,9 +130,12 @@ impl From<CompletionShell> for Shell {
     }
 }
 
-pub fn generate_completions(shell: CompletionShell) {
+/// Renders a completion script into memory so writing it out stays fallible.
+pub fn completion_script(shell: CompletionShell) -> Vec<u8> {
     let mut command = Cli::command();
-    generate(Shell::from(shell), &mut command, "relay", &mut io::stdout());
+    let mut script = Vec::new();
+    generate(Shell::from(shell), &mut command, "relay", &mut script);
+    script
 }
 
 #[derive(Debug, Args)]

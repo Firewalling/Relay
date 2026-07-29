@@ -1,11 +1,16 @@
 use clap::{Parser, error::Error};
 use relay::{
     app,
-    cli::{Cli, Command, generate_completions},
+    cli::{Cli, Command, completion_script},
     model::{ErrorEnvelope, OUTPUT_SCHEMA_VERSION, OutputError, SuccessEnvelope},
     project,
 };
-use std::{env, ffi::OsStr, io::Write, process::ExitCode};
+use std::{
+    env,
+    ffi::OsStr,
+    io::{self, Write},
+    process::ExitCode,
+};
 
 fn main() -> ExitCode {
     let args_os = env::args_os().collect::<Vec<_>>();
@@ -15,8 +20,10 @@ fn main() -> ExitCode {
         Err(error) => return handle_parser_error(error, json_requested),
     };
     if let Command::Completions(args) = &cli.command {
-        generate_completions(args.shell);
-        return ExitCode::SUCCESS;
+        return match write_stdout(&completion_script(args.shell)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => output_write_failure(cli.json, cli.command.name(), &error),
+        };
     }
     if matches!(&cli.command, Command::Protocol) {
         return emit_success(cli.json, cli.command.name(), app::protocol_output());
@@ -79,21 +86,39 @@ fn handle_parser_error(error: Error, json_requested: bool) -> ExitCode {
 }
 
 fn emit_success(json_output: bool, command: &str, output: app::RunOutput) -> ExitCode {
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string(&SuccessEnvelope {
-                output_schema_version: OUTPUT_SCHEMA_VERSION,
-                ok: true,
-                command: command.into(),
-                data: output.data,
-            })
-            .expect("serializing a Relay output envelope cannot fail")
-        );
+    let mut document = if json_output {
+        serde_json::to_string(&SuccessEnvelope {
+            output_schema_version: OUTPUT_SCHEMA_VERSION,
+            ok: true,
+            command: command.into(),
+            data: output.data,
+        })
+        .expect("serializing a Relay output envelope cannot fail")
     } else {
-        println!("{}", output.human);
+        output.human
+    };
+    document.push('\n');
+    match write_stdout(document.as_bytes()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => output_write_failure(json_output, command, &error),
     }
-    ExitCode::SUCCESS
+}
+
+fn write_stdout(bytes: &[u8]) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(bytes)?;
+    stdout.flush()
+}
+
+fn output_write_failure(json_output: bool, command: &str, error: &io::Error) -> ExitCode {
+    emit_error(
+        json_output,
+        command,
+        "output_write",
+        &format!("could not write Relay output to stdout: {error}"),
+    );
+    ExitCode::FAILURE
 }
 
 fn emit_error(json_output: bool, command: &str, code: &str, message: &str) {

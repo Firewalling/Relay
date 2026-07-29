@@ -63,6 +63,11 @@ to stderr, and writes no success document to stdout. There is no streaming
 session, JSON Lines framing, multiplexing, or persistent process. The
 manifest's `one_document` field describes this application-response framing.
 
+Delivering a success document is fallible. If stdout rejects it, Relay exits
+nonzero and reports the reason with `error.code: "output_write"` on stderr, so a
+consumer that closes or exhausts stdout sees a protocol failure rather than a
+panic status. The mutation that produced the document remains recorded on disk.
+
 Successful help and version requests remain ordinary shell-facing Clap text,
 including with `--json`; they are not JSON responses or protocol failures.
 Consumers must still treat a mismatched exit status, stream,

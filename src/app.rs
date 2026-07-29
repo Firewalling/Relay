@@ -901,7 +901,7 @@ fn handoff(project: &Path, args: HandoffArgs) -> Result<HandoffResult, AppError>
     let timestamp = Utc::now();
     let live_git = git::capture(project)?;
     let (checkpoints, _) = relevant_checkpoints(&events, session.id, 5)?;
-    let session_notes = recorded_notes(&events, session.id);
+    let session_notes = recorded_notes(&events, session.id)?;
     let markdown = render_handoff(
         project,
         &session,
@@ -1118,7 +1118,7 @@ fn finish(project: &Path) -> Result<FinishResult, AppError> {
     let final_git = git::capture(project)?;
     let summary_path = paths.relay.join(format!("summary-{}.md", session.id));
     let summary_relative = relative_to_project(project, &summary_path);
-    let notes = recorded_notes(&events, session.id);
+    let notes = recorded_notes(&events, session.id)?;
     let markdown = render_summary(project, &session, completed_at, &final_git, &notes);
     let mut operation = Operation::begin(
         &paths,
@@ -1426,24 +1426,45 @@ fn read_note_text(
 fn recorded_notes(
     events: &[Event],
     session_id: Uuid,
-) -> Vec<(NoteCategory, String, DateTime<Utc>)> {
+) -> Result<Vec<(NoteCategory, String, DateTime<Utc>)>, AppError> {
     events
         .iter()
         .filter(|event| event.session_id == session_id && event.event_type == "note.recorded")
-        .filter_map(|event| {
-            let category = match event.payload.get("category")?.as_str()? {
+        .map(|event| {
+            let category = event
+                .payload
+                .get("category")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AppError::Lifecycle(format!(
+                        "note.recorded event {} is missing its category",
+                        event.id
+                    ))
+                })?;
+            let category = match category {
                 "progress" => NoteCategory::Progress,
                 "decision" => NoteCategory::Decision,
                 "blocker" => NoteCategory::Blocker,
                 "observation" => NoteCategory::Observation,
                 "next_action" => NoteCategory::NextAction,
-                _ => return None,
+                other => {
+                    return Err(AppError::Lifecycle(format!(
+                        "note.recorded event {} has the unrecognized category `{other}`",
+                        event.id
+                    )));
+                }
             };
-            Some((
-                category,
-                event.payload.get("text")?.as_str()?.to_owned(),
-                event.timestamp,
-            ))
+            let text = event
+                .payload
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AppError::Lifecycle(format!(
+                        "note.recorded event {} is missing its text",
+                        event.id
+                    ))
+                })?;
+            Ok((category, text.to_owned(), event.timestamp))
         })
         .collect()
 }
@@ -1724,7 +1745,7 @@ fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
     let selected_categories: HashSet<_> =
         args.categories.iter().map(|value| value.as_str()).collect();
     let selected_kinds: HashSet<_> = args.kinds.iter().map(String::as_str).collect();
-    let mut notes = recorded_notes(&all_events, session.id)
+    let mut notes = recorded_notes(&all_events, session.id)?
         .into_iter()
         .filter(|(category, _, _)| {
             selected_categories.is_empty() || selected_categories.contains(category.as_str())
@@ -1852,16 +1873,21 @@ fn doctor(project: &Path, args: DoctorArgs) -> Result<DoctorResult, AppError> {
             repaired.push(relative);
         }
         if !repaired.is_empty() {
-            if let Ok(session) = require_active(&paths)
-                && read_events(&paths.events).is_ok()
-            {
-                append_event(
-                    &paths.events,
-                    &session,
-                    Utc::now(),
-                    "doctor.repaired",
-                    json!({"actions": repaired.iter().map(|path| json!({"action": "remove_completed_operation_marker", "path": path})).collect::<Vec<_>>()}),
-                )?;
+            // Without an active session there is nothing to record the repair
+            // against; any other failure is real and must reach the caller.
+            match require_active(&paths) {
+                Ok(session) => {
+                    read_events(&paths.events)?;
+                    append_event(
+                        &paths.events,
+                        &session,
+                        Utc::now(),
+                        "doctor.repaired",
+                        json!({"actions": repaired.iter().map(|path| json!({"action": "remove_completed_operation_marker", "path": path})).collect::<Vec<_>>()}),
+                    )?;
+                }
+                Err(AppError::Lifecycle(_)) => {}
+                Err(error) => return Err(error),
             }
             diagnostics = inspect_state(project, &paths);
         }
@@ -1967,8 +1993,20 @@ fn inspect_state(project: &Path, paths: &Paths) -> Vec<Diagnostic> {
         );
     }
 
+    let (session_files, sessions_failure) = state_json_files(paths);
+    if let Some(error) = sessions_failure {
+        push_diagnostic(
+            &mut diagnostics,
+            "sessions_unreadable",
+            DiagnosticSeverity::Error,
+            ".relay/sessions",
+            &error.to_string(),
+            "Correct filesystem permissions or damage manually; Relay cannot inspect session records it cannot list.",
+            false,
+        );
+    }
     let mut sessions = Vec::new();
-    for path in state_json_files(paths) {
+    for path in session_files {
         let relative = relative_to_project(project, &path);
         match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<Session>(&bytes) {
@@ -2135,61 +2173,68 @@ fn inspect_state(project: &Path, paths: &Paths) -> Vec<Diagnostic> {
             );
         }
     }
-    if paths.operations.exists()
-        && let Ok(entries) = fs::read_dir(&paths.operations)
-    {
-        let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let relative = relative_to_project(project, &entry.path());
-            match storage::read_json::<OperationMarker>(&entry.path()) {
-                Ok(marker) if marker.schema_version != SCHEMA_VERSION => push_diagnostic(
-                    &mut diagnostics,
-                    "unsupported_operation_schema",
-                    DiagnosticSeverity::Error,
-                    &relative,
-                    &format!(
-                        "operation marker uses schema version {}",
-                        marker.schema_version
+    match read_directory(&paths.operations) {
+        Ok(entries) => {
+            for entry in entries {
+                let relative = relative_to_project(project, &entry.path());
+                match storage::read_json::<OperationMarker>(&entry.path()) {
+                    Ok(marker) if marker.schema_version != SCHEMA_VERSION => push_diagnostic(
+                        &mut diagnostics,
+                        "unsupported_operation_schema",
+                        DiagnosticSeverity::Error,
+                        &relative,
+                        &format!(
+                            "operation marker uses schema version {}",
+                            marker.schema_version
+                        ),
+                        "Use a compatible Relay version; do not rewrite it.",
+                        false,
                     ),
-                    "Use a compatible Relay version; do not rewrite it.",
-                    false,
-                ),
-                Ok(marker) => {
-                    let complete = operation_is_provably_complete(project, &marker, &events);
-                    if complete {
-                        push_diagnostic(
-                            &mut diagnostics,
-                            "completed_operation_marker",
-                            DiagnosticSeverity::Warning,
-                            &relative,
-                            "all declared effects are complete but the marker remains",
-                            "Run `relay doctor --repair` to remove only this stale marker.",
-                            true,
-                        );
-                    } else {
-                        push_diagnostic(
-                            &mut diagnostics,
-                            "incomplete_operation",
-                            DiagnosticSeverity::Error,
-                            &relative,
-                            "one or more declared effects are incomplete or missing",
-                            "Inspect the listed durable effects and resolve manually; Relay will not guess.",
-                            false,
-                        );
+                    Ok(marker) => {
+                        let complete = operation_is_provably_complete(project, &marker, &events);
+                        if complete {
+                            push_diagnostic(
+                                &mut diagnostics,
+                                "completed_operation_marker",
+                                DiagnosticSeverity::Warning,
+                                &relative,
+                                "all declared effects are complete but the marker remains",
+                                "Run `relay doctor --repair` to remove only this stale marker.",
+                                true,
+                            );
+                        } else {
+                            push_diagnostic(
+                                &mut diagnostics,
+                                "incomplete_operation",
+                                DiagnosticSeverity::Error,
+                                &relative,
+                                "one or more declared effects are incomplete or missing",
+                                "Inspect the listed durable effects and resolve manually; Relay will not guess.",
+                                false,
+                            );
+                        }
                     }
+                    Err(error) => push_diagnostic(
+                        &mut diagnostics,
+                        "operation_malformed_json",
+                        DiagnosticSeverity::Error,
+                        &relative,
+                        &error.to_string(),
+                        "Preserve and inspect this interruption evidence manually.",
+                        false,
+                    ),
                 }
-                Err(error) => push_diagnostic(
-                    &mut diagnostics,
-                    "operation_malformed_json",
-                    DiagnosticSeverity::Error,
-                    &relative,
-                    &error.to_string(),
-                    "Preserve and inspect this interruption evidence manually.",
-                    false,
-                ),
             }
         }
+        Err(error) => push_diagnostic(
+            &mut diagnostics,
+            "operations_unreadable",
+            DiagnosticSeverity::Error,
+            ".relay/operations",
+            &error.to_string(),
+            "Correct filesystem permissions or damage manually; interrupted operations cannot be diagnosed while this directory is unreadable.",
+            false,
+        ),
     }
     diagnostics.sort_by(|left, right| {
         left.path
@@ -2199,21 +2244,38 @@ fn inspect_state(project: &Path, paths: &Paths) -> Vec<Diagnostic> {
     diagnostics
 }
 
-fn state_json_files(paths: &Paths) -> Vec<PathBuf> {
+/// Lists Relay's session documents, reporting why any of them could not be
+/// listed instead of silently presenting an incomplete view.
+fn state_json_files(paths: &Paths) -> (Vec<PathBuf>, Option<io::Error>) {
     let mut files = Vec::new();
     if paths.session.exists() {
         files.push(paths.session.clone());
     }
-    if let Ok(entries) = fs::read_dir(&paths.sessions) {
-        files.extend(
+    let mut failure = None;
+    match read_directory(&paths.sessions) {
+        Ok(entries) => files.extend(
             entries
-                .filter_map(Result::ok)
+                .into_iter()
                 .map(|entry| entry.path())
                 .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("json")),
-        );
+        ),
+        Err(error) => failure = Some(error),
     }
     files.sort();
-    files
+    (files, failure)
+}
+
+/// Reads a Relay state directory in a stable order, treating an absent
+/// directory as empty and every other failure as reportable.
+fn read_directory(path: &Path) -> io::Result<Vec<fs::DirEntry>> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut entries = entries.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
 }
 
 fn operation_is_provably_complete(
@@ -2263,11 +2325,23 @@ fn inspect_artifacts(
     referenced: &HashSet<&str>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
+    let entries = match read_directory(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            push_diagnostic(
+                diagnostics,
+                "artifacts_unreadable",
+                DiagnosticSeverity::Error,
+                &relative_to_project(project, directory),
+                &error.to_string(),
+                &format!(
+                    "Correct filesystem permissions or damage manually; {kind} artifacts cannot be diagnosed while this directory is unreadable."
+                ),
+                false,
+            );
+            return;
+        }
     };
-    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let relative = relative_to_project(project, &entry.path());
         if kind == "checkpoint" && storage::read_json::<Checkpoint>(&entry.path()).is_err() {

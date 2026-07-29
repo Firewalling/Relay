@@ -131,6 +131,11 @@ system cannot start the Relay process, Relay
 cannot emit an envelope; the caller must handle that launch failure.
 `output_schema_version` is separate from the on-disk schema version.
 
+Writing the selected output is itself fallible. If stdout cannot accept a
+success document or a completion script, Relay reports that failure through the
+same output-mode-aware renderer with `error.code: "output_write"` and exits
+nonzero instead of panicking; a completed mutation is still recorded on disk.
+
 For mutating commands, human and JSON output are rendered from the operation's
 typed result; Relay does not reconstruct a completed mutation by rescanning
 unrelated historical records.
@@ -152,7 +157,9 @@ text, `--stdin`, and `--editor` is rejected.
 
 Recorded notes are facts: Relay can include them in handoffs, final summaries,
 and context, but never fills in work, decisions, failures, or next actions that
-were not recorded.
+were not recorded. A recorded note event whose category or text is missing or
+unrecognized is reported rather than skipped, so generated handoffs, summaries,
+and context never quietly omit recorded facts.
 
 ## Deterministic local search
 
@@ -300,7 +307,10 @@ redaction policy beyond context-path privacy, hosted sync, or access control.
 Inside Git, Relay records the branch, commit, cleanliness, and project-scoped
 changed paths while excluding its own `.relay/` directory. Non-UTF-8 path bytes
 on Unix are rendered deterministically. Outside Git, lifecycle commands work
-and report Git fields as unavailable.
+and report Git fields as unavailable. Only Git's own absent-worktree
+diagnostics mean "outside Git"; any other Git failure, such as a refused or
+damaged repository, is reported instead of being read as an unavailable
+snapshot.
 
 Relay invokes read-only Git queries only. It never commits, stages, stashes,
 checks out, resets, rewrites history, pushes, or edits working files. Relay
@@ -313,7 +323,8 @@ redirection targets.
 stable codes, severity, relative affected paths, guidance, and health totals
 for malformed or partial JSONL, malformed/unsupported records and artifacts,
 invalid lifecycle combinations, missing references, orphaned artifacts,
-current/history disagreement, and incomplete operation markers.
+current/history disagreement, unlistable state directories, and incomplete
+operation markers.
 
 `relay doctor --repair` is deliberately conservative. It takes the project
 lock and removes only stale operation markers whose listed effects are all

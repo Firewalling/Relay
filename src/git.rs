@@ -28,7 +28,7 @@ pub fn capture(directory: &Path) -> Result<GitSnapshot, GitError> {
 
     let branch = optional_text(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     let commit = optional_text(&root, &["rev-parse", "--verify", "HEAD"])?;
-    let mut status_command = Command::new("git");
+    let mut status_command = git_command(&root);
     status_command
         .args([
             "status",
@@ -49,8 +49,7 @@ pub fn capture(directory: &Path) -> Result<GitSnapshot, GitError> {
                 project_prefix.join(".relay")
             };
             format!(":(exclude,literal){}", relay.to_string_lossy())
-        })
-        .current_dir(&root);
+        });
     let status = status_command.output().map_err(|source| GitError::Spawn {
         directory: root.clone(),
         source,
@@ -84,10 +83,25 @@ pub fn capture(directory: &Path) -> Result<GitSnapshot, GitError> {
 pub fn repository_root(directory: &Path) -> Result<Option<PathBuf>, GitError> {
     let output = run(directory, &["rev-parse", "--show-toplevel"])?;
     if !output.status.success() {
-        return Ok(None);
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if reports_no_worktree(&message) {
+            return Ok(None);
+        }
+        return Err(GitError::Command {
+            directory: directory.to_owned(),
+            message,
+        });
     }
     let text = decode_trimmed(output.stdout, directory)?;
     Ok(Some(PathBuf::from(text)))
+}
+
+/// Distinguishes an absent worktree from a Git failure such as a refused
+/// repository, an unreadable directory, or a damaged repository.
+fn reports_no_worktree(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("not a git repository")
+        || message.contains("this operation must be run in a work tree")
 }
 
 fn optional_text(directory: &Path, args: &[&str]) -> Result<Option<String>, GitError> {
@@ -100,14 +114,23 @@ fn optional_text(directory: &Path, args: &[&str]) -> Result<Option<String>, GitE
 }
 
 fn run(directory: &Path, args: &[&str]) -> Result<Output, GitError> {
-    Command::new("git")
+    git_command(directory)
         .args(args)
-        .current_dir(directory)
         .output()
         .map_err(|source| GitError::Spawn {
             directory: directory.to_owned(),
             source,
         })
+}
+
+/// Runs Git in the C locale so its diagnostics stay classifiable.
+fn git_command(directory: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(directory)
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "");
+    command
 }
 
 fn decode_trimmed(bytes: Vec<u8>, directory: &Path) -> Result<String, GitError> {
@@ -239,6 +262,33 @@ mod tests {
             snapshot.git_path_encoding.as_deref(),
             Some("escaped_bytes_v1")
         );
+    }
+
+    #[test]
+    fn damaged_gitfile_is_reported_instead_of_reading_as_outside_git() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join(".git"), "gitdir: \n").unwrap();
+
+        let error = capture(directory.path()).unwrap_err();
+
+        assert!(matches!(error, GitError::Command { .. }));
+        assert!(error.to_string().contains("gitfile"));
+    }
+
+    #[test]
+    fn only_absent_worktree_diagnostics_report_no_worktree() {
+        assert!(reports_no_worktree(
+            "fatal: not a git repository (or any of the parent directories): .git"
+        ));
+        assert!(reports_no_worktree(
+            "fatal: this operation must be run in a work tree"
+        ));
+        assert!(!reports_no_worktree(
+            "fatal: detected dubious ownership in repository at '/work'"
+        ));
+        assert!(!reports_no_worktree(
+            "fatal: no path in gitfile: /work/.git"
+        ));
     }
 
     #[test]
