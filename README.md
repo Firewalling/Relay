@@ -295,6 +295,12 @@ their contents. Goals, notes, handoffs, summaries, branch names, commit IDs, and
 changed paths can contain sensitive information. Relay provides no encryption,
 redaction policy beyond context-path privacy, hosted sync, or access control.
 
+On Unix, Relay keeps `.relay/` owner-only: directories are created `0700` and
+files `0600` regardless of umask, and a normal locked mutation narrows any
+more permissive mode on `.relay/`, its subdirectories, `session.json`,
+`events.jsonl`, and `lock` left by an earlier version. Relay refuses to use a
+symlinked state path.
+
 ## Git behavior and operations
 
 Inside Git, Relay records the branch, commit, cleanliness, and project-scoped
@@ -306,6 +312,11 @@ Relay invokes read-only Git queries only. It never commits, stages, stashes,
 checks out, resets, rewrites history, pushes, or edits working files. Relay
 mutates only its selected `.relay/` storage and user-requested completion
 redirection targets.
+
+Git queries run without a shell, without optional index locks, and with
+repository-controlled program settings disabled (`core.fsmonitor`,
+`core.hooksPath`) so inspecting an untrusted checkout cannot make Relay execute
+programs named by that repository's configuration.
 
 ## Doctor and recovery
 

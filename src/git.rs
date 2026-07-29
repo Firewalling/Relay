@@ -28,7 +28,7 @@ pub fn capture(directory: &Path) -> Result<GitSnapshot, GitError> {
 
     let branch = optional_text(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     let commit = optional_text(&root, &["rev-parse", "--verify", "HEAD"])?;
-    let mut status_command = Command::new("git");
+    let mut status_command = command(&root);
     status_command
         .args([
             "status",
@@ -49,8 +49,7 @@ pub fn capture(directory: &Path) -> Result<GitSnapshot, GitError> {
                 project_prefix.join(".relay")
             };
             format!(":(exclude,literal){}", relay.to_string_lossy())
-        })
-        .current_dir(&root);
+        });
     let status = status_command.output().map_err(|source| GitError::Spawn {
         directory: root.clone(),
         source,
@@ -100,14 +99,28 @@ fn optional_text(directory: &Path, args: &[&str]) -> Result<Option<String>, GitE
 }
 
 fn run(directory: &Path, args: &[&str]) -> Result<Output, GitError> {
-    Command::new("git")
+    command(directory)
         .args(args)
-        .current_dir(directory)
         .output()
         .map_err(|source| GitError::Spawn {
             directory: directory.to_owned(),
             source,
         })
+}
+
+/// Builds a `git` invocation that ignores repository-controlled configuration
+/// Git would otherwise execute or block on. A repository's own `.git/config`
+/// can name arbitrary programs through `core.fsmonitor` and `core.hooksPath`,
+/// so inspecting an untrusted checkout must not honor them.
+fn command(directory: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("--no-optional-locks")
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.hooksPath=/nonexistent"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(directory);
+    command
 }
 
 fn decode_trimmed(bytes: Vec<u8>, directory: &Path) -> Result<String, GitError> {
@@ -274,6 +287,35 @@ mod tests {
             assert!(matches!(error, GitError::Command { .. }));
             assert!(error.to_string().contains("malformed rename"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_configured_fsmonitor_is_never_executed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init", "--quiet"]);
+        let marker = directory.path().join("fsmonitor-ran");
+        let hook = directory.path().join("fsmonitor-hook.sh");
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            directory.path(),
+            &["config", "core.fsmonitor", hook.to_str().unwrap()],
+        );
+
+        let snapshot = capture(directory.path()).unwrap();
+
+        assert!(snapshot.available);
+        assert!(
+            !marker.exists(),
+            "capture executed the repository-configured fsmonitor program"
+        );
     }
 
     #[cfg(unix)]

@@ -40,6 +40,60 @@ pub enum StorageError {
     PartialJsonLine { path: PathBuf, line: usize },
 }
 
+/// Relay state can contain private project context, so its files and
+/// directories are owner-only on Unix.
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
+#[cfg(unix)]
+const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+
+/// Creates `path` and any missing parents, owner-only on Unix.
+pub fn create_dir_all_private(path: &Path) -> Result<(), StorageError> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(PRIVATE_DIRECTORY_MODE);
+    }
+    builder
+        .create(path)
+        .map_err(|source| io_error(path, source))?;
+    restrict_existing(path)
+}
+
+/// Narrows permissions of an existing state path to owner-only on Unix so state
+/// written by earlier Relay versions or a permissive umask stops being readable
+/// by other local users. Symlinks and missing paths are left untouched.
+pub fn restrict_existing(path: &Path) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(io_error(path, source)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        let wanted = mode
+            & if metadata.is_dir() {
+                PRIVATE_DIRECTORY_MODE
+            } else {
+                PRIVATE_FILE_MODE
+            };
+        if wanted != mode {
+            fs::set_permissions(path, fs::Permissions::from_mode(wanted))
+                .map_err(|source| io_error(path, source))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 pub fn write_json_to_open_file<T: Serialize>(
     mut file: &fs::File,
     path: &Path,
@@ -79,7 +133,7 @@ pub fn write_markdown_atomic(path: &Path, markdown: &str) -> Result<(), StorageE
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+    create_dir_all_private(parent)?;
 
     let mut temporary = NamedTempFile::new_in(parent).map_err(|source| io_error(parent, source))?;
     temporary
@@ -104,18 +158,24 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, StorageError> {
 
 pub fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<(), StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+    create_dir_all_private(parent)?;
     let mut line = serde_json::to_vec(value).map_err(|source| StorageError::Encode {
         path: path.to_owned(),
         source,
     })?;
     line.push(b'\n');
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(PRIVATE_FILE_MODE);
+    }
+    let mut file = options
         .open(path)
         .map_err(|source| io_error(path, source))?;
+    restrict_existing(path)?;
     file.write_all(&line)
         .and_then(|()| file.flush())
         .and_then(|()| file.sync_all())
@@ -226,6 +286,47 @@ mod tests {
             StorageError::PartialJsonLine { line: 2, .. }
         ));
         assert!(error.to_string().contains("not terminated by a newline"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_files_and_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("state/nested");
+        let json = nested.join("record.json");
+        let jsonl = nested.join("events.jsonl");
+        let record = Record {
+            value: "hello".into(),
+        };
+
+        write_json_atomic(&json, &record).unwrap();
+        append_json_line(&jsonl, &record).unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&nested), 0o700);
+        assert_eq!(mode(&json), 0o600);
+        assert_eq!(mode(&jsonl), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_existing_narrows_group_and_other_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        fs::write(&path, "{}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        restrict_existing(&path).unwrap();
+        restrict_existing(directory.path()).unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(directory.path()), 0o700);
     }
 
     #[test]

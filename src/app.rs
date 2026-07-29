@@ -2479,10 +2479,7 @@ fn materialize_legacy_session(paths: &Paths) -> Result<(), AppError> {
         }
         return Ok(());
     }
-    fs::create_dir_all(&paths.sessions).map_err(|source| AppError::Io {
-        path: paths.sessions.clone(),
-        source,
-    })?;
+    storage::create_dir_all_private(&paths.sessions)?;
     let mut operation = Operation::begin(
         paths,
         "history.materialize",
@@ -2509,10 +2506,7 @@ impl Operation {
         session_id: Option<Uuid>,
         effects: Vec<(&str, String)>,
     ) -> Result<Self, AppError> {
-        fs::create_dir_all(&paths.operations).map_err(|source| AppError::Io {
-            path: paths.operations.clone(),
-            source,
-        })?;
+        storage::create_dir_all_private(&paths.operations)?;
         let marker = OperationMarker {
             schema_version: SCHEMA_VERSION,
             id: Uuid::new_v4(),
@@ -2653,15 +2647,16 @@ fn validate_git_version(git: &GitSnapshot) -> Result<(), AppError> {
 
 fn create_state_directories(paths: &Paths) -> Result<(), AppError> {
     for path in [
+        &paths.relay,
         &paths.checkpoints,
         &paths.handoffs,
         &paths.sessions,
         &paths.operations,
     ] {
-        fs::create_dir_all(path).map_err(|source| AppError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
+        storage::create_dir_all_private(path)?;
+    }
+    for path in [&paths.session, &paths.events, &paths.lock] {
+        storage::restrict_existing(path)?;
     }
     Ok(())
 }
@@ -2830,6 +2825,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["session.started", "checkpoint.created", "session.finished"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_paths_are_owner_only_even_when_created_by_an_earlier_version() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let relay = directory.path().join(".relay");
+        fs::create_dir(&relay).unwrap();
+        fs::set_permissions(&relay, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(relay.join("events.jsonl"), "").unwrap();
+        fs::set_permissions(
+            relay.join("events.jsonl"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        run(
+            Command::Start(StartArgs {
+                goal: "keep state private".into(),
+            }),
+            directory.path(),
+        )
+        .unwrap();
+        run(
+            Command::Handoff(handoff_args("next-agent")),
+            directory.path(),
+        )
+        .unwrap();
+
+        let mode = |relative: &str| {
+            fs::metadata(relay.join(relative))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        for relative in ["", "checkpoints", "handoffs", "sessions", "operations"] {
+            assert_eq!(mode(relative), 0o700, "{relative} is not owner-only");
+        }
+        for relative in ["session.json", "events.jsonl", "lock"] {
+            assert_eq!(mode(relative), 0o600, "{relative} is not owner-only");
+        }
     }
 
     #[test]

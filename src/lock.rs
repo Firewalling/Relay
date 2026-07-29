@@ -5,7 +5,7 @@ use crate::{
 use chrono::Utc;
 use fs2::FileExt;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
 };
@@ -32,21 +32,20 @@ pub struct ProjectLock {
 impl ProjectLock {
     pub fn acquire(project: &Path, command: &str) -> Result<Self, LockError> {
         let relay = project.join(".relay");
-        fs::create_dir_all(&relay).map_err(|source| LockError::Io {
-            path: relay.clone(),
+        storage::create_dir_all_private(&relay)?;
+        let path = relay.join("lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(|source| LockError::Io {
+            path: path.clone(),
             source,
         })?;
-        let path = relay.join("lock");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| LockError::Io {
-                path: path.clone(),
-                source,
-            })?;
+        storage::restrict_existing(&path)?;
         match file.try_lock_exclusive() {
             Ok(()) => {}
             Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
