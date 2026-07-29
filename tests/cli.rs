@@ -7,27 +7,27 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
+fn relay_command(project: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_relay"));
+    command.args(args).current_dir(project);
+    command
+}
+
 fn relay(project: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_relay"))
-        .args(args)
-        .current_dir(project)
+    relay_command(project, args)
         .output()
         .expect("run relay binary")
 }
 
 fn relay_with_env(project: &Path, args: &[&str], key: &str, value: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_relay"))
-        .args(args)
+    relay_command(project, args)
         .env(key, value)
-        .current_dir(project)
         .output()
         .expect("run relay binary")
 }
 
 fn relay_with_stdin(project: &Path, args: &[&str], input: &[u8]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_relay"))
-        .args(args)
-        .current_dir(project)
+    let mut child = relay_command(project, args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -250,6 +250,12 @@ fn init_repository() -> tempfile::TempDir {
     fs::write(directory.path().join("tracked file.txt"), "original\n").unwrap();
     git_ok(directory.path(), ["add", "tracked file.txt"]);
     git_ok(directory.path(), ["commit", "--quiet", "-m", "initial"]);
+    directory
+}
+
+fn started_project(goal: &str) -> tempfile::TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    assert_success(&relay(directory.path(), &["start", goal]));
     directory
 }
 
@@ -614,8 +620,7 @@ fn lock_contention_is_nonblocking_and_owner_metadata_is_actionable() {
 
 #[test]
 fn injected_fault_leaves_durable_effect_and_operation_marker() {
-    let directory = tempfile::tempdir().unwrap();
-    assert_success(&relay(directory.path(), &["start", "fault testing"]));
+    let directory = started_project("fault testing");
 
     let failed = relay_with_env(
         directory.path(),
@@ -643,8 +648,7 @@ fn injected_fault_leaves_durable_effect_and_operation_marker() {
 
 #[test]
 fn sessions_remain_addressable_and_resume_creates_lineage() {
-    let directory = tempfile::tempdir().unwrap();
-    assert_success(&relay(directory.path(), &["start", "first goal"]));
+    let directory = started_project("first goal");
     let first = read_session(directory.path());
     assert_success(&relay(directory.path(), &["finish"]));
     let source_bytes = fs::read(
@@ -697,8 +701,7 @@ fn sessions_remain_addressable_and_resume_creates_lineage() {
 
 #[test]
 fn valid_legacy_session_is_read_only_until_locked_mutation_materializes_it() {
-    let directory = tempfile::tempdir().unwrap();
-    assert_success(&relay(directory.path(), &["start", "legacy"]));
+    let directory = started_project("legacy");
     let session = read_session(directory.path());
     fs::remove_file(
         directory
@@ -730,8 +733,7 @@ fn valid_legacy_session_is_read_only_until_locked_mutation_materializes_it() {
 
 #[test]
 fn ambiguous_session_prefix_is_rejected() {
-    let directory = tempfile::tempdir().unwrap();
-    assert_success(&relay(directory.path(), &["start", "seed"]));
+    let directory = started_project("seed");
     let template = read_session(directory.path());
     assert_success(&relay(directory.path(), &["finish"]));
     let sessions = directory.path().join(".relay/sessions");
@@ -835,8 +837,7 @@ fn abandoned_process_releases_kernel_lock_and_metadata_is_refreshed() {
 #[test]
 fn faults_after_event_and_session_record_leave_precise_progress() {
     for fault in ["event", "session_record"] {
-        let directory = tempfile::tempdir().unwrap();
-        assert_success(&relay(directory.path(), &["start", "handoff fault"]));
+        let directory = started_project("handoff fault");
         let failed = relay_with_env(
             directory.path(),
             &["handoff", "codex"],
@@ -881,8 +882,7 @@ fn faults_after_event_and_session_record_leave_precise_progress() {
 
 #[test]
 fn list_recovers_older_supported_legacy_session_from_events() {
-    let directory = tempfile::tempdir().unwrap();
-    assert_success(&relay(directory.path(), &["start", "older"]));
+    let directory = started_project("older");
     let older = read_session(directory.path());
     assert_success(&relay(directory.path(), &["finish"]));
     assert_success(&relay(directory.path(), &["start", "newer"]));
@@ -1233,8 +1233,7 @@ fn json_envelopes_are_single_typed_documents_and_failures_stay_on_stderr() {
 
 #[test]
 fn doctor_detects_damage_without_changing_any_bytes_and_refuses_unsafe_repair() {
-    let directory = tempfile::tempdir().unwrap();
-    assert_success(&relay(directory.path(), &["start", "diagnose"]));
+    let directory = started_project("diagnose");
     let events = directory.path().join(".relay/events.jsonl");
     fs::write(&events, b"{\"partial\":true}").unwrap();
     let before = fs::read(&events).unwrap();
@@ -1260,8 +1259,7 @@ fn doctor_detects_damage_without_changing_any_bytes_and_refuses_unsafe_repair() 
 
 #[test]
 fn doctor_repairs_only_a_provably_complete_stale_marker() {
-    let directory = tempfile::tempdir().unwrap();
-    assert_success(&relay(directory.path(), &["start", "repair marker"]));
+    let directory = started_project("repair marker");
     let session = read_session(directory.path());
     let marker_id = uuid::Uuid::new_v4();
     let marker = serde_json::json!({
@@ -1295,8 +1293,7 @@ fn doctor_repairs_only_a_provably_complete_stale_marker() {
 
 #[test]
 fn categorized_notes_support_argument_stdin_editor_and_generated_artifacts() {
-    let directory = tempfile::tempdir().unwrap();
-    assert_success(&relay(directory.path(), &["start", "notes"]));
+    let directory = started_project("notes");
     assert_success(&relay(
         directory.path(),
         &["note", "decision", "Keep JSONL"],
@@ -1342,8 +1339,7 @@ fn categorized_notes_support_argument_stdin_editor_and_generated_artifacts() {
 
 #[test]
 fn context_filters_deterministically_respects_item_budget_and_preserves_privacy() {
-    let directory = tempfile::tempdir().unwrap();
-    assert_success(&relay(directory.path(), &["start", "bounded context"]));
+    let directory = started_project("bounded context");
     assert_success(&relay(
         directory.path(),
         &["note", "progress", "private progress"],
@@ -1521,8 +1517,7 @@ fn context_renders_structured_handoff_details_without_duplicating_separate_items
 
 #[test]
 fn context_limits_keep_latest_items_in_recorded_order() {
-    let directory = tempfile::tempdir().unwrap();
-    assert_success(&relay(directory.path(), &["start", "recent context"]));
+    let directory = started_project("recent context");
     assert_success(&relay(
         directory.path(),
         &["note", "progress", "oldest note"],

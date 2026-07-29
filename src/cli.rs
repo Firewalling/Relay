@@ -154,6 +154,14 @@ pub enum NoteCategory {
 }
 
 impl NoteCategory {
+    pub const ALL: [Self; 5] = [
+        Self::Progress,
+        Self::Decision,
+        Self::Blocker,
+        Self::Observation,
+        Self::NextAction,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Progress => "progress",
@@ -162,6 +170,12 @@ impl NoteCategory {
             Self::Observation => "observation",
             Self::NextAction => "next_action",
         }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|category| category.as_str() == value)
     }
 }
 

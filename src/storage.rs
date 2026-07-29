@@ -45,11 +45,7 @@ pub fn write_json_to_open_file<T: Serialize>(
     path: &Path,
     value: &T,
 ) -> Result<(), StorageError> {
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(|source| StorageError::Encode {
-        path: path.to_owned(),
-        source,
-    })?;
-    bytes.push(b'\n');
+    let bytes = encode_json_line(path, value, serde_json::to_vec_pretty)?;
     file.set_len(0).map_err(|source| io_error(path, source))?;
     file.seek(SeekFrom::Start(0))
         .and_then(|_| file.write_all(&bytes))
@@ -60,17 +56,25 @@ pub fn write_json_to_open_file<T: Serialize>(
 
 pub fn remove_file_synced(path: &Path) -> Result<(), StorageError> {
     fs::remove_file(path).map_err(|source| io_error(path, source))?;
-    sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
-        .map_err(|source| io_error(path, source))
+    sync_directory(parent_of(path)).map_err(|source| io_error(path, source))
 }
 
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StorageError> {
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(|source| StorageError::Encode {
+    let bytes = encode_json_line(path, value, serde_json::to_vec_pretty)?;
+    write_atomic(path, &bytes)
+}
+
+fn encode_json_line<T: Serialize>(
+    path: &Path,
+    value: &T,
+    encode: fn(&T) -> serde_json::Result<Vec<u8>>,
+) -> Result<Vec<u8>, StorageError> {
+    let mut bytes = encode(value).map_err(|source| StorageError::Encode {
         path: path.to_owned(),
         source,
     })?;
     bytes.push(b'\n');
-    write_atomic(path, &bytes)
+    Ok(bytes)
 }
 
 pub fn write_markdown_atomic(path: &Path, markdown: &str) -> Result<(), StorageError> {
@@ -78,8 +82,7 @@ pub fn write_markdown_atomic(path: &Path, markdown: &str) -> Result<(), StorageE
 }
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), StorageError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+    let parent = create_parent(path)?;
 
     let mut temporary = NamedTempFile::new_in(parent).map_err(|source| io_error(parent, source))?;
     temporary
@@ -103,13 +106,8 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, StorageError> {
 }
 
 pub fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<(), StorageError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
-    let mut line = serde_json::to_vec(value).map_err(|source| StorageError::Encode {
-        path: path.to_owned(),
-        source,
-    })?;
-    line.push(b'\n');
+    create_parent(path)?;
+    let line = encode_json_line(path, value, serde_json::to_vec)?;
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -134,13 +132,8 @@ pub fn read_json_lines<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, Stora
         });
     }
 
-    bytes
-        .strip_suffix(b"\n")
-        .unwrap_or(&bytes)
-        .split(|byte| *byte == b'\n')
-        .enumerate()
-        .map(|(index, line)| {
-            let line_number = index + 1;
+    split_json_lines(&bytes)
+        .map(|(line_number, line)| {
             serde_json::from_slice(line).map_err(|source| StorageError::CorruptJsonLine {
                 path: path.to_owned(),
                 line: line_number,
@@ -148,6 +141,26 @@ pub fn read_json_lines<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, Stora
             })
         })
         .collect()
+}
+
+/// Splits a complete JSON Lines document into its one-based line numbers and records.
+pub fn split_json_lines(bytes: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
+    bytes
+        .strip_suffix(b"\n")
+        .unwrap_or(bytes)
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+        .map(|(index, line)| (index + 1, line))
+}
+
+fn parent_of(path: &Path) -> &Path {
+    path.parent().unwrap_or_else(|| Path::new("."))
+}
+
+fn create_parent(path: &Path) -> Result<&Path, StorageError> {
+    let parent = parent_of(path);
+    fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+    Ok(parent)
 }
 
 #[cfg(unix)]
