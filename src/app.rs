@@ -3009,4 +3009,357 @@ mod tests {
         assert!(!relative.contains("escape"));
         assert!(relative.starts_with(".relay/handoffs/"));
     }
+
+    fn started(goal: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        start(directory.path(), StartArgs { goal: goal.into() }).unwrap();
+        directory
+    }
+
+    fn diagnose(project: &Path) -> Vec<Diagnostic> {
+        doctor(project, DoctorArgs { repair: false })
+            .unwrap()
+            .diagnostics
+    }
+
+    fn codes(diagnostics: &[Diagnostic]) -> Vec<&str> {
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect()
+    }
+
+    fn operation_marker(
+        command: &str,
+        session_id: Option<Uuid>,
+        effects: &[(&str, bool)],
+    ) -> OperationMarker {
+        OperationMarker {
+            schema_version: SCHEMA_VERSION,
+            id: Uuid::new_v4(),
+            command: command.into(),
+            session_id,
+            started_at: Utc::now(),
+            effects: effects
+                .iter()
+                .map(|(path, completed)| OperationEffect {
+                    kind: "session_record".into(),
+                    path: (*path).into(),
+                    completed: *completed,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn doctor_reports_only_missing_state_before_any_session_exists() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let result = doctor(directory.path(), DoctorArgs { repair: false }).unwrap();
+
+        assert!(!result.healthy);
+        assert_eq!(codes(&result.diagnostics), ["state_missing"]);
+        assert_eq!(result.counts.errors, 1);
+        assert_eq!(result.counts.warnings, 0);
+        assert!(result.repaired.is_empty());
+        assert!(!directory.path().join(".relay").exists());
+    }
+
+    #[test]
+    fn doctor_reports_a_started_session_as_healthy() {
+        let directory = started("stay healthy");
+
+        let result = doctor(directory.path(), DoctorArgs { repair: false }).unwrap();
+
+        assert!(result.healthy);
+        assert!(result.diagnostics.is_empty());
+        assert!(result.repaired.is_empty());
+    }
+
+    #[test]
+    fn doctor_reports_a_missing_event_log_and_current_session() {
+        let directory = started("lose durable state");
+        fs::remove_file(directory.path().join(".relay/events.jsonl")).unwrap();
+        fs::remove_file(directory.path().join(".relay/session.json")).unwrap();
+
+        let diagnostics = diagnose(directory.path());
+
+        let found = codes(&diagnostics);
+        for code in [
+            "current_session_missing",
+            "events_missing",
+            "lifecycle_event_inconsistent",
+        ] {
+            assert!(found.contains(&code), "missing {code}");
+        }
+        assert!(diagnostics.iter().all(|item| !item.repairable));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|item| item.severity == DiagnosticSeverity::Error)
+        );
+    }
+
+    #[test]
+    fn doctor_reports_damaged_event_records_without_rewriting_them() {
+        let unsupported = format!(
+            "{}\n",
+            json!({
+                "schema_version": 99,
+                "id": Uuid::new_v4(),
+                "session_id": Uuid::new_v4(),
+                "timestamp": "2020-01-01T00:00:00Z",
+                "type": "session.started",
+                "payload": {},
+            })
+        );
+        for (contents, expected) in [
+            ("{\"schema_version\":1}".to_owned(), "events_partial_line"),
+            ("not json\n".to_owned(), "events_malformed_json"),
+            (unsupported, "unsupported_event_schema"),
+            ("\n".to_owned(), "lifecycle_event_inconsistent"),
+        ] {
+            let directory = started("preserve evidence");
+            let path = directory.path().join(".relay/events.jsonl");
+            fs::write(&path, &contents).unwrap();
+
+            let diagnostics = diagnose(directory.path());
+
+            assert!(
+                codes(&diagnostics).contains(&expected),
+                "missing {expected}"
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reports_unreadable_state_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = started("guard permissions");
+        let events = directory.path().join(".relay/events.jsonl");
+        let session = directory.path().join(".relay/session.json");
+        for path in [&events, &session] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        if fs::read(&events).is_ok() {
+            return; // A privileged user can read regardless of permissions.
+        }
+
+        let diagnostics = diagnose(directory.path());
+
+        let found = codes(&diagnostics);
+        assert!(found.contains(&"events_unreadable"));
+        assert!(found.contains(&"session_unreadable"));
+        for path in [&events, &session] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn doctor_reports_unsupported_and_malformed_session_documents() {
+        let directory = started("keep sessions");
+        let path = directory.path().join(".relay/session.json");
+        let session = read_session(&path).unwrap();
+        let mut unsupported = serde_json::to_value(&session).unwrap();
+        unsupported["schema_version"] = json!(99);
+        fs::write(&path, serde_json::to_vec(&unsupported).unwrap()).unwrap();
+        let malformed = directory
+            .path()
+            .join(format!(".relay/sessions/{}.json", Uuid::new_v4()));
+        fs::write(&malformed, "{oops}\n").unwrap();
+
+        let diagnostics = diagnose(directory.path());
+
+        let found = codes(&diagnostics);
+        assert!(found.contains(&"unsupported_session_schema"));
+        assert!(found.contains(&"session_malformed_json"));
+        assert_eq!(fs::read_to_string(&malformed).unwrap(), "{oops}\n");
+    }
+
+    #[test]
+    fn doctor_reports_lifecycle_conflicts_and_record_disagreement() {
+        let directory = started("disagree");
+        let path = directory.path().join(".relay/session.json");
+        let mut current = serde_json::to_value(read_session(&path).unwrap()).unwrap();
+        current["state"] = json!("completed");
+        fs::write(&path, serde_json::to_vec(&current).unwrap()).unwrap();
+
+        let diagnostics = diagnose(directory.path());
+
+        let found = codes(&diagnostics);
+        for code in [
+            "current_session_disagrees",
+            "invalid_session_lifecycle",
+            "lifecycle_event_inconsistent",
+        ] {
+            assert!(found.contains(&code), "missing {code}");
+        }
+    }
+
+    #[test]
+    fn doctor_reports_a_current_session_without_a_durable_record() {
+        let directory = started("orphan the current session");
+        let paths = Paths::new(directory.path());
+        let session = read_session(&paths.session).unwrap();
+        fs::remove_file(paths.session_record(session.id)).unwrap();
+
+        let diagnostics = diagnose(directory.path());
+
+        let missing = diagnostics
+            .iter()
+            .find(|item| item.code == "session_record_missing")
+            .unwrap();
+        assert_eq!(missing.path, format!(".relay/sessions/{}.json", session.id));
+        assert!(!missing.repairable);
+    }
+
+    #[test]
+    fn doctor_reports_missing_referenced_artifacts_and_orphans() {
+        let directory = started("track artifacts");
+        checkpoint(
+            directory.path(),
+            CheckpointArgs {
+                message: Some("saved".into()),
+            },
+        )
+        .unwrap();
+        let events = read_events(&directory.path().join(".relay/events.jsonl")).unwrap();
+        let referenced = events
+            .iter()
+            .filter_map(|event| event.payload.get("path").and_then(Value::as_str))
+            .next()
+            .unwrap()
+            .to_owned();
+        fs::remove_file(directory.path().join(&referenced)).unwrap();
+        fs::write(
+            directory.path().join(".relay/checkpoints/orphan.json"),
+            "{oops}\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(".relay/handoffs/orphan.md"),
+            "# orphan\n",
+        )
+        .unwrap();
+
+        let diagnostics = diagnose(directory.path());
+
+        let found = codes(&diagnostics);
+        assert!(found.contains(&"referenced_artifact_missing"));
+        assert!(found.contains(&"artifact_malformed"));
+        let orphans = diagnostics
+            .iter()
+            .filter(|item| item.code == "orphaned_artifact")
+            .collect::<Vec<_>>();
+        assert_eq!(orphans.len(), 2);
+        assert!(
+            orphans
+                .iter()
+                .all(|item| item.severity == DiagnosticSeverity::Warning && !item.repairable)
+        );
+    }
+
+    #[test]
+    fn doctor_separates_stale_markers_from_interrupted_operations() {
+        let directory = started("classify markers");
+        let paths = Paths::new(directory.path());
+        let session = read_session(&paths.session).unwrap();
+        let stale = operation_marker("start", Some(session.id), &[(".relay/session.json", true)]);
+        let incomplete = operation_marker(
+            "checkpoint",
+            Some(session.id),
+            &[(".relay/checkpoints/missing.json", false)],
+        );
+        let mut unsupported =
+            operation_marker("start", Some(session.id), &[(".relay/session.json", true)]);
+        unsupported.schema_version = 99;
+        for marker in [&stale, &incomplete, &unsupported] {
+            storage::write_json_atomic(
+                &paths.operations.join(format!("{}.json", marker.id)),
+                marker,
+            )
+            .unwrap();
+        }
+        fs::write(paths.operations.join("malformed.json"), "{oops}\n").unwrap();
+
+        let diagnostics = diagnose(directory.path());
+
+        let repairable = diagnostics
+            .iter()
+            .find(|item| item.code == "completed_operation_marker")
+            .unwrap();
+        assert_eq!(repairable.severity, DiagnosticSeverity::Warning);
+        assert!(repairable.repairable);
+        assert_eq!(
+            repairable.path,
+            format!(".relay/operations/{}.json", stale.id)
+        );
+        let found = codes(&diagnostics);
+        for code in [
+            "incomplete_operation",
+            "unsupported_operation_schema",
+            "operation_malformed_json",
+        ] {
+            assert!(found.contains(&code), "missing {code}");
+        }
+    }
+
+    #[test]
+    fn operation_completeness_requires_bounded_effects_and_matching_events() {
+        let directory = started("prove completeness");
+        let paths = Paths::new(directory.path());
+        let session = read_session(&paths.session).unwrap();
+        let events = read_events(&paths.events).unwrap();
+        let complete = |marker: &OperationMarker| {
+            operation_is_provably_complete(directory.path(), marker, &events)
+        };
+        let recorded = ".relay/session.json";
+
+        assert!(complete(&operation_marker(
+            "start",
+            Some(session.id),
+            &[(recorded, true)]
+        )));
+        assert!(complete(&operation_marker(
+            "history.materialize",
+            None,
+            &[(recorded, true)]
+        )));
+
+        // Every other command needs its own durable event before the marker is stale.
+        for command in ["resume", "checkpoint", "handoff", "finish", "note", "wat"] {
+            assert!(
+                !complete(&operation_marker(
+                    command,
+                    Some(session.id),
+                    &[(recorded, true)]
+                )),
+                "{command} must not be provably complete"
+            );
+        }
+        assert!(!complete(&operation_marker(
+            "start",
+            None,
+            &[(recorded, true)]
+        )));
+        for (path, completed) in [
+            (recorded, false),
+            ("/etc/hosts", true),
+            (".relay/../.relay/session.json", true),
+            ("session.json", true),
+            (".relay/sessions/missing.json", true),
+        ] {
+            assert!(
+                !complete(&operation_marker(
+                    "start",
+                    Some(session.id),
+                    &[(path, completed)]
+                )),
+                "{path} must not be provably complete"
+            );
+        }
+    }
 }

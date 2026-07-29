@@ -585,6 +585,30 @@ fn nested_discovery_and_monorepo_git_status_are_project_bounded() {
 }
 
 #[test]
+fn repository_scope_outside_git_fails_discovery_without_touching_the_project() {
+    let directory = tempfile::tempdir().unwrap();
+
+    let human = relay(
+        directory.path(),
+        &["--scope", "repository", "start", "Scope"],
+    );
+    let json = relay(
+        directory.path(),
+        &["--json", "--scope", "repository", "status"],
+    );
+
+    assert!(!human.status.success());
+    assert!(stderr(&human).contains("repository scope requires a Git worktree"));
+    assert!(stdout(&human).is_empty());
+    assert!(!json.status.success());
+    let envelope: serde_json::Value = serde_json::from_str(stderr(&json).trim()).unwrap();
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["command"], "status");
+    assert_eq!(envelope["error"]["code"], "project_discovery");
+    assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
+}
+
+#[test]
 fn lock_contention_is_nonblocking_and_owner_metadata_is_actionable() {
     let directory = tempfile::tempdir().unwrap();
     let mut owner = Command::new(env!("CARGO_BIN_EXE_relay"))

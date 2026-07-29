@@ -80,3 +80,86 @@ impl Drop for ProjectLock {
         let _ = FileExt::unlock(&self.file);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn acquire_error(project: &Path, command: &str) -> LockError {
+        match ProjectLock::acquire(project, command) {
+            Ok(_) => panic!("expected acquiring the lock to fail"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn acquiring_creates_state_and_records_owner_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let _lock = ProjectLock::acquire(directory.path(), "checkpoint").unwrap();
+
+        let path = directory.path().join(".relay/lock");
+        let owner = storage::read_json::<LockOwner>(&path).unwrap();
+        assert_eq!(owner.schema_version, SCHEMA_VERSION);
+        assert_eq!(owner.pid, std::process::id());
+        assert_eq!(owner.command, "checkpoint");
+        assert!(owner.acquired_at <= Utc::now());
+    }
+
+    #[test]
+    fn contention_reports_the_owning_process_and_clears_after_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let held = ProjectLock::acquire(directory.path(), "start").unwrap();
+
+        let error = acquire_error(directory.path(), "note");
+        assert!(matches!(error, LockError::Busy { .. }));
+        let message = error.to_string();
+        assert!(message.contains(&format!("PID {}", std::process::id())));
+        assert!(message.contains("command `start`"));
+        assert!(message.contains("retry after the owning process finishes"));
+
+        drop(held);
+        let reacquired = ProjectLock::acquire(directory.path(), "note").unwrap();
+        assert_eq!(
+            storage::read_json::<LockOwner>(&directory.path().join(".relay/lock"))
+                .unwrap()
+                .command,
+            "note"
+        );
+        drop(reacquired);
+    }
+
+    #[test]
+    fn contention_stays_actionable_when_owner_metadata_is_unreadable() {
+        let directory = tempfile::tempdir().unwrap();
+        let _held = ProjectLock::acquire(directory.path(), "start").unwrap();
+        fs::write(directory.path().join(".relay/lock"), "not json").unwrap();
+
+        let error = acquire_error(directory.path(), "note");
+
+        assert!(matches!(&error, LockError::Busy { owner } if owner.is_empty()));
+        assert!(error.to_string().starts_with("Relay project is busy;"));
+    }
+
+    #[test]
+    fn an_unusable_lock_path_is_reported_with_the_offending_path() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join(".relay"), "not a directory").unwrap();
+
+        let error = acquire_error(directory.path(), "start");
+
+        assert!(matches!(error, LockError::Io { .. }));
+        assert!(error.to_string().contains(".relay"));
+    }
+
+    #[test]
+    fn a_lock_file_that_cannot_be_opened_is_reported_with_its_path() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join(".relay/lock")).unwrap();
+
+        let error = acquire_error(directory.path(), "start");
+
+        assert!(matches!(error, LockError::Io { .. }));
+        assert!(error.to_string().contains(".relay/lock"));
+    }
+}

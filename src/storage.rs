@@ -171,6 +171,7 @@ fn io_error(path: &Path, source: io::Error) -> StorageError {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct Record {
@@ -238,5 +239,156 @@ mod tests {
         let error = read_json::<Record>(&path).unwrap_err();
         assert!(matches!(error, StorageError::CorruptJson { .. }));
         assert_eq!(fs::read(path).unwrap(), contents);
+    }
+
+    /// Serializing a map keyed by a sequence always fails, which exercises the
+    /// encoding error paths without touching the filesystem state.
+    fn unserializable() -> BTreeMap<(u8, u8), u8> {
+        BTreeMap::from([((1, 2), 3)])
+    }
+
+    #[test]
+    fn writing_to_an_open_file_replaces_longer_previous_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.json");
+        fs::write(&path, "x".repeat(4096)).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        write_json_to_open_file(
+            &file,
+            &path,
+            &Record {
+                value: "short".into(),
+            },
+        )
+        .unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.ends_with("\n"));
+        assert!(!contents.contains('x'));
+        assert_eq!(
+            read_json::<Record>(&path).unwrap(),
+            Record {
+                value: "short".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unserializable_values_are_reported_with_their_target_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record.json");
+        let file = fs::File::create(&path).unwrap();
+
+        for error in [
+            write_json_to_open_file(&file, &path, &unserializable()).unwrap_err(),
+            write_json_atomic(&path, &unserializable()).unwrap_err(),
+            append_json_line(&path, &unserializable()).unwrap_err(),
+        ] {
+            assert!(matches!(error, StorageError::Encode { .. }));
+            assert!(error.to_string().contains("record.json"));
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    fn removing_a_file_reports_missing_paths_without_creating_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("marker.json");
+        fs::write(&path, "{}\n").unwrap();
+
+        remove_file_synced(&path).unwrap();
+        assert!(!path.exists());
+
+        let error = remove_file_synced(&path).unwrap_err();
+        assert!(matches!(error, StorageError::Io { .. }));
+        assert!(error.to_string().contains("marker.json"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn atomic_writes_create_missing_parents_and_keep_markdown_byte_exact() {
+        let directory = tempfile::tempdir().unwrap();
+        let markdown = directory.path().join("handoffs/nested/handoff.md");
+        let json = directory.path().join("sessions/nested/session.json");
+        let contents = "# Handoff\n\nno trailing newline is added";
+
+        write_markdown_atomic(&markdown, contents).unwrap();
+        write_json_atomic(
+            &json,
+            &Record {
+                value: "nested".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&markdown).unwrap(), contents);
+        assert_eq!(
+            read_json::<Record>(&json).unwrap(),
+            Record {
+                value: "nested".into()
+            }
+        );
+        assert_eq!(
+            fs::read_dir(directory.path().join("handoffs/nested"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn atomic_writes_report_paths_that_cannot_hold_a_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let occupied = directory.path().join("occupied");
+        fs::create_dir(&occupied).unwrap();
+
+        let error = write_markdown_atomic(&occupied, "content").unwrap_err();
+
+        assert!(matches!(error, StorageError::Io { .. }));
+        assert!(error.to_string().contains("occupied"));
+        assert!(occupied.is_dir());
+    }
+
+    #[test]
+    fn appending_a_json_line_creates_missing_parents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/events.jsonl");
+        let record = Record {
+            value: "appended".into(),
+        };
+
+        append_json_line(&path, &record).unwrap();
+
+        assert_eq!(read_json_lines::<Record>(&path).unwrap(), [record]);
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn reads_report_missing_files_with_their_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let json = directory.path().join("missing.json");
+        let jsonl = directory.path().join("missing.jsonl");
+
+        let json_error = read_json::<Record>(&json).unwrap_err();
+        let jsonl_error = read_json_lines::<Record>(&jsonl).unwrap_err();
+
+        assert!(matches!(json_error, StorageError::Io { .. }));
+        assert!(json_error.to_string().contains("missing.json"));
+        assert!(matches!(jsonl_error, StorageError::Io { .. }));
+        assert!(jsonl_error.to_string().contains("missing.jsonl"));
+    }
+
+    #[test]
+    fn an_empty_json_lines_file_holds_no_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        fs::write(&path, "").unwrap();
+
+        assert_eq!(read_json_lines::<Record>(&path).unwrap(), Vec::new());
     }
 }
