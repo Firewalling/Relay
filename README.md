@@ -2,15 +2,18 @@
 
 > Continuous, local context for terminal agents.
 
-Relay is a Rust CLI for recording project-local work sessions, checkpoints,
-categorized notes, handoffs, and bounded context for the next terminal agent.
-It does not run agents, call model-provider APIs, inspect chat transcripts, or
-replace Git.
+Relay contains a Rust CLI for recording project-local work sessions,
+checkpoints, categorized notes, handoffs, and bounded context for the next
+terminal agent, plus a standalone Go supervisor for one explicitly requested
+local child process. The Rust CLI does not run agents, call model-provider APIs,
+inspect chat transcripts, or replace Git; the Go component is not integrated
+with the Rust command surface or a scheduler.
 
 ## Prerequisites and installation
 
-Relay requires a stable Rust toolchain with Cargo. Install `git` too if you want
-Git-aware snapshots; Relay also works outside a Git repository.
+The Rust CLI requires a stable Rust toolchain with Cargo. Building and running
+the optional one-child supervisor requires Linux and Go 1.26 or newer. Install
+`git` too for Git-aware snapshots; Relay also works outside a Git repository.
 
 Install the checked-out source directly:
 
@@ -26,6 +29,12 @@ cargo build --release
 mkdir -p "$HOME/.local/bin"
 cp target/release/relay "$HOME/.local/bin/relay"
 chmod 755 "$HOME/.local/bin/relay"
+```
+
+Build the standalone supervisor without installing it:
+
+```sh
+go build ./cmd/relay-supervisor
 ```
 
 Ensure `$HOME/.local/bin` is on `PATH`. Relay does not currently claim
@@ -106,10 +115,12 @@ Relay supports these commands:
   contract compiled into Relay.
 
 See the [orchestration process protocol](docs/orchestration-protocol.md) for
-the exact versioned manifest, transport, operation subset, and security
-requirements. Relay does not yet include a Go orchestrator, Lua workflow
-runtime, or agent/workflow process launcher. Allowed Git-aware operations may
-invoke `git`; existing note editor behavior is outside protocol v1.
+the exact versioned manifest, one-child execution request/result, lifecycle,
+environment policy, limits, persistence, platform support, and security
+requirements. The standalone supervisor is deliberately not a Go orchestrator:
+Relay still has no scheduler, queue, Rust launcher command, or Lua workflow
+runtime. Allowed Git-aware Rust operations may invoke `git`; existing note
+editor behavior remains outside protocol v1.
 
 `--json` and `--scope auto|current|repository` are global options and work
 before or after a subcommand. Human output remains the default. An exact global
@@ -323,13 +334,15 @@ back up `.relay/`, and resolve such damage manually.
 
 ## Current limitations
 
-Relay supports one active session per selected project. It has no daemon, TUI,
-hosted synchronization, provider integration, agent execution, transcript
-import, automatic source inspection, semantic search, encryption, or automatic
-recovery of ambiguous interrupted operations. Advisory locks depend on
-filesystem lock support. Context is deterministic selection and formatting,
-not model-generated summarization. Packaging is currently source installation
-or a locally copied release binary.
+Relay supports one active Rust session per selected project. The Go component
+supervises one local child per invocation on Linux; it has no queue, retries,
+remote execution, or Rust command-surface integration. Relay
+has no daemon, TUI, hosted synchronization, provider integration, transcript
+import, automatic source inspection, semantic search, encryption, Lua runtime,
+or automatic recovery of ambiguous interrupted operations. Advisory locks
+depend on filesystem lock support. Context is deterministic selection and
+formatting, not model-generated summarization. Packaging is currently source
+installation or locally built binaries.
 
 The files under `openspec/` describe development intent only. Relay has no
 runtime OpenSpec dependency.

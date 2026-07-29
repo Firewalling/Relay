@@ -1508,7 +1508,7 @@ fn render_context_event(project: &Path, event: &Event) -> String {
     rendered
 }
 
-// The CLI writes human output with `println!`, which appends one Unicode character.
+// The CLI appends one transport newline to human output.
 const CONTEXT_TRANSPORT_NEWLINE_CHARS: usize = 1;
 const CONTEXT_FOOTER_TRUNCATED: &str = "\n\nTruncated: ";
 const CONTEXT_FOOTER_COUNT_NOTES: &str = "\nCount-omitted notes: ";

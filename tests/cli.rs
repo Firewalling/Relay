@@ -1137,6 +1137,28 @@ fn parser_failures_honor_json_mode_without_mutating_project_state() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn successful_output_ignores_closed_stdout() {
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+    let directory = tempfile::tempdir().unwrap();
+    for args in [&["protocol"][..], &["--json", "protocol"][..]] {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        let output = Command::new(env!("CARGO_BIN_EXE_relay"))
+            .args(args)
+            .current_dir(directory.path())
+            .stdout(Stdio::from(OwnedFd::from(stream)))
+            .output()
+            .expect("run relay binary with closed stdout");
+
+        assert_eq!(output.status.code(), Some(0), "args: {args:?}");
+        assert!(output.stderr.is_empty(), "args: {args:?}");
+        assert!(!directory.path().join(".relay").exists());
+    }
+}
+
 #[test]
 fn json_envelopes_are_single_typed_documents_and_failures_stay_on_stderr() {
     let directory = tempfile::tempdir().unwrap();

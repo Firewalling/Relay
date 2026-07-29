@@ -1,0 +1,1 @@
+{"output_schema_version":1,"ok":false,"command":"supervise","error":{"code":"unsupported_protocol_version","message":"unsupported protocol version 2 (supported: 1)"}}

@@ -79,8 +79,11 @@ fn handle_parser_error(error: Error, json_requested: bool) -> ExitCode {
 }
 
 fn emit_success(json_output: bool, command: &str, output: app::RunOutput) -> ExitCode {
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
     if json_output {
-        println!(
+        let _ = writeln!(
+            stdout,
             "{}",
             serde_json::to_string(&SuccessEnvelope {
                 output_schema_version: OUTPUT_SCHEMA_VERSION,
@@ -91,7 +94,7 @@ fn emit_success(json_output: bool, command: &str, output: app::RunOutput) -> Exi
             .expect("serializing a Relay output envelope cannot fail")
         );
     } else {
-        println!("{}", output.human);
+        let _ = writeln!(stdout, "{}", output.human);
     }
     ExitCode::SUCCESS
 }
