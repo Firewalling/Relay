@@ -12,7 +12,10 @@ import (
 	"relay/protocol"
 )
 
-const outputReadBufferBytes = 32 << 10
+const (
+	outputReadBufferBytes    = 32 << 10
+	maxConsecutiveEmptyReads = 100
+)
 
 type observationRecorder struct {
 	mu        sync.Mutex
@@ -74,6 +77,7 @@ func observationCost(entry protocol.OutputObservation) int64 {
 }
 
 type limitedCapture struct {
+	mu       sync.Mutex
 	stream   string
 	limit    int64
 	recorder *observationRecorder
@@ -104,6 +108,8 @@ func (capture *limitedCapture) Write(data []byte) (int, error) {
 }
 
 func (capture *limitedCapture) record(data []byte) {
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
 	sequence := capture.recorder.output(capture.stream, len(data))
 	if capture.first == nil {
 		first := sequence
@@ -125,10 +131,17 @@ func (capture *limitedCapture) record(data []byte) {
 
 func (capture *limitedCapture) consume(reader io.Reader) error {
 	buffer := make([]byte, outputReadBufferBytes)
+	emptyReads := 0
 	for {
 		count, err := reader.Read(buffer)
 		if count > 0 {
+			emptyReads = 0
 			capture.record(buffer[:count])
+		} else if err == nil {
+			emptyReads++
+			if emptyReads >= maxConsecutiveEmptyReads {
+				return io.ErrNoProgress
+			}
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
@@ -140,6 +153,8 @@ func (capture *limitedCapture) consume(reader io.Reader) error {
 }
 
 func (capture *limitedCapture) result() protocol.StreamResult {
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
 	return protocol.StreamResult{
 		Text:          strings.ToValidUTF8(string(capture.data), "\uFFFD"),
 		BytesObserved: capture.observed,

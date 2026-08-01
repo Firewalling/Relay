@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"relay/protocol"
@@ -63,6 +64,37 @@ func TestLimitedCapturePropagatesReadErrors(t *testing.T) {
 	}
 }
 
+func TestLimitedCaptureRejectsZeroProgressReader(t *testing.T) {
+	capture := newLimitedCapture("stdout", 32, newObservationRecorder(1024))
+	if err := capture.consume(zeroProgressReader{}); err != io.ErrNoProgress {
+		t.Fatalf("consume error = %v, want io.ErrNoProgress", err)
+	}
+}
+
+func TestLimitedCaptureSynchronizesConcurrentWritersAndResults(t *testing.T) {
+	capture := newLimitedCapture("stdout", 1<<20, newObservationRecorder(1<<20))
+	const writers = 8
+	const writes = 64
+	var group sync.WaitGroup
+	group.Add(writers)
+	for range writers {
+		go func() {
+			defer group.Done()
+			for range writes {
+				if _, err := capture.Write([]byte("x")); err != nil {
+					t.Errorf("write: %v", err)
+				}
+				_ = capture.result()
+			}
+		}()
+	}
+	group.Wait()
+	result := capture.result()
+	if result.BytesObserved != writers*writes || result.BytesRetained != writers*writes {
+		t.Fatalf("concurrent capture result = %#v", result)
+	}
+}
+
 type oneByteReader struct {
 	data []byte
 }
@@ -82,6 +114,12 @@ type errorReader struct {
 
 func (reader errorReader) Read([]byte) (int, error) {
 	return 0, reader.err
+}
+
+type zeroProgressReader struct{}
+
+func (zeroProgressReader) Read([]byte) (int, error) {
+	return 0, nil
 }
 
 func TestObservationCostIncludesVariableFields(t *testing.T) {
