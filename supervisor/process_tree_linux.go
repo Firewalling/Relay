@@ -33,6 +33,9 @@ func (platformProcessTree) kill(process *os.Process) error {
 }
 
 func (platformProcessTree) alive(process *os.Process) bool {
+	// Scan every /proc stat entry instead of probing only the leader: the direct
+	// child may already have exited while descendants (or zombies) remain in its
+	// process group.
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		err = syscall.Kill(-process.Pid, 0)

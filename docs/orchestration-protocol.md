@@ -141,6 +141,11 @@ Malformed or unsupported requests and supervisor infrastructure failures
 produce one output-schema-v1 error envelope on stderr and a nonzero supervisor
 exit. There is no JSON Lines stream or second child.
 
+The supervisor installs catchable termination-signal handling only after the
+complete stdin request has been read and decoded. Signals received while request
+framing is still incomplete are not interpreted as cancellation of a child,
+because no child has been launched.
+
 Before decoding requests, Go strictly decodes the same embedded
 [`manifest-v1.json`](../protocol/manifest-v1.json) used by Rust. It requires the
 v1 direct-argv, no-shell, stream, ownership, and ordered-operation contract.
@@ -162,7 +167,7 @@ component are rejected before launch.
 | `redact_argument_indexes` | At most 32 argument positions replaced by `<redacted>` in result/run-state argv metadata; the indexed values may total at most 64 KiB. If retained output contains a declared value or ends with its truncated prefix, the entire retained stream text becomes `<redacted>`. |
 | `working_directory` | Absolute child working directory, separate from argv. |
 | `environment` | Ordered `{name,value}` entries; policy and precedence are below. |
-| `timeout_ms` | `0` disables timeout; maximum is 24 hours. |
+| `timeout_ms` | `0` disables the execution timeout only; bounded internal cleanup and drain deadlines still apply. The maximum is 24 hours. |
 | `termination_grace_ms` | Grace period before escalation; default 2,000 ms, maximum 60,000 ms. |
 | `stdout_limit_bytes`, `stderr_limit_bytes` | Per-stream retained-byte limits; default 1 MiB each, maximum 8 MiB each. |
 | `log_limit_bytes` | Bound for output-observation metadata; default 64 KiB, maximum 4 MiB. |
@@ -177,22 +182,26 @@ environment for programs that explicitly launch their own subprocesses.
 Every accepted execution records `accepted`, then `starting`; a successful OS
 start records `running`. The final lifecycle is one of:
 
-- `completed` for a natural zero or nonzero exit, including when a surviving
-  in-group descendant exits during graceful cleanup;
+- `completed` for a natural zero or nonzero direct-child exit after its `Wait`
+  completes and any required in-group descendant cleanup is confirmed;
 - `failed_to_start` when the OS cannot start the executable;
 - `timed_out` when timeout termination completes during the grace period;
 - `cancelled` when cancellation termination completes during the grace period;
 - `killed` when timeout, cancellation, or surviving-descendant cleanup requires
-  forced process-group termination; or
+  forced process-group termination and its result is confirmed; or
 - `protocol_failure` for malformed framing or supervisor infrastructure
-  failure. Protocol failures use the error envelope and are also written to an
-  already-created run record when persistence remains available.
+  failure, including an unconfirmed direct-child reap, process-group cleanup,
+  or drain shutdown. Protocol failures use the error envelope and are also
+  written to an already-created run record when persistence remains available.
 
 `termination_reason` removes ambiguity between zero/nonzero completion, start
 error, graceful or forced timeout/cancellation, graceful or forced descendant
-cleanup, and protocol
-failure. Results include run and protocol versions, supervisor version,
-sanitized program/arguments/environment metadata, accepted/start/completion UTC
+cleanup, and protocol failure. `exit_code` is populated only after the direct
+child's `Wait` completes; no result infers it from `ProcessState` before then.
+`descendants_terminated` and `descendants_killed` mean the corresponding
+in-group cleanup was confirmed, not merely that a signal was sent. Results
+include run and protocol versions, supervisor version, sanitized
+program/arguments/environment metadata, accepted/start/completion UTC
 timestamps, duration in milliseconds, exit code when the OS provides one,
 timeout/cancellation/termination details, both streams, lifecycle history, and
 bounded output observations. Lifecycle and output observations share monotonic
@@ -206,18 +215,26 @@ Request timeout, caller cancellation, and catchable supervisor
 `SIGINT`/`SIGTERM` first send graceful termination to that group. The timeout
 clock starts immediately after a successful child start, before running-state
 persistence. After `termination_grace_ms`, the group receives forced
-termination. If the direct child exits while an in-group descendant remains,
-the supervisor applies the same graceful-then-forced cleanup before returning;
-`descendants_terminated` and `descendants_killed` distinguish those outcomes.
-Tests exercise graceful exit, escalation, direct-child-first exit, descendants,
-supervisor-signal cleanup, and timeout cleanup while persistence is blocked.
+termination. Direct-child `Wait` runs independently of stream draining, so an
+inherited stdout or stderr descriptor cannot prevent reaping that child. After
+that wait, if a non-zombie in-group descendant remains, the supervisor applies
+the same graceful-then-forced cleanup before returning. After forced
+termination, direct-child reaping and process-group confirmation have a 250 ms
+window. Inability to confirm both produces `protocol_failure` with
+`termination_error`, rather than a successful termination result.
+
+The Linux process-tree check retains a full `/proc` scan: it detects
+leader-exited, non-zombie in-group descendants and distinguishes them from
+zombies. Termination and cleanup poll at a 20 ms cadence, reducing the former
+5 ms scan frequency while preserving detection within each bounded window.
 
 Process groups cannot contain a descendant that deliberately calls `setsid` or
-moves itself to another group. Untrusted children that may detach, an
+moves itself to another group. The supervisor cannot detect or clean up a
+detached process after it closes the inherited streams, so a successful result
+confirms only the direct child and the original process group; it does not prove
+that no detached descendant exists. Untrusted children that may detach, an
 uncatchable supervisor `SIGKILL`, kernel failure, or machine loss require an
-external cgroup/service containment boundary. Those limitations are explicit;
-the supervisor does not claim a stronger guarantee or hide them behind a
-success result.
+external cgroup or service containment boundary.
 
 ### Environment and secret policy
 
@@ -243,8 +260,15 @@ classified reliably.
 
 ### Bounded output and observations
 
-Stdout and stderr are drained concurrently to avoid pipe deadlock and retained
-separately. Draining continues after either retention limit is reached.
+The supervisor owns distinct stdout and stderr pipes, closes its parent writer
+copies immediately after a successful `Start`, and drains both streams
+concurrently. This prevents the parent-held writers from prolonging EOF and
+prevents either stream from blocking the other. Draining continues after either
+retention limit is reached. After child and process-group handling, drains get
+250 ms to finish naturally. The supervisor then closes any remaining readers
+and gives those goroutines a final 250 ms to stop. Requiring forced reader
+closure, or failing to stop afterward, is `protocol_failure` with
+`termination_error`, not a completed result.
 `bytes_observed`, `bytes_retained`, and `truncated` describe original bytes;
 invalid UTF-8 in retained bytes is replaced with U+FFFD before JSON encoding.
 The bounded observation log stores only sequence, stream, and chunk byte count,
@@ -276,7 +300,7 @@ symbolic links, and neither the lexical nor resolved path may enter Rust-owned
 ### Platform support
 
 Execution and full in-group process cleanup are currently supported on Linux,
-using isolated process-group mechanics and `/proc` live-process inspection in
+using isolated process-group mechanics and full `/proc` inspection in
 `process_tree_linux.go`. Other Go targets compile the protocol and fixture
 packages, but the runner rejects execution before child launch rather than
 advertising process behavior it cannot verify. No platform silently degrades

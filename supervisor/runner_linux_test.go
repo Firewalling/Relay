@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -102,18 +103,22 @@ func runSupervisorHelper(mode string) int {
 		time.Sleep(10 * time.Minute)
 		return 0
 	case "spawn-tree-exit":
-		command := exec.Command(os.Args[0], helperTestArgument)
-		command.Env = replaceEnvironment(os.Environ(), "SUPERVISOR_HELPER_MODE", "grandchild")
-		command.Stdout = io.Discard
-		command.Stderr = io.Discard
-		if err := command.Start(); err != nil {
-			_, _ = fmt.Fprintln(os.Stderr, err)
-			return 91
-		}
-		writeHelperFile("SUPERVISOR_HELPER_TREE_PID", strconv.Itoa(command.Process.Pid))
-		return 0
+		return spawnHelperGrandchild("grandchild", "none", false)
+	case "spawn-tree-exit-graceful":
+		return spawnHelperGrandchild("grandchild-graceful", "none", false)
+	case "spawn-tree-exit-output":
+		return spawnHelperGrandchild("grandchild", os.Getenv("SUPERVISOR_HELPER_INHERIT_STREAMS"), false)
+	case "spawn-detached-exit-output":
+		return spawnHelperGrandchild("grandchild", "both", true)
 	case "grandchild":
 		signal.Ignore(syscall.SIGTERM)
+		_, _ = fmt.Fprint(os.Stdout, "descendant stdout\n")
+		_, _ = fmt.Fprint(os.Stderr, "descendant stderr\n")
+		writeHelperFile("SUPERVISOR_HELPER_READY", "ready")
+		time.Sleep(10 * time.Minute)
+		return 0
+	case "grandchild-graceful":
+		writeHelperFile("SUPERVISOR_HELPER_READY", "ready")
 		time.Sleep(10 * time.Minute)
 		return 0
 	case "supervisor-wrapper":
@@ -122,6 +127,37 @@ func runSupervisorHelper(mode string) int {
 		_, _ = fmt.Fprintf(os.Stderr, "unknown helper mode %q", mode)
 		return 92
 	}
+}
+
+func spawnHelperGrandchild(mode, inheritedStreams string, detached bool) int {
+	command := exec.Command(os.Args[0], helperTestArgument)
+	command.Env = replaceEnvironment(os.Environ(), "SUPERVISOR_HELPER_MODE", mode)
+	switch inheritedStreams {
+	case "stdout":
+		command.Stdout = os.Stdout
+		command.Stderr = io.Discard
+	case "stderr":
+		command.Stdout = io.Discard
+		command.Stderr = os.Stderr
+	case "both":
+		command.Stdout = os.Stdout
+		command.Stderr = os.Stderr
+	default:
+		command.Stdout = io.Discard
+		command.Stderr = io.Discard
+	}
+	if detached {
+		command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	}
+	if err := command.Start(); err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		return 91
+	}
+	writeHelperFile("SUPERVISOR_HELPER_TREE_PID", strconv.Itoa(command.Process.Pid))
+	if !waitForHelperFile(os.Getenv("SUPERVISOR_HELPER_READY"), 5*time.Second) {
+		return 93
+	}
+	return 0
 }
 
 func TestExecuteSuccessUsesLiteralArgvAndRedactsDeclaredSecrets(t *testing.T) {
@@ -366,6 +402,81 @@ func TestExecuteTimeoutCancellationAndEscalation(t *testing.T) {
 	})
 }
 
+func TestForcedCleanupDoesNotWaitForeverForDirectChild(t *testing.T) {
+	runner := testRunner()
+	runner.tree = fakeProcessTree{gracefulErr: errors.New("term failed")}
+	runner.timing = runnerTiming{pollInterval: time.Millisecond, forcedWait: time.Millisecond, drainWait: time.Millisecond}
+	request := testRequest(t, "sleep")
+	waitDone := make(chan error)
+	done := make(chan completionOutcome, 1)
+	go func() {
+		done <- runner.terminateRunningTree(&os.Process{Pid: 1}, waitDone, request, terminationTimeout)
+	}()
+	select {
+	case outcome := <-done:
+		if outcome.directChildReaped || outcome.infrastructureFailure == nil || !outcome.escalationAttempted {
+			t.Fatalf("forced wait outcome = %#v", outcome)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forced cleanup waited for an unbounded direct Wait")
+	}
+}
+
+func TestTerminationSignalFailuresBecomeInfrastructureFailure(t *testing.T) {
+	runner := testRunner()
+	runner.tree = fakeProcessTree{gracefulErr: errors.New("term failed"), killErr: errors.New("kill failed")}
+	outcome := runner.terminateRunningTree(&os.Process{Pid: 1}, make(chan error), testRequest(t, "sleep"), terminationCancellation)
+	if outcome.infrastructureFailure == nil || !outcome.gracefulAttempted || !outcome.escalationAttempted {
+		t.Fatalf("signal failure outcome = %#v", outcome)
+	}
+}
+
+func TestSignalFailureStillStopsActiveOutputDrain(t *testing.T) {
+	runner := testRunner()
+	runner.tree = fakeProcessTree{gracefulErr: errors.New("term failed"), killErr: errors.New("kill failed")}
+	runner.timing = runnerTiming{pollInterval: time.Millisecond, forcedWait: 10 * time.Millisecond, drainWait: time.Millisecond}
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create output pipe: %v", err)
+	}
+	defer writer.Close()
+	capture := newLimitedCapture("stdout", 1024, newObservationRecorder(1024))
+	done := make(chan error, 1)
+	var group sync.WaitGroup
+	group.Add(1)
+	go func() {
+		defer group.Done()
+		done <- capture.consume(reader)
+	}()
+	if _, err := writer.Write([]byte("active output")); err != nil {
+		t.Fatalf("write active output: %v", err)
+	}
+
+	outcome := runner.terminateRunningTree(&os.Process{Pid: 1}, make(chan error), testRequest(t, "sleep"), terminationCancellation)
+	if outcome.infrastructureFailure == nil {
+		t.Fatal("signal failure did not become infrastructure failure")
+	}
+	if err := runner.awaitDrains(done, &group, reader); err == nil || !strings.Contains(err.Error(), "exceeded bounded wait") {
+		t.Fatalf("stop active output drain error = %v", err)
+	}
+	if got := capture.result().Text; got != "active output" {
+		t.Fatalf("captured output = %q", got)
+	}
+}
+
+type fakeProcessTree struct {
+	gracefulErr error
+	killErr     error
+	aliveValue  bool
+}
+
+func (tree fakeProcessTree) supported() bool            { return true }
+func (tree fakeProcessTree) configure(*exec.Cmd)        {}
+func (tree fakeProcessTree) graceful(*os.Process) error { return tree.gracefulErr }
+func (tree fakeProcessTree) kill(*os.Process) error     { return tree.killErr }
+func (tree fakeProcessTree) alive(*os.Process) bool     { return tree.aliveValue }
+
 type blockingStateStore struct {
 	delegate *StateStore
 	entered  chan struct{}
@@ -432,6 +543,7 @@ func TestExecuteCleansDescendantProcessTree(t *testing.T) {
 	request.Environment = append(request.Environment, protocol.EnvironmentVariable{Name: "SUPERVISOR_HELPER_TREE_PID", Value: pidPath})
 	request.TerminationGraceMilliseconds = 50
 	ctx, cancel := context.WithCancel(context.Background())
+
 	resultChannel := make(chan protocol.ExecutionResult, 1)
 	errorChannel := make(chan error, 1)
 	go func() {
@@ -453,10 +565,38 @@ func TestExecuteCleansDescendantProcessTree(t *testing.T) {
 	}
 }
 
+func TestDirectExitRetainsExitCodeAfterGracefulDescendantCleanup(t *testing.T) {
+	request := testRequest(t, "spawn-tree-exit-graceful")
+	directory := t.TempDir()
+	pidPath := filepath.Join(directory, "grandchild.pid")
+	readyPath := filepath.Join(directory, "grandchild.ready")
+	request.Environment = append(
+		request.Environment,
+		protocol.EnvironmentVariable{Name: "SUPERVISOR_HELPER_TREE_PID", Value: pidPath},
+		protocol.EnvironmentVariable{Name: "SUPERVISOR_HELPER_READY", Value: readyPath},
+	)
+	result, err := testRunner().Execute(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.ExitCode == nil || *result.ExitCode != 0 || result.Lifecycle != protocol.LifecycleCompleted || result.TerminationReason != protocol.TerminationDescendantsTerminated {
+		t.Fatalf("graceful descendant result = %#v", result)
+	}
+	if !result.Termination.GracefulAttempted || result.Termination.Escalated {
+		t.Fatalf("graceful descendant termination detail = %#v", result.Termination)
+	}
+}
+
 func TestExecuteCleansDescendantsAfterDirectChildExit(t *testing.T) {
 	request := testRequest(t, "spawn-tree-exit")
-	pidPath := filepath.Join(t.TempDir(), "grandchild.pid")
-	request.Environment = append(request.Environment, protocol.EnvironmentVariable{Name: "SUPERVISOR_HELPER_TREE_PID", Value: pidPath})
+	directory := t.TempDir()
+	pidPath := filepath.Join(directory, "grandchild.pid")
+	readyPath := filepath.Join(directory, "grandchild.ready")
+	request.Environment = append(
+		request.Environment,
+		protocol.EnvironmentVariable{Name: "SUPERVISOR_HELPER_TREE_PID", Value: pidPath},
+		protocol.EnvironmentVariable{Name: "SUPERVISOR_HELPER_READY", Value: readyPath},
+	)
 	request.TerminationGraceMilliseconds = 50
 
 	result, err := testRunner().Execute(context.Background(), request)
@@ -472,6 +612,147 @@ func TestExecuteCleansDescendantsAfterDirectChildExit(t *testing.T) {
 	}
 	if processIsRunning(grandchildPID) {
 		t.Fatalf("grandchild %d still runs after direct child exit", grandchildPID)
+	}
+}
+
+func TestDirectExitWithInheritedStreamsUsesDescendantCleanup(t *testing.T) {
+	tests := []struct {
+		name       string
+		streams    string
+		timeout    int64
+		wantStdout bool
+		wantStderr bool
+	}{
+		{name: "stdout", streams: "stdout", wantStdout: true},
+		{name: "stderr", streams: "stderr", wantStderr: true},
+		{name: "both", streams: "both", wantStdout: true, wantStderr: true},
+		{name: "both with finite timeout", streams: "both", timeout: 2_000, wantStdout: true, wantStderr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			request := testRequestInDirectory(t, "spawn-tree-exit-output", directory)
+			pidPath := filepath.Join(directory, "grandchild.pid")
+			readyPath := filepath.Join(directory, "grandchild.ready")
+			request.Environment = append(
+				request.Environment,
+				protocol.EnvironmentVariable{Name: "SUPERVISOR_HELPER_TREE_PID", Value: pidPath},
+				protocol.EnvironmentVariable{Name: "SUPERVISOR_HELPER_READY", Value: readyPath},
+				protocol.EnvironmentVariable{Name: "SUPERVISOR_HELPER_INHERIT_STREAMS", Value: test.streams},
+			)
+			request.TimeoutMilliseconds = test.timeout
+			request.TerminationGraceMilliseconds = 25
+
+			started := time.Now()
+			result, err := testRunner().Execute(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			if time.Since(started) > 2*time.Second {
+				t.Fatal("descendant cleanup did not return promptly")
+			}
+			grandchildPID := waitForPID(t, pidPath)
+			if result.ExitCode == nil || *result.ExitCode != 0 {
+				t.Fatalf("direct exit code = %v", result.ExitCode)
+			}
+			if result.Lifecycle != protocol.LifecycleKilled || result.TerminationReason != protocol.TerminationDescendantsKilled {
+				t.Fatalf("descendant result = %s/%s", result.Lifecycle, result.TerminationReason)
+			}
+			if result.Timeout.Triggered {
+				t.Fatal("direct-child completion was falsely reported as timeout")
+			}
+			if strings.Contains(result.Stdout.Text, "descendant stdout") != test.wantStdout {
+				t.Fatalf("stdout = %q, want marker %t", result.Stdout.Text, test.wantStdout)
+			}
+			if strings.Contains(result.Stderr.Text, "descendant stderr") != test.wantStderr {
+				t.Fatalf("stderr = %q, want marker %t", result.Stderr.Text, test.wantStderr)
+			}
+			if processIsRunning(grandchildPID) {
+				t.Fatalf("grandchild %d still runs after cleanup", grandchildPID)
+			}
+		})
+	}
+}
+
+func TestDrainShutdownIsBoundedForDetachedDescriptorOwner(t *testing.T) {
+	directory := t.TempDir()
+	request := testRequestInDirectory(t, "spawn-detached-exit-output", directory)
+	pidPath := filepath.Join(directory, "detached.pid")
+	readyPath := filepath.Join(directory, "detached.ready")
+	request.Environment = append(
+		request.Environment,
+		protocol.EnvironmentVariable{Name: "SUPERVISOR_HELPER_TREE_PID", Value: pidPath},
+		protocol.EnvironmentVariable{Name: "SUPERVISOR_HELPER_READY", Value: readyPath},
+	)
+	runner := testRunner()
+	runner.timing = runnerTiming{pollInterval: time.Millisecond, forcedWait: 50 * time.Millisecond, drainWait: 10 * time.Millisecond}
+
+	_, executeErr := runner.Execute(context.Background(), request)
+	detachedPID := waitForPID(t, pidPath)
+	defer func() {
+		_ = syscall.Kill(detachedPID, syscall.SIGKILL)
+		waitForProcessExit(t, detachedPID)
+	}()
+	if executeErr == nil || !strings.Contains(executeErr.Error(), "termination_error") {
+		t.Fatalf("Execute error = %v, want termination_error", executeErr)
+	}
+	record, loadErr := NewStateStore().Load(request.StatePath)
+	if loadErr != nil {
+		t.Fatalf("load protocol-failure state: %v", loadErr)
+	}
+	execution := record.Execution
+	if execution.Lifecycle != protocol.LifecycleProtocolFailure || execution.TerminationReason != protocol.TerminationProtocolFailure {
+		t.Fatalf("detached descriptor state = %s/%s", execution.Lifecycle, execution.TerminationReason)
+	}
+	if execution.Failure == nil || execution.Failure.Code != "termination_error" || execution.ExitCode == nil || *execution.ExitCode != 0 {
+		t.Fatalf("detached descriptor failure = %#v, exit = %v", execution.Failure, execution.ExitCode)
+	}
+}
+
+func TestExecuteJoinsDrainsBeforeResultsAcrossRepeatedRuns(t *testing.T) {
+	runner := testRunner()
+	var mu sync.Mutex
+	active := 0
+	started := 0
+	finished := 0
+	resultChecks := 0
+	resultWhileActive := false
+	runner.hooks = runnerHooks{
+		drainStarted: func() {
+			mu.Lock()
+			defer mu.Unlock()
+			active++
+			started++
+		},
+		drainFinished: func() {
+			mu.Lock()
+			defer mu.Unlock()
+			active--
+			finished++
+		},
+		beforeCaptureResults: func() {
+			mu.Lock()
+			defer mu.Unlock()
+			resultChecks++
+			resultWhileActive = resultWhileActive || active != 0
+		},
+	}
+
+	const runs = 20
+	for run := range runs {
+		request := testRequest(t, "echo")
+		result, err := runner.Execute(context.Background(), request)
+		if err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+		if result.Lifecycle != protocol.LifecycleCompleted {
+			t.Fatalf("run %d lifecycle = %s", run, result.Lifecycle)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if active != 0 || started != 2*runs || finished != started || resultChecks != runs || resultWhileActive {
+		t.Fatalf("drain lifecycle active=%d started=%d finished=%d checks=%d result_while_active=%t", active, started, finished, resultChecks, resultWhileActive)
 	}
 }
 
@@ -592,6 +873,20 @@ func writeHelperFile(environmentName, contents string) {
 	if path := os.Getenv(environmentName); path != "" {
 		_ = os.WriteFile(path, []byte(contents), 0o600)
 	}
+}
+
+func waitForHelperFile(path string, wait time.Duration) bool {
+	if path == "" {
+		return true
+	}
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
 }
 
 func writeRepeated(writer io.Writer, value byte, count int) {

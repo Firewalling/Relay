@@ -122,6 +122,15 @@ Relay still has no scheduler, queue, Rust launcher command, or Lua workflow
 runtime. Allowed Git-aware Rust operations may invoke `git`; existing note
 editor behavior remains outside protocol v1.
 
+The supervisor reaps its direct child independently of concurrent stdout/stderr
+draining. After the configured graceful period, forced reaping and group
+confirmation are bounded to 250 ms. Drains get 250 ms to reach EOF, then their
+readers are closed and given a final 250 ms to stop; unconfirmed cleanup or
+drain shutdown produces a protocol failure rather than an invented completed
+result. Cleanup covers only the original process group. A child that detaches
+with `setsid` or self-regroups requires a cgroup or service boundary, and a
+successful result cannot prove that no such detached process exists.
+
 `--json` and `--scope auto|current|repository` are global options and work
 before or after a subcommand. Human output remains the default. An exact global
 `--json` anywhere before a literal `--` requests JSON error framing even when
