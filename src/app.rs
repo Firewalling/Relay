@@ -81,7 +81,7 @@ impl IntoRunOutput for ProtocolResult {
                  Transport: direct argv, one JSON document per process\n\
                  Output schema: {}\n\
                  State owner: Rust (schema {})\n\
-                 Agent/workflow process launch: no\n\
+                 Manifest-v1 launcher capability: not advertised\n\
                  Go orchestrator: not implemented\n\
                  Lua workflow: not implemented\n\
                  Operations: status, context, note, checkpoint, handoff, finish",
@@ -396,6 +396,7 @@ pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
         Command::Note(args) => note(project, args)?.into_run_output(),
         Command::Context(args) => context(project, args)?,
         Command::Protocol => protocol_output(),
+        Command::Supervise(_) => unreachable!("supervise is handled before project discovery"),
         Command::Completions(_) => unreachable!("completions are handled before project discovery"),
     };
     Ok(output)
@@ -717,6 +718,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Note(_) => "note",
         Command::Context(_) => "context",
         Command::Protocol => "protocol",
+        Command::Supervise(_) => "supervise",
         Command::Completions(_) => "completions",
     }
 }
