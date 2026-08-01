@@ -146,10 +146,8 @@ fn parse_porcelain_z(
                 directory: directory.to_owned(),
                 message: "malformed rename in porcelain status output".into(),
             })?;
-            paths.push(path);
-        } else {
-            paths.push(path);
         }
+        paths.push(path);
     }
 
     paths.sort();
