@@ -32,3 +32,9 @@ jobs:
         run: go vet ./...
       - name: Run all Go tests
         run: go test -race ./...
+      - name: Build Go supervisor integration binary
+        run: go build -o "$RUNNER_TEMP/relay-supervisor" ./cmd/relay-supervisor
+      - name: Run Rust-to-Go supervisor integration test
+        run: cargo test --test supervise real_go_supervisor_e2e_when_configured
+        env:
+          RELAY_SUPERVISOR_E2E_BIN: ${{ runner.temp }}/relay-supervisor

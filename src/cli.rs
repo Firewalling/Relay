@@ -53,6 +53,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run one absolute program through the external Relay supervisor.
+    Supervise(SuperviseArgs),
     /// Prints the negotiated, versioned Rust/Go process contract and launches nothing.
     Protocol,
     /// Start a session with a goal.
@@ -89,6 +91,7 @@ impl Command {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Protocol => "protocol",
+            Self::Supervise(_) => "supervise",
             Self::Start(_) => "start",
             Self::Status => "status",
             Self::Checkpoint(_) => "checkpoint",
@@ -136,6 +139,42 @@ pub fn generate_completions(shell: CompletionShell) {
     generate(Shell::from(shell), &mut command, "relay", &mut io::stdout());
 }
 
+#[derive(Debug, Args)]
+pub struct SuperviseArgs {
+    /// Absolute path to the relay-supervisor executable.
+    #[arg(long)]
+    pub supervisor: Option<std::path::PathBuf>,
+    /// Stable identifier for this supervised run.
+    #[arg(long)]
+    pub run_id: Option<String>,
+    /// Supervisor-owned run record path.
+    #[arg(long)]
+    pub state_path: Option<std::path::PathBuf>,
+    /// Directory in which the program runs; defaults to the current directory.
+    #[arg(long)]
+    pub working_directory: Option<std::path::PathBuf>,
+    /// Child timeout in milliseconds; zero disables the timeout.
+    #[arg(long, default_value_t = 0)]
+    pub timeout_ms: i64,
+    /// Grace period before the supervisor escalates termination.
+    #[arg(long, default_value_t = 2_000)]
+    pub termination_grace_ms: i64,
+    /// Maximum retained child stdout bytes.
+    #[arg(long, default_value_t = 1 << 20)]
+    pub stdout_limit_bytes: i64,
+    /// Maximum retained child stderr bytes.
+    #[arg(long, default_value_t = 1 << 20)]
+    pub stderr_limit_bytes: i64,
+    /// Maximum retained supervisor observation-log bytes.
+    #[arg(long, default_value_t = 64 << 10)]
+    pub log_limit_bytes: i64,
+    /// Zero-based child argument index to redact from persisted output.
+    #[arg(long = "redact-argument-index")]
+    pub redact_argument_indexes: Vec<usize>,
+    /// Absolute program path and literal arguments, following `--`.
+    #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+    pub program_and_args: Vec<String>,
+}
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
     /// Remove only provably complete stale operation markers.
@@ -594,10 +633,43 @@ mod tests {
                 "context",
                 "search",
                 "protocol",
+                "supervise",
                 "completions",
             ] {
                 assert!(script.contains(command), "{shell:?} omitted {command}");
             }
         }
+    }
+
+    #[test]
+    fn supervise_preserves_literal_trailing_argv() {
+        let cli = Cli::try_parse_from([
+            "relay",
+            "supervise",
+            "--timeout-ms",
+            "9",
+            "--",
+            "/usr/bin/printf",
+            "--looks-like-an-option",
+            "literal;$(not-a-shell)",
+        ])
+        .unwrap();
+        let Command::Supervise(args) = cli.command else {
+            panic!("expected supervise");
+        };
+        assert_eq!(
+            args.program_and_args,
+            [
+                "/usr/bin/printf",
+                "--looks-like-an-option",
+                "literal;$(not-a-shell)"
+            ]
+        );
+        assert_eq!(args.timeout_ms, 9);
+    }
+
+    #[test]
+    fn supervise_requires_separator_for_program_argv() {
+        assert!(Cli::try_parse_from(["relay", "supervise", "/usr/bin/printf"]).is_err());
     }
 }

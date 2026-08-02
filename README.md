@@ -4,10 +4,10 @@
 
 Relay contains a Rust CLI for recording project-local work sessions,
 checkpoints, categorized notes, handoffs, and bounded context for the next
-terminal agent, plus a standalone Go supervisor for one explicitly requested
-local child process. The Rust CLI does not run agents, call model-provider APIs,
-inspect chat transcripts, or replace Git; the Go component is not integrated
-with the Rust command surface or a scheduler.
+terminal agent, plus `relay supervise`, a Rust launcher for one explicitly
+requested local child process through the standalone Go supervisor. The Rust
+CLI does not implement an agent or model runtime, call model-provider APIs,
+inspect chat transcripts, or replace Git; the launcher is not a scheduler or orchestrator.
 
 ## Prerequisites and installation
 
@@ -34,11 +34,44 @@ chmod 755 "$HOME/.local/bin/relay"
 Build the standalone supervisor without installing it:
 
 ```sh
-go build ./cmd/relay-supervisor
+go build -o relay-supervisor ./cmd/relay-supervisor
 ```
 
-Ensure `$HOME/.local/bin` is on `PATH`. Relay does not currently claim
-prebuilt packages or a crates.io release.
+`relay supervise` discovers that executable only by an explicit absolute
+`--supervisor PATH`, then an absolute `RELAY_SUPERVISOR` path, then a
+`relay-supervisor` sibling of the running `relay` executable. It never searches
+`PATH` for the supervisor.
+Ensure `$HOME/.local/bin` is on `PATH` if that is where you install Relay;
+Relay does not currently claim prebuilt packages or a crates.io release.
+
+## Supervise one process
+
+```sh
+relay supervise [options] -- <ABSOLUTE_PROGRAM> [ARG...]
+```
+
+The literal `--` separates launcher options from the child argv. The program
+must be an absolute path; every following argument remains a distinct argv
+element and is never shell-evaluated. The launcher options are
+`--supervisor ABSOLUTE_PATH`, `--run-id ID`, `--state-path PATH`,
+`--working-directory PATH`, `--timeout-ms N`, `--termination-grace-ms N`,
+`--stdout-limit-bytes N`, `--stderr-limit-bytes N`, `--log-limit-bytes N`, and
+repeatable `--redact-argument-index N`. `--run-id` defaults to a UUID;
+`--state-path` defaults to `<temporary-directory>/relay-runs/<run-id>.json`.
+The Go defaults are a disabled timeout (`0`), 2,000 ms termination grace, 1 MiB
+each for retained stdout and stderr, and 64 KiB for output observations.
+
+The launcher sends one JSON request and closes the supervisor's stdin, then
+waits for one response while bounding each response stream to 32 MiB. On Linux,
+it forwards `SIGINT` and `SIGTERM` to the supervisor while it waits; Go owns the
+child-process-group cleanup. Rust never
+reads or writes the Go-owned run record. Human output summarizes lifecycle,
+reason, exit code, duration, state path, and retained stdout/stderr byte counts;
+`--json` returns an outer object with `state_path` and `execution`.
+
+This command is project-independent: it neither discovers nor reads `.relay`.
+It launches one local child, not a scheduler, queue, daemon, remote executor,
+or Lua workflow runtime.
 
 ## Shell completions
 
@@ -117,10 +150,11 @@ Relay supports these commands:
 See the [orchestration process protocol](docs/orchestration-protocol.md) for
 the exact versioned manifest, one-child execution request/result, lifecycle,
 environment policy, limits, persistence, platform support, and security
-requirements. The standalone supervisor is deliberately not a Go orchestrator:
-Relay still has no scheduler, queue, Rust launcher command, or Lua workflow
-runtime. Allowed Git-aware Rust operations may invoke `git`; existing note
-editor behavior remains outside protocol v1.
+requirements. `relay supervise` is a one-child launcher, not an orchestrator:
+the immutable protocol-v1 manifest continues to report
+`orchestrator.implemented: false` and does not advertise launcher capability.
+Allowed Git-aware Rust operations may invoke `git`; existing note editor
+behavior remains outside protocol v1.
 
 The supervisor reaps its direct child independently of concurrent stdout/stderr
 draining. After the configured graceful period, forced reaping and group
@@ -343,15 +377,15 @@ back up `.relay/`, and resolve such damage manually.
 
 ## Current limitations
 
-Relay supports one active Rust session per selected project. The Go component
-supervises one local child per invocation on Linux; it has no queue, retries,
-remote execution, or Rust command-surface integration. Relay
-has no daemon, TUI, hosted synchronization, provider integration, transcript
-import, automatic source inspection, semantic search, encryption, Lua runtime,
-or automatic recovery of ambiguous interrupted operations. Advisory locks
-depend on filesystem lock support. Context is deterministic selection and
-formatting, not model-generated summarization. Packaging is currently source
-installation or locally built binaries.
+Relay supports one active Rust session per selected project. Through
+`relay supervise`, the Go component supervises one local child per invocation
+on Linux; there is no queue, retries, remote execution, or multi-child
+orchestration. Relay has no daemon, TUI, hosted synchronization, provider
+integration, transcript import, automatic source inspection, semantic search,
+encryption, Lua runtime, or automatic recovery of ambiguous interrupted
+operations. Advisory locks depend on filesystem lock support. Context is
+deterministic selection and formatting, not model-generated summarization.
+Packaging is currently source installation or locally built binaries.
 
 The files under `openspec/` describe development intent only. Relay has no
 runtime OpenSpec dependency.

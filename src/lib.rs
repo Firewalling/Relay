@@ -5,3 +5,4 @@ pub mod lock;
 pub mod model;
 pub mod project;
 pub mod storage;
+pub mod supervise;

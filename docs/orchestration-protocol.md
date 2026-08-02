@@ -6,12 +6,13 @@ capabilities without discovering a project, reading or validating `.relay`, or
 creating files. The canonical v1 manifest is
 [`protocol/manifest-v1.json`](../protocol/manifest-v1.json).
 
-Relay now includes a standalone Go one-child supervisor at
-`cmd/relay-supervisor`. It implements the low-level execution safety boundary
-described below, but it is not invoked or advertised by the Rust CLI and is not
-a scheduler, queue, daemon, remote executor, or Lua runtime. Allowed Git-aware
-Rust operations may invoke `git`; existing note editor behavior remains outside
-protocol v1.
+Relay also includes `relay supervise`, a project-independent Rust launcher for
+the standalone Go one-child supervisor at `cmd/relay-supervisor`. It is not
+advertised by manifest v1 and is not an orchestrator, scheduler, queue, daemon,
+remote executor, or Lua runtime. Child termination and child-output capture
+remain exclusively in Go rather than being duplicated by the launcher. Allowed
+Git-aware Rust operations may invoke `git`; existing note editor behavior
+remains outside protocol v1.
 
 ## Negotiation and versions
 
@@ -109,37 +110,37 @@ stdin data.
 ## Component responsibilities
 
 - **Rust** owns all `.relay` state, state validation, locking, Relay command
-  behavior, JSON envelopes, and protocol manifest reporting. Schema-v1 state
-  remains the source of truth. Rust does not read or write Go run records.
+  behavior, JSON envelopes, protocol manifest reporting, and the
+  project-independent `supervise` launcher. Schema-v1 state remains the source
+  of truth. Rust never reads or writes Go run records.
 - **Go** owns strict decoding of the canonical manifest, one versioned
   execution request, direct process launch, filtered child environments,
   bounded output metadata, cancellation and timeout handling, process-tree
   cleanup, and versioned run records outside `.relay`.
 - **Orchestration and scheduling remain unimplemented.** The immutable
-  manifest still reports `orchestrator.implemented: false` because no Rust
-  command invokes the supervisor and there is no queue, dependency graph,
-  retry engine, daemon, or long-running service.
+  manifest still reports `orchestrator.implemented: false`: a one-child
+  launcher is not scheduling or orchestration. Manifest v1 does not advertise
+  launcher capability; advertising it or changing allowed operations requires
+  a future manifest version.
 - **Lua** remains the owner of a future workflow layer and remains
   `implemented: false`; there is no workflow language, parser, runtime, or
   sandbox.
 
 The Go records are a separately versioned, subordinate execution contract, not
 an extension to Rust state or to `manifest-v1.json`. Existing Rust commands,
-schema-v1 projects, and protocol-v1 consumers therefore remain compatible. A
-future Rust command that advertises or launches the supervisor would require a
-new capability manifest version.
+schema-v1 projects, and protocol-v1 consumers therefore remain compatible.
 
 ## Go one-child supervisor
 
-`go run ./cmd/relay-supervisor` (or the built `relay-supervisor` executable)
-reads exactly one JSON execution request from stdin, up to 1 MiB. A valid
-request produces one output-schema-v1 success envelope on stdout with
-`command: "supervise"` and the execution result in `data`. Child nonzero exits,
-start failures, timeouts, cancellations, and forced kills are execution data,
-so the supervisor process still exits zero when it reports them successfully.
-Malformed or unsupported requests and supervisor infrastructure failures
-produce one output-schema-v1 error envelope on stderr and a nonzero supervisor
-exit. There is no JSON Lines stream or second child.
+The built `relay-supervisor` executable reads exactly one JSON execution request
+from stdin, up to 1 MiB. A valid request produces one output-schema-v1 success
+envelope on stdout with `command: "supervise"` and the execution result in
+`data`. Child nonzero exits, start failures, timeouts, cancellations, and
+forced kills are execution data, so the supervisor process still exits zero
+when it reports them successfully. Malformed or unsupported requests and
+supervisor infrastructure failures produce one output-schema-v1 error envelope
+on stderr and a nonzero supervisor exit. There is no JSON Lines stream or
+second child.
 
 The supervisor installs catchable termination-signal handling only after the
 complete stdin request has been read and decoded. Signals received while request
@@ -151,6 +152,51 @@ Before decoding requests, Go strictly decodes the same embedded
 v1 direct-argv, no-shell, stream, ownership, and ordered-operation contract.
 The execution request reuses `protocol_version: 1` and the established envelope
 fields; it does not add fields to the immutable manifest.
+
+### Rust launcher
+
+The command is exactly:
+
+```text
+relay supervise [options] -- <ABSOLUTE_PROGRAM> [ARG...]
+```
+
+The literal `--` is required to separate launcher options from the direct child
+argv. An absolute `--supervisor PATH` takes precedence over an absolute
+`RELAY_SUPERVISOR` path, which takes precedence over a `relay-supervisor`
+sibling beside the executing `relay` binary. Discovery never searches `PATH`.
+The remaining options are
+`--run-id`, `--state-path`, `--working-directory`, `--timeout-ms`,
+`--termination-grace-ms`, `--stdout-limit-bytes`, `--stderr-limit-bytes`,
+`--log-limit-bytes`, and repeatable `--redact-argument-index`. The default run
+ID is a UUID. The default state path is
+`<temporary-directory>/relay-runs/<run-id>.json`; `--state-path` selects a
+custom absolute Go-owned record path outside lexical `.relay`.
+
+Rust validates the absolute program, run ID, limits, redaction indexes,
+absolute working directory, and state path before constructing every v1 request
+field with an empty user environment. It rejects an encoded request, including
+its terminating newline, above 1 MiB before spawning the supervisor. Otherwise
+it writes that document, closes supervisor stdin, and concurrently drains each
+response stream through EOF while retaining at most 32 MiB. It accepts only one
+strict envelope:
+exit status zero requires a success envelope on stdout and empty stderr; nonzero
+requires an error envelope on stderr and empty stdout. Rust verifies output
+schema `1`, command `supervise`, execution protocol `1`, matching run ID, the
+required summary fields, and a known final lifecycle. Execution
+outcomes—including child nonzero exit, start failure, timeout, and
+cancellation—are transport success. Its JSON outer data is
+`{ "state_path": ..., "execution": ... }`; human output summarizes lifecycle,
+reason, exit status, duration, state path, and retained stdout/stderr byte counts.
+
+Before spawning on Linux, Rust blocks `SIGINT` and `SIGTERM` through supervisor
+PID publication, restores the pre-launch mask in the exec child, and then
+forwards either signal only to the active supervisor PID while it waits. It
+observes supervisor exit without reaping, disarms forwarding while that PID
+still cannot be reused, and only then reaps the process. Go alone performs
+child-group cleanup, with the limitations below. The launcher is
+project-independent and neither discovers, reads, nor writes `.relay` or Go run
+records.
 
 ### Execution request
 
@@ -442,9 +488,15 @@ migration policy.
 ## Current limitations
 
 The Go component supervises exactly one local process and persists one local
-run record. No Rust command invokes it yet, so `orchestrator.implemented`
-correctly remains false. There is no scheduler, queue, dependency graph,
-retry/resume engine, daemon, remote execution, authentication, deployment
-layer, Lua parser, Lua runtime, or Lua sandbox. Execution is currently limited
-to Linux. Self-detaching descendants and uncatchable process or machine
-termination require an external OS containment boundary.
+run record. `relay supervise` launches that one child but does not make
+`orchestrator.implemented` true: there is no scheduler, queue, dependency
+graph, retry/resume engine, daemon, remote execution, authentication,
+deployment layer, Lua parser, Lua runtime, or Lua sandbox. Execution is
+currently limited to Linux. Self-detaching descendants and uncatchable process
+or machine termination require an external OS containment boundary.
+
+The configured supervisor is a trusted local executable. Rust's 32 MiB
+per-response-stream limit bounds memory, not the runtime of a supervisor that
+violates its contract. `timeout_ms: 0` permits the requested child to run
+indefinitely; Go's internal termination and drain windows remain bounded once
+cleanup begins.
