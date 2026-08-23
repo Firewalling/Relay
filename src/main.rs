@@ -3,7 +3,7 @@ use relay::{
     app,
     cli::{Cli, Command, generate_completions},
     model::{ErrorEnvelope, OUTPUT_SCHEMA_VERSION, OutputError, SuccessEnvelope},
-    project, supervise,
+    orchestrate, project, supervise,
 };
 use std::{env, ffi::OsStr, io::Write, process::ExitCode};
 
@@ -31,6 +31,27 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Command::Run(args) = cli.command {
+        let project = match project::discover(&invocation_directory, cli.scope) {
+            Ok(project) => project,
+            Err(error) => {
+                emit_error(
+                    json_output,
+                    command_name,
+                    "project_discovery",
+                    &error.to_string(),
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        return match orchestrate::run(args, &invocation_directory, &project.relay_project_root) {
+            Ok(output) => emit_success(json_output, command_name, output),
+            Err(error) => {
+                emit_error(json_output, command_name, error.code(), &error.to_string());
+                ExitCode::FAILURE
+            }
+        };
+    }
     if let Command::Supervise(args) = cli.command {
         return match supervise::run(args, &invocation_directory) {
             Ok(output) => emit_success(json_output, command_name, output),

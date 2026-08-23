@@ -53,6 +53,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run a persisted task plan through the external Relay supervisor.
+    Run(RunArgs),
     /// Run one absolute program through the external Relay supervisor.
     Supervise(SuperviseArgs),
     /// Prints the negotiated, versioned Rust/Go process contract and launches nothing.
@@ -90,6 +92,7 @@ pub enum Command {
 impl Command {
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Run(_) => "run",
             Self::Protocol => "protocol",
             Self::Supervise(_) => "supervise",
             Self::Start(_) => "start",
@@ -137,6 +140,26 @@ impl From<CompletionShell> for Shell {
 pub fn generate_completions(shell: CompletionShell) {
     let mut command = Cli::command();
     generate(Shell::from(shell), &mut command, "relay", &mut io::stdout());
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("state")
+        .args(["state_path", "resume"])
+        .multiple(false)
+))]
+pub struct RunArgs {
+    /// Absolute path to the relay-supervisor executable.
+    #[arg(long)]
+    pub supervisor: Option<std::path::PathBuf>,
+    /// Absolute aggregate run state path for a new run.
+    #[arg(long)]
+    pub state_path: Option<std::path::PathBuf>,
+    /// Absolute aggregate run state path to resume.
+    #[arg(long)]
+    pub resume: Option<std::path::PathBuf>,
+    /// Task plan JSON file.
+    pub plan: std::path::PathBuf,
 }
 
 #[derive(Debug, Args)]

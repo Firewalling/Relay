@@ -38,3 +38,7 @@ jobs:
         run: cargo test --test supervise real_go_supervisor_e2e_when_configured
         env:
           RELAY_SUPERVISOR_E2E_BIN: ${{ runner.temp }}/relay-supervisor
+      - name: Run Rust-to-Go DAG integration test
+        run: cargo test --test run real_go_supervisor_runs_two_task_dependency_dag_when_configured
+        env:
+          RELAY_SUPERVISOR_E2E_BIN: ${{ runner.temp }}/relay-supervisor

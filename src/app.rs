@@ -397,6 +397,7 @@ pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
         Command::Context(args) => context(project, args)?,
         Command::Protocol => protocol_output(),
         Command::Supervise(_) => unreachable!("supervise is handled before project discovery"),
+        Command::Run(_) => unreachable!("run is handled before project discovery"),
         Command::Completions(_) => unreachable!("completions are handled before project discovery"),
     };
     Ok(output)
@@ -718,6 +719,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Note(_) => "note",
         Command::Context(_) => "context",
         Command::Protocol => "protocol",
+        Command::Run(_) => "run",
         Command::Supervise(_) => "supervise",
         Command::Completions(_) => "completions",
     }
