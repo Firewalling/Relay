@@ -243,6 +243,20 @@ impl Harness {
             .expect("run relay coordinator")
     }
 
+    fn run_human(&self, plan: &Path, state: &Path) -> Output {
+        self.command()
+            .args([
+                "run",
+                "--supervisor",
+                self.supervisor.to_str().unwrap(),
+                "--state-path",
+                state.to_str().unwrap(),
+                plan.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run human relay coordinator")
+    }
+
     fn resume_json(&self, plan: &Path, state: &Path) -> Output {
         self.command()
             .args([
@@ -309,27 +323,31 @@ fn task(id: &str, dependencies: &[&str]) -> Value {
     })
 }
 
-fn success_document(output: &Output) -> Value {
+fn run_document(output: &Output) -> Value {
     assert!(
-        output.status.success(),
-        "relay failed: {}",
+        output.stderr.is_empty(),
+        "run envelope unexpectedly wrote stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stderr.is_empty());
     let document: Value =
         serde_json::from_slice(&output.stdout).expect("valid JSON success envelope");
     assert_eq!(document["output_schema_version"], 1);
     assert_eq!(document["ok"], true);
     assert_eq!(document["command"], "run");
     assert!(document["data"].is_object());
+    let run_status = document["data"]["run"]["status"]
+        .as_str()
+        .expect("run envelope status");
+    assert_eq!(
+        output.status.code(),
+        Some(if run_status == "completed" { 0 } else { 1 }),
+        "shell status disagrees with run status {run_status}"
+    );
     document
 }
 
 fn error_document(output: &Output) -> Value {
-    assert!(
-        !output.status.success(),
-        "invalid run unexpectedly succeeded"
-    );
+    assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let document: Value =
         serde_json::from_slice(&output.stderr).expect("valid JSON error envelope");
@@ -445,7 +463,7 @@ fn real_go_supervisor_runs_two_task_dependency_dag_when_configured() {
         ])
         .output()
         .expect("run Relay with the real Go supervisor");
-    let document = success_document(&output);
+    let document = run_document(&output);
     let state_path = PathBuf::from(
         document["data"]["state_path"]
             .as_str()
@@ -607,7 +625,7 @@ fn real_go_supervisor_cancels_signal_latched_immediately_after_spawn_when_config
     let output = child
         .wait_with_output()
         .expect("wait for clean Relay cancellation");
-    success_document(&output);
+    run_document(&output);
     assert!(
         state_path.is_file(),
         "aggregate cancellation was not persisted"
@@ -667,7 +685,7 @@ fn default_state_path_is_project_scoped_and_survives_temporary_cleanup() {
         .output()
         .unwrap();
 
-    let document = success_document(&output);
+    let document = run_document(&output);
     let state_path = PathBuf::from(
         document["data"]["state_path"]
             .as_str()
@@ -707,7 +725,7 @@ fn default_state_uses_discovered_root_and_honors_scope() {
         ])
         .output()
         .unwrap();
-    let auto_document = success_document(&auto);
+    let auto_document = run_document(&auto);
     let auto_path = Path::new(auto_document["data"]["state_path"].as_str().unwrap());
     assert!(auto_path.starts_with(harness.directory.path().join(".relay/runs")));
 
@@ -726,7 +744,7 @@ fn default_state_uses_discovered_root_and_honors_scope() {
         ])
         .output()
         .unwrap();
-    let current_document = success_document(&current);
+    let current_document = run_document(&current);
     let current_path = Path::new(current_document["data"]["state_path"].as_str().unwrap());
     assert!(current_path.starts_with(nested.join(".relay/runs")));
 
@@ -767,7 +785,7 @@ fn executes_literal_arguments_in_stable_dependency_order() {
     );
     let state_path = harness.state("order");
 
-    success_document(&harness.run_json(&plan, &state_path));
+    run_document(&harness.run_json(&plan, &state_path));
 
     let requests = harness.requests();
     assert_eq!(
@@ -920,7 +938,7 @@ fn successful_state_has_unique_attempt_identities_and_sanitizes_secrets() {
     let plan = harness.plan("success", json!([first, second]));
     let state_path = harness.state("success");
 
-    let document = success_document(&harness.run_json(&plan, &state_path));
+    let document = run_document(&harness.run_json(&plan, &state_path));
     assert_eq!(document["data"]["state_path"], state_path.to_str().unwrap());
     let bytes = fs::read(&state_path).unwrap();
     let persisted = String::from_utf8(bytes).unwrap();
@@ -968,6 +986,27 @@ fn successful_state_has_unique_attempt_identities_and_sanitizes_secrets() {
 }
 
 #[test]
+fn aggregate_state_and_lock_files_are_owner_private() {
+    let harness = Harness::new();
+    let plan = harness.plan("private-state", json!([task("private-state", &[])]));
+    let state_path = harness.state("private-state");
+
+    run_document(&harness.run_json(&plan, &state_path));
+
+    let lock_path = state_path.with_file_name(format!(
+        "{}.orchestration.lock",
+        state_path.file_name().unwrap().to_str().unwrap()
+    ));
+    for (description, path) in [
+        ("aggregate state", &state_path),
+        ("coordinator lock", &lock_path),
+    ] {
+        let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{description} mode");
+    }
+}
+
+#[test]
 fn canonical_state_identity_is_persisted_and_hardlink_alias_resume_is_rejected() {
     let harness = Harness::new();
     harness.configure(&[("waiting", "cancelled")]);
@@ -976,7 +1015,7 @@ fn canonical_state_identity_is_persisted_and_hardlink_alias_resume_is_rejected()
         json!([task("waiting", &[]), task("later", &[])]),
     );
     let state_path = harness.state("state-identity");
-    success_document(&harness.run_json(&plan, &state_path));
+    run_document(&harness.run_json(&plan, &state_path));
 
     let canonical_state_path = fs::canonicalize(&state_path).unwrap();
     let state = read_state(&state_path);
@@ -1016,7 +1055,7 @@ fn failures_block_descendants_but_independent_tasks_continue() {
     );
     let state_path = harness.state("failures");
 
-    success_document(&harness.run_json(&plan, &state_path));
+    let document = run_document(&harness.run_json(&plan, &state_path));
 
     assert_eq!(
         request_names(&harness.requests()),
@@ -1024,6 +1063,7 @@ fn failures_block_descendants_but_independent_tasks_continue() {
     );
     let state = read_state(&state_path);
     assert_eq!(state["status"], "failed");
+    assert_eq!(document["data"]["run"], state);
     for id in ["nonzero", "timeout", "start"] {
         assert_eq!(record(&state, id)["status"], "failed", "task {id}");
     }
@@ -1063,7 +1103,7 @@ fn coordinator_accepts_legacy_v1_state_creation_before_cancellation_response() {
     wait_for_path(&attempt_state);
 
     let output = terminate(child);
-    success_document(&output);
+    run_document(&output);
     let aggregate = read_state(&state_path);
     assert_eq!(aggregate["status"], "cancelled");
     assert_eq!(record(&aggregate, "waiting")["status"], "cancelled");
@@ -1091,9 +1131,10 @@ fn cancellation_blocks_only_descendants_and_resume_runs_pending_independent_task
     harness.wait_for_requests(2);
 
     let cancelled = terminate(child);
-    success_document(&cancelled);
+    let document = run_document(&cancelled);
     let interrupted = read_state(&state_path);
     assert_eq!(interrupted["status"], "cancelled");
+    assert_eq!(document["data"]["run"], interrupted);
     assert_eq!(record(&interrupted, "first")["status"], "succeeded");
     assert_eq!(record(&interrupted, "waiting")["status"], "cancelled");
     assert_eq!(record(&interrupted, "later")["status"], "pending");
@@ -1102,7 +1143,7 @@ fn cancellation_blocks_only_descendants_and_resume_runs_pending_independent_task
     assert_eq!(request_names(&harness.requests()), ["first", "waiting"]);
 
     harness.configure(&[]);
-    success_document(&harness.resume_json(&plan, &state_path));
+    run_document(&harness.resume_json(&plan, &state_path));
     let resumed = read_state(&state_path);
     assert_eq!(record(&resumed, "first")["status"], "succeeded");
     assert_eq!(record(&resumed, "waiting")["status"], "cancelled");
@@ -1124,7 +1165,7 @@ fn resume_from_another_directory_keeps_the_original_default_working_directory() 
         json!([task("waiting", &[]), task("later", &[])]),
     );
     let state_path = harness.state("cwd-resume");
-    success_document(&harness.run_json(&plan, &state_path));
+    run_document(&harness.run_json(&plan, &state_path));
     let interrupted = read_state(&state_path);
     assert_eq!(record(&interrupted, "later")["status"], "pending");
     assert!(
@@ -1152,7 +1193,7 @@ fn resume_from_another_directory_keeps_the_original_default_working_directory() 
         ])
         .output()
         .expect("resume relay from another directory");
-    success_document(&resumed);
+    run_document(&resumed);
 
     let requests = harness.requests();
     assert_eq!(request_names(&requests), ["waiting", "later"]);
@@ -1171,7 +1212,7 @@ fn resume_accepts_persisted_supervisor_paths_from_a_different_tmpdir() {
         json!([task("waiting", &[]), task("later", &[])]),
     );
     let state_path = harness.state("cross-tmpdir-resume");
-    success_document(&harness.run_json(&plan, &state_path));
+    run_document(&harness.run_json(&plan, &state_path));
     let interrupted = read_state(&state_path);
     let prior_supervisor_path = PathBuf::from(
         record(&interrupted, "waiting")["supervisor_state_path"]
@@ -1198,7 +1239,7 @@ fn resume_accepts_persisted_supervisor_paths_from_a_different_tmpdir() {
         ])
         .output()
         .expect("resume relay with changed TMPDIR");
-    success_document(&output);
+    run_document(&output);
 
     let resumed = read_state(&state_path);
     assert_eq!(record(&resumed, "waiting")["status"], "cancelled");
@@ -1228,7 +1269,7 @@ fn resume_with_redacted_arguments_is_rejected_without_launching() {
     later["redact_argument_indexes"] = json!([0]);
     let plan = harness.plan("redacted-resume", json!([task("waiting", &[]), later]));
     let state_path = harness.state("redacted-resume");
-    success_document(&harness.run_json(&plan, &state_path));
+    run_document(&harness.run_json(&plan, &state_path));
     let before = harness.requests().len();
 
     let error = error_document(&harness.resume_json(&plan, &state_path));
@@ -1238,6 +1279,153 @@ fn resume_with_redacted_arguments_is_rejected_without_launching() {
         record(&read_state(&state_path), "later")["status"],
         "pending"
     );
+}
+
+#[test]
+fn resume_rejects_inconsistent_task_summaries() {
+    let harness = Harness::new();
+    harness.configure(&[("cancelled", "cancelled")]);
+    let plan = harness.plan(
+        "summary-invariants",
+        json!([task("cancelled", &[]), task("pending", &[])]),
+    );
+    let state_path = harness.state("summary-invariants");
+    run_document(&harness.run_json(&plan, &state_path));
+    let original = read_state(&state_path);
+    let before = harness.requests().len();
+
+    let mut missing = original.clone();
+    missing["tasks"][0]["summary"] = Value::Null;
+    fs::write(&state_path, serde_json::to_vec_pretty(&missing).unwrap()).unwrap();
+    let error = error_document(&harness.resume_json(&plan, &state_path));
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+
+    let mut stale = original.clone();
+    let cancelled_summary = stale["tasks"][0]["summary"].clone();
+    stale["tasks"][1]["summary"] = cancelled_summary;
+    fs::write(&state_path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+    let error = error_document(&harness.resume_json(&plan, &state_path));
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+
+    let mut wrong_status = original.clone();
+    wrong_status["tasks"][0]["status"] = json!("succeeded");
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&wrong_status).unwrap(),
+    )
+    .unwrap();
+    let error = error_document(&harness.resume_json(&plan, &state_path));
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("conflicts with its execution summary")
+    );
+
+    let mut nonterminal = original;
+    nonterminal["tasks"][0]["summary"]["lifecycle"] = json!("running");
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&nonterminal).unwrap(),
+    )
+    .unwrap();
+    let error = error_document(&harness.resume_json(&plan, &state_path));
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid execution summary")
+    );
+    assert_eq!(harness.requests().len(), before);
+}
+
+#[test]
+fn resume_rejects_inconsistent_dependency_transitions() {
+    let harness = Harness::new();
+    harness.configure(&[("failed", "nonzero")]);
+    let plan = harness.plan(
+        "pending-after-failure",
+        json!([task("failed", &[]), task("child", &["failed"])]),
+    );
+    let state_path = harness.state("pending-after-failure");
+    run_document(&harness.run_json(&plan, &state_path));
+    let before = harness.requests().len();
+    let mut pending = read_state(&state_path);
+    pending["status"] = json!("running");
+    pending["tasks"][1]["status"] = json!("pending");
+    pending["tasks"][1]["reason"] = Value::Null;
+    fs::write(&state_path, serde_json::to_vec_pretty(&pending).unwrap()).unwrap();
+    let error = error_document(&harness.resume_json(&plan, &state_path));
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pending task")
+    );
+    assert_eq!(harness.requests().len(), before);
+
+    let harness = Harness::new();
+    let plan = harness.plan(
+        "blocked-after-success",
+        json!([task("first", &[]), task("child", &["first"])]),
+    );
+    let state_path = harness.state("blocked-after-success");
+    run_document(&harness.run_json(&plan, &state_path));
+    let before = harness.requests().len();
+    let mut blocked = read_state(&state_path);
+    blocked["status"] = json!("failed");
+    blocked["tasks"][1]["status"] = json!("blocked");
+    blocked["tasks"][1]["reason"] = json!("dependency first did not succeed");
+    blocked["tasks"][1]["attempt_run_id"] = Value::Null;
+    blocked["tasks"][1]["supervisor_state_path"] = Value::Null;
+    blocked["tasks"][1]["summary"] = Value::Null;
+    fs::write(&state_path, serde_json::to_vec_pretty(&blocked).unwrap()).unwrap();
+    let error = error_document(&harness.resume_json(&plan, &state_path));
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("blocked task")
+    );
+    assert_eq!(harness.requests().len(), before);
+}
+
+#[test]
+fn resume_accepts_a_recorded_unsuccessful_dependency_reason_after_transitive_blocking() {
+    let harness = Harness::new();
+    harness.configure(&[("failed", "nonzero")]);
+    let plan = harness.plan(
+        "stable-block-reason",
+        json!([
+            task("failed", &[]),
+            task("target", &["earlier", "failed"]),
+            task("earlier", &["failed"])
+        ]),
+    );
+    let state_path = harness.state("stable-block-reason");
+    run_document(&harness.run_json(&plan, &state_path));
+    let state = read_state(&state_path);
+    assert_eq!(
+        record(&state, "target")["reason"],
+        "dependency failed did not succeed"
+    );
+    assert_eq!(record(&state, "earlier")["status"], "blocked");
+    let before = harness.requests().len();
+
+    let document = run_document(&harness.resume_json(&plan, &state_path));
+
+    let resumed = read_state(&state_path);
+    assert_eq!(document["data"]["run"], resumed);
+    assert_eq!(
+        record(&resumed, "target")["reason"],
+        "dependency failed did not succeed"
+    );
+    assert_eq!(record(&resumed, "earlier")["status"], "blocked");
+    assert_eq!(harness.requests().len(), before);
 }
 
 #[test]
@@ -1301,7 +1489,7 @@ fn resume_rejects_changed_plans_and_indeterminate_or_running_state() {
     harness.configure(&[]);
     let completed_plan = harness.plan("original", json!([task("original", &[])]));
     let completed_state = harness.state("original");
-    success_document(&harness.run_json(&completed_plan, &completed_state));
+    run_document(&harness.run_json(&completed_plan, &completed_state));
     let changed_plan = harness.plan("changed", json!([task("changed", &[])]));
     let mismatch = error_document(&harness.resume_json(&changed_plan, &completed_state));
     assert_eq!(mismatch["error"]["code"], "run_state_invalid");
@@ -1322,7 +1510,7 @@ fn one_aggregate_state_path_allows_only_one_coordinator() {
     assert_eq!(harness.requests().len(), 1);
 
     let first_output = terminate(first);
-    success_document(&first_output);
+    run_document(&first_output);
 }
 
 #[test]
@@ -1399,7 +1587,7 @@ fn cancellation_before_launch_and_after_result_preserves_resumable_work() {
         };
         assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
         fs::write(&release, b"release\n").unwrap();
-        success_document(&child.wait_with_output().unwrap());
+        run_document(&child.wait_with_output().unwrap());
 
         let expected_launches = usize::from(pause == "after_supervisor_result");
         assert_eq!(harness.requests().len(), expected_launches, "pause {pause}");
@@ -1423,7 +1611,7 @@ fn cancellation_before_launch_and_after_result_preserves_resumable_work() {
             "running task remained at {pause}"
         );
 
-        success_document(&harness.resume_json(&plan, &state_path));
+        run_document(&harness.resume_json(&plan, &state_path));
         let resumed = read_state(&state_path);
         assert_eq!(resumed["status"], "completed", "pause {pause}");
         assert_eq!(resumed["cancellation_requested"], false, "pause {pause}");
@@ -1450,6 +1638,8 @@ fn malformed_and_remote_supervisor_responses_persist_indeterminate_state() {
         let canonical_state_path = state["state_path"]
             .as_str()
             .expect("canonical aggregate state path");
+        assert_eq!(error["data"]["state_path"], canonical_state_path);
+        assert_eq!(error["data"]["run"], state);
         let message = error["error"]["message"]
             .as_str()
             .expect("indeterminate error message");
@@ -1551,7 +1741,7 @@ fn accepts_explicit_aggregate_path_in_project_runs_directory() {
     let plan = harness.plan("project-runs", json!([task("safe", &[])]));
     let state_path = harness.directory.path().join(".relay/runs/explicit.json");
 
-    let document = success_document(&harness.run_json(&plan, &state_path));
+    let document = run_document(&harness.run_json(&plan, &state_path));
 
     assert_eq!(document["data"]["state_path"], state_path.to_str().unwrap());
     assert_eq!(read_state(&state_path)["status"], "completed");
@@ -1563,7 +1753,7 @@ fn human_and_json_outputs_are_framed_and_run_ignores_the_project_lock() {
     let plan = harness.plan("framing", json!([task("framing", &[])]));
     let json_state = harness.state("json-framing");
     let json_output = harness.run_json(&plan, &json_state);
-    let document = success_document(&json_output);
+    let document = run_document(&json_output);
     assert_eq!(document["data"]["state_path"], json_state.to_str().unwrap());
 
     let relay_directory = harness.directory.path().join(".relay");
@@ -1620,4 +1810,82 @@ fn human_and_json_outputs_are_framed_and_run_ignores_the_project_lock() {
     assert!(text.contains("framing"));
     assert!(text.contains(human_state.to_str().unwrap()));
     assert!(!text.trim_start().starts_with('{'));
+}
+
+#[test]
+fn human_output_exit_status_tracks_completed_failed_cancelled_and_indeterminate_runs() {
+    for (name, mode, tasks, expected_status, succeeds) in [
+        (
+            "human-success",
+            "success",
+            json!([task("human-success", &[])]),
+            "completed",
+            true,
+        ),
+        (
+            "human-failure",
+            "nonzero",
+            json!([
+                task("human-failure", &[]),
+                task("blocked-child", &["human-failure"])
+            ]),
+            "failed",
+            false,
+        ),
+        (
+            "human-cancelled",
+            "cancelled",
+            json!([task("human-cancelled", &[])]),
+            "cancelled",
+            false,
+        ),
+    ] {
+        let harness = Harness::new();
+        harness.configure(&[(name, mode)]);
+        let plan = harness.plan(name, tasks);
+        let state_path = harness.state(name);
+
+        let output = harness.run_human(&plan, &state_path);
+
+        assert_eq!(
+            output.status.code(),
+            Some(if succeeds { 0 } else { 1 }),
+            "case {name}"
+        );
+        assert!(output.stderr.is_empty(), "case {name}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(&format!(": {expected_status}")),
+            "case {name}"
+        );
+        assert!(text.contains(state_path.to_str().unwrap()), "case {name}");
+        let state = read_state(&state_path);
+        assert_eq!(state["status"], expected_status, "case {name}");
+        if name == "human-failure" {
+            assert_eq!(record(&state, "human-failure")["status"], "failed");
+            assert_eq!(record(&state, "blocked-child")["status"], "blocked");
+        }
+    }
+
+    let harness = Harness::new();
+    harness.configure(&[("human-indeterminate", "malformed")]);
+    let plan = harness.plan(
+        "human-indeterminate",
+        json!([task("human-indeterminate", &[])]),
+    );
+    let state_path = harness.state("human-indeterminate");
+
+    let output = harness.run_human(&plan, &state_path);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.starts_with("error: supervisor failed for run "));
+    assert!(error.contains(state_path.to_str().unwrap()));
+    let state = read_state(&state_path);
+    assert_eq!(state["status"], "indeterminate");
+    assert_eq!(
+        record(&state, "human-indeterminate")["status"],
+        "indeterminate"
+    );
 }

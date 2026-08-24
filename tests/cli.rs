@@ -95,8 +95,9 @@ fn protocol_manifest_is_versioned_project_independent_and_stable() {
         "Transport: direct argv, one JSON document per process\n",
         "Output schema: 1\n",
         "State owner: Rust (schema 1)\n",
-        "Manifest-v1 launcher capability: not advertised\n",
-        "Go orchestrator: not implemented\n",
+        "Built-in run coordinator: Rust (sequential)\n",
+        "Go one-child supervisor: implemented\n",
+        "Manifest-v1 external orchestrator (owner Go): not implemented\n",
         "Lua workflow: not implemented\n",
         "Operations: status, context, note, checkpoint, handoff, finish\n",
     );

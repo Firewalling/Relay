@@ -50,6 +50,7 @@ pub enum RunError {
     Supervisor {
         run_id: String,
         state_path: String,
+        state: Box<RunState>,
         #[source]
         source: SupervisorError,
     },
@@ -62,6 +63,13 @@ impl RunError {
             Self::State(_) => "run_state_invalid",
             Self::Busy(_) => "run_busy",
             Self::Supervisor { .. } => "run_supervisor",
+        }
+    }
+
+    pub fn state(&self) -> Option<&RunState> {
+        match self {
+            Self::Supervisor { state, .. } => Some(state),
+            _ => None,
         }
     }
 }
@@ -204,11 +212,22 @@ pub struct RunState {
     pub tasks: Vec<TaskRecord>,
 }
 
+pub struct RunResult {
+    pub output: RunOutput,
+    pub status: RunStatus,
+}
+
+impl RunResult {
+    pub fn succeeded(&self) -> bool {
+        self.status == RunStatus::Completed
+    }
+}
+
 pub fn run(
     args: RunArgs,
     invocation_directory: &Path,
     project_root: &Path,
-) -> Result<RunOutput, RunError> {
+) -> Result<RunResult, RunError> {
     let raw_plan = read_bounded(&args.plan, MAX_PLAN_BYTES).map_err(|error| {
         RunError::Plan(format!("could not read {}: {error}", args.plan.display()))
     })?;
@@ -310,6 +329,7 @@ pub fn run(
         supervise::CoordinatorSignals::install().map_err(|source| RunError::Supervisor {
             run_id: state.run_id.clone(),
             state_path: state.state_path.clone(),
+            state: Box::new(state.clone()),
             source,
         })?;
 
@@ -330,6 +350,7 @@ pub fn run(
         let (attempt_run_id, supervisor_state_path) = &attempts[index];
         state.tasks[index].status = TaskStatus::Running;
         state.tasks[index].reason = None;
+        state.tasks[index].summary = None;
         state.tasks[index].attempt_run_id = Some(attempt_run_id.clone());
         state.tasks[index].supervisor_state_path = Some(path_string(supervisor_state_path)?);
         state.status = RunStatus::Running;
@@ -368,6 +389,7 @@ pub fn run(
                 return Err(RunError::Supervisor {
                     run_id: state.run_id.clone(),
                     state_path: state.state_path.clone(),
+                    state: Box::new(state),
                     source,
                 });
             }
@@ -1474,6 +1496,7 @@ fn validate_resume_state(state: &RunState, plan: &Plan, state_path: &Path) -> Re
             "resume is unsafe with running or indeterminate task records".into(),
         ));
     }
+    validate_resume_dependencies(plan, &state.tasks)?;
     let mut attempt_ids = HashSet::new();
     let mut supervisor_paths = HashSet::new();
     for task in &state.tasks {
@@ -1532,13 +1555,178 @@ fn validate_resume_state(state: &RunState, plan: &Plan, state_path: &Path) -> Re
                 )));
             }
         }
-        if matches!(task.status, TaskStatus::Succeeded | TaskStatus::Failed)
-            && task.summary.is_none()
+        if matches!(task.status, TaskStatus::Pending | TaskStatus::Blocked)
+            && task.summary.is_some()
+        {
+            return Err(RunError::State(format!(
+                "non-executed task {:?} has an execution summary",
+                task.id
+            )));
+        }
+        if matches!(
+            task.status,
+            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
+        ) && task.summary.is_none()
         {
             return Err(RunError::State(format!(
                 "terminal task {:?} has no execution summary",
                 task.id
             )));
+        }
+        if let Some(summary) = &task.summary
+            && matches!(
+                task.status,
+                TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
+            )
+        {
+            let Some(summary_status) = task_status_from_summary(summary) else {
+                return Err(RunError::State(format!(
+                    "terminal task {:?} has an invalid execution summary",
+                    task.id
+                )));
+            };
+            if task.status != summary_status {
+                return Err(RunError::State(format!(
+                    "terminal task {:?} status {} conflicts with its execution summary",
+                    task.id,
+                    task.status.as_str()
+                )));
+            }
+            let reason_is_valid = if task.status == TaskStatus::Succeeded {
+                task.reason.is_none()
+            } else {
+                task.reason.is_some()
+            };
+            if !reason_is_valid {
+                return Err(RunError::State(format!(
+                    "terminal task {:?} has an inconsistent reason",
+                    task.id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn task_status_from_summary(summary: &ExecutionSummary) -> Option<TaskStatus> {
+    let pair_is_valid = matches!(
+        (summary.lifecycle, summary.termination_reason),
+        (
+            Lifecycle::Completed,
+            TerminationReason::ExitZero
+                | TerminationReason::ExitNonzero
+                | TerminationReason::DescendantsTerminated
+        ) | (Lifecycle::FailedToStart, TerminationReason::StartError)
+            | (Lifecycle::TimedOut, TerminationReason::TimeoutTerminated)
+            | (Lifecycle::Cancelled, TerminationReason::CancelledTerminated)
+            | (
+                Lifecycle::Killed,
+                TerminationReason::TimeoutKilled
+                    | TerminationReason::CancelledKilled
+                    | TerminationReason::DescendantsKilled
+            )
+    );
+    if !pair_is_valid
+        || (summary.termination_reason == TerminationReason::ExitZero
+            && summary.exit_code != Some(0))
+        || (summary.termination_reason == TerminationReason::ExitNonzero
+            && summary.exit_code == Some(0))
+        || (summary.termination_reason == TerminationReason::StartError
+            && summary.exit_code.is_some())
+        || summary.failure_code.is_some() != summary.failure_message.is_some()
+        || summary.failure_code.is_some()
+            != (summary.termination_reason == TerminationReason::StartError)
+        || summary.duration_ms < 0
+        || summary.stdout_bytes_observed < 0
+        || summary.stdout_bytes_retained < 0
+        || summary.stdout_bytes_retained > summary.stdout_bytes_observed
+        || summary.stderr_bytes_observed < 0
+        || summary.stderr_bytes_retained < 0
+        || summary.stderr_bytes_retained > summary.stderr_bytes_observed
+    {
+        return None;
+    }
+    let cancelled = matches!(
+        summary.termination_reason,
+        TerminationReason::CancelledTerminated | TerminationReason::CancelledKilled
+    );
+    if summary.cancellation_requested != cancelled {
+        return None;
+    }
+    if summary.lifecycle == Lifecycle::Completed
+        && summary.termination_reason == TerminationReason::ExitZero
+    {
+        Some(TaskStatus::Succeeded)
+    } else if cancelled {
+        Some(TaskStatus::Cancelled)
+    } else {
+        Some(TaskStatus::Failed)
+    }
+}
+
+fn validate_resume_dependencies(plan: &Plan, records: &[TaskRecord]) -> Result<(), RunError> {
+    let statuses: HashMap<&str, TaskStatus> = records
+        .iter()
+        .map(|record| (record.id.as_str(), record.status))
+        .collect();
+    for (index, task) in plan.tasks.iter().enumerate() {
+        let record = &records[index];
+        let unsuccessful_dependency = task.depends_on.iter().find(|dependency| {
+            let status = statuses[dependency.as_str()];
+            status.is_terminal() && status != TaskStatus::Succeeded
+        });
+        match record.status {
+            TaskStatus::Pending => {
+                if let Some(dependency) = unsuccessful_dependency {
+                    return Err(RunError::State(format!(
+                        "pending task {:?} has unsuccessful dependency {dependency:?}",
+                        task.id
+                    )));
+                }
+                if record.reason.is_some() {
+                    return Err(RunError::State(format!(
+                        "pending task {:?} has a terminal reason",
+                        task.id
+                    )));
+                }
+            }
+            TaskStatus::Blocked => {
+                if unsuccessful_dependency.is_none() {
+                    return Err(RunError::State(format!(
+                        "blocked task {:?} has no unsuccessful dependency",
+                        task.id
+                    )));
+                }
+                let reason_matches = record.reason.as_deref().is_some_and(|reason| {
+                    task.depends_on.iter().any(|dependency| {
+                        let status = statuses[dependency.as_str()];
+                        status.is_terminal()
+                            && status != TaskStatus::Succeeded
+                            && reason == format!("dependency {dependency} did not succeed")
+                    })
+                });
+                if !reason_matches {
+                    return Err(RunError::State(format!(
+                        "blocked task {:?} has an inconsistent reason",
+                        task.id
+                    )));
+                }
+            }
+            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled => {
+                if let Some(dependency) = task
+                    .depends_on
+                    .iter()
+                    .find(|dependency| statuses[dependency.as_str()] != TaskStatus::Succeeded)
+                {
+                    return Err(RunError::State(format!(
+                        "executed task {:?} has dependency {dependency:?} that did not succeed",
+                        task.id
+                    )));
+                }
+            }
+            TaskStatus::Running | TaskStatus::Indeterminate => {
+                unreachable!("unsafe task statuses are rejected before dependency validation")
+            }
         }
     }
     Ok(())
@@ -1719,7 +1907,7 @@ fn truncate(value: &str, maximum: usize) -> String {
     value[..end].to_owned()
 }
 
-fn render(path: &Path, state: RunState) -> RunOutput {
+fn render(path: &Path, state: RunState) -> RunResult {
     let mut human = format!(
         "Run {}: {}\nState: {}\nTasks:",
         state.run_id,
@@ -1735,12 +1923,16 @@ fn render(path: &Path, state: RunState) -> RunOutput {
             human.push_str(&format!(" [{}]", supervisor_path));
         }
     }
-    RunOutput {
-        human,
-        data: json!({
-            "state_path": path.to_string_lossy(),
-            "run": state,
-        }),
+    let status = state.status;
+    RunResult {
+        status,
+        output: RunOutput {
+            human,
+            data: json!({
+                "state_path": path.to_string_lossy(),
+                "run": state,
+            }),
+        },
     }
 }
 

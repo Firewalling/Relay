@@ -387,6 +387,109 @@ func TestSupervisorMainAllowsDirectInvocationWithoutReadinessDescriptor(t *testi
 	}
 }
 
+func TestSupervisorMainDirectInvocationExitsOnSignalWhileRequestIsIncomplete(t *testing.T) {
+	directory := t.TempDir()
+	childMarker := filepath.Join(directory, "child-started")
+	statePath := filepath.Join(directory, "state.json")
+	request := protocol.ExecutionRequest{
+		ProtocolVersion:              protocol.ProtocolVersion,
+		RunID:                        "direct-incomplete-request",
+		Program:                      "/usr/bin/touch",
+		Arguments:                    []string{childMarker, strings.Repeat("x", 256<<10)},
+		RedactArgumentIndexes:        []int{},
+		WorkingDirectory:             directory,
+		Environment:                  []protocol.EnvironmentVariable{},
+		TerminationGraceMilliseconds: 100,
+		StdoutLimitBytes:             1024,
+		StderrLimitBytes:             1024,
+		LogLimitBytes:                1024,
+		StatePath:                    statePath,
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	payload = payload[:len(payload)-1]
+
+	socketDescriptors, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("create stdin socketpair: %v", err)
+	}
+	if err := syscall.SetsockoptInt(socketDescriptors[0], syscall.SOL_SOCKET, syscall.SO_SNDBUF, 1024); err != nil {
+		t.Fatalf("limit stdin socket send buffer: %v", err)
+	}
+	launcherInput := os.NewFile(uintptr(socketDescriptors[0]), "launcher-stdin")
+	supervisorInput := os.NewFile(uintptr(socketDescriptors[1]), "supervisor-stdin")
+	defer launcherInput.Close()
+
+	command := exec.Command(os.Args[0], "-test.run=^TestSupervisorMainHelper$")
+	command.Env = []string{supervisorMainHelperEnvironment + "=1"}
+	command.Stdin = supervisorInput
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		_ = supervisorInput.Close()
+		t.Fatalf("start helper: %v", err)
+	}
+	defer func() {
+		if command.ProcessState == nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	}()
+	if err := supervisorInput.Close(); err != nil {
+		t.Fatalf("close parent supervisor stdin: %v", err)
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := launcherInput.Write(payload)
+		writeDone <- err
+	}()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("write incomplete request: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("helper did not begin reading the incomplete request")
+	}
+
+	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal helper: %v", err)
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- command.Wait() }()
+	select {
+	case err := <-waitDone:
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) {
+			t.Fatalf("helper exit = %v; stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+		}
+		status, ok := exitError.ProcessState.Sys().(syscall.WaitStatus)
+		if !ok || !status.Signaled() || status.Signal() != syscall.SIGTERM {
+			t.Fatalf("helper exit status = %v, want SIGTERM; stdout=%q stderr=%q", status, stdout.String(), stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		_ = command.Process.Kill()
+		<-waitDone
+		t.Fatal("direct helper did not exit after SIGTERM")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("helper stdout = %q", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("helper stderr = %q", stderr.String())
+	}
+	if _, err := os.Stat(statePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("incomplete request created execution state; state stat error = %v", err)
+	}
+	if _, err := os.Stat(childMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("incomplete request started child; marker stat error = %v", err)
+	}
+}
+
 func TestSupervisorMainHandlesClosedStdoutWithoutSIGPIPEExit(t *testing.T) {
 	directory := t.TempDir()
 	request := protocol.ExecutionRequest{

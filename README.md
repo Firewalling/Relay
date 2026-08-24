@@ -139,11 +139,15 @@ treat the Go file as aggregate state. Resume validates the persisted path
 without requiring the resumed invocation to use the same `TMPDIR`.
 
 Human output prints the run ID and status, aggregate state path, and each
-task's status, reason, and Go state path. `relay --json run ...` returns the
-normal output-schema-v1 envelope; inspect `data.state_path` and
-`data.run.tasks`. A successfully completed scheduling operation can have
-`ok: true` even when `data.run.status` is `failed`, so automation must inspect
-the run status and task records rather than only the CLI envelope.
+task's status, reason, and Go state path. Shell exit is zero only when the
+aggregate status is `completed`. `failed` (including blocked descendants) and
+`cancelled` runs exit nonzero but still return the normal `ok: true`
+output-schema-v1 envelope on stdout, with the full persisted state under
+`data.run`; this keeps task outcome distinct from coordinator failure while
+making `relay run ... && deploy` safe. An indeterminate supervisor boundary
+failure instead exits nonzero and returns `ok: false` on stderr with
+`error.code: "run_supervisor"` plus the full persisted state under `data.run`
+and its canonical path under `data.state_path`.
 
 Resume always requires the original plan:
 
@@ -273,8 +277,9 @@ See the [orchestration process protocol](docs/orchestration-protocol.md) for
 the exact versioned manifest, one-child execution request/result, lifecycle,
 environment policy, limits, persistence, platform support, and security
 requirements. That immutable protocol-v1 manifest continues to report
-`orchestrator.implemented: false`: it describes the Rust/Go one-child boundary
-and advertises neither `relay run` nor the `relay supervise` CLI surface.
+`orchestrator.owner: "go"` and `orchestrator.implemented: false` for a future
+external orchestrator capability. It advertises neither the Rust-owned built-in
+`relay run` coordinator nor the `relay supervise` CLI surface.
 Allowed Git-aware Rust operations may invoke `git`; existing note editor
 behavior remains outside protocol v1.
 

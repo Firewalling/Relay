@@ -28,6 +28,11 @@ type executor interface {
 }
 
 func main() {
+	_, relayLaunched := os.LookupEnv(supervisorReadyEnvironment)
+	if !relayLaunched {
+		os.Exit(runDirect(os.Stdin, os.Stdout, os.Stderr, supervisor.NewRunner()))
+	}
+
 	executionContext, stop := signal.NotifyContext(context.Background(), terminationSignals()...)
 	executionContext = supervisor.WithCancellationSource(executionContext, "supervisor_signal")
 	if err := emitSupervisorReady(); err != nil {
@@ -91,25 +96,58 @@ func emitSupervisorReady() (resultErr error) {
 	return nil
 }
 
+func runDirect(stdin io.Reader, stdout, stderr io.Writer, runner executor) int {
+	request, exitCode, ok := readExecutionRequest(stdin, stderr)
+	if !ok {
+		return exitCode
+	}
+	executionContext, stop := signal.NotifyContext(context.Background(), terminationSignals()...)
+	defer stop()
+	executionContext = supervisor.WithCancellationSource(executionContext, "supervisor_signal")
+	return executeRequest(executionContext, request, stdout, stderr, runner)
+}
+
 func run(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, runner executor) int {
+	request, exitCode, ok := readExecutionRequest(stdin, stderr)
+	if !ok {
+		return exitCode
+	}
+	return executeRequest(ctx, request, stdout, stderr, runner)
+}
+
+func readExecutionRequest(stdin io.Reader, stderr io.Writer) (protocol.ExecutionRequest, int, bool) {
 	if _, err := protocol.CanonicalManifest(); err != nil {
-		return emitError(stderr, "protocol_failure", fmt.Sprintf("invalid embedded Relay protocol manifest: %v", err))
+		exitCode := emitError(stderr, "protocol_failure", fmt.Sprintf("invalid embedded Relay protocol manifest: %v", err))
+		return protocol.ExecutionRequest{}, exitCode, false
 	}
 	payload, err := io.ReadAll(io.LimitReader(stdin, maximumRequestBytes+1))
 	if err != nil {
-		return emitError(stderr, "protocol_failure", "could not read execution request")
+		exitCode := emitError(stderr, "protocol_failure", "could not read execution request")
+		return protocol.ExecutionRequest{}, exitCode, false
 	}
 	if int64(len(payload)) > maximumRequestBytes {
-		return emitError(stderr, "protocol_failure", fmt.Sprintf("execution request exceeds %d bytes", maximumRequestBytes))
+		exitCode := emitError(stderr, "protocol_failure", fmt.Sprintf("execution request exceeds %d bytes", maximumRequestBytes))
+		return protocol.ExecutionRequest{}, exitCode, false
 	}
 	request, err := protocol.DecodeExecutionRequest(bytes.NewReader(payload))
 	if err != nil {
 		var unsupported protocol.UnsupportedProtocolVersionError
 		if errors.As(err, &unsupported) {
-			return emitError(stderr, "unsupported_protocol_version", err.Error())
+			exitCode := emitError(stderr, "unsupported_protocol_version", err.Error())
+			return protocol.ExecutionRequest{}, exitCode, false
 		}
-		return emitError(stderr, "protocol_failure", err.Error())
+		exitCode := emitError(stderr, "protocol_failure", err.Error())
+		return protocol.ExecutionRequest{}, exitCode, false
 	}
+	return request, 0, true
+}
+
+func executeRequest(
+	ctx context.Context,
+	request protocol.ExecutionRequest,
+	stdout, stderr io.Writer,
+	runner executor,
+) int {
 	result, err := runner.Execute(ctx, request)
 	if err != nil {
 		return emitError(stderr, "protocol_failure", err.Error())

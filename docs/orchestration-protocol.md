@@ -124,11 +124,12 @@ stdin data.
   cleanup, and one versioned attempt record outside `.relay`. It supervises
   one child and never schedules DAG tasks or reads or writes Rust project state.
 - **The externally advertised orchestrator remains unimplemented.** The
-  immutable manifest still reports `orchestrator.implemented: false` because it
-  describes the external process-operation contract and does not advertise the
-  built-in `run` command. The built-in coordinator does not retroactively
-  change that contract. Advertising it, advertising parallel execution, or
-  changing allowed operations requires a future protocol version and fixtures.
+  immutable manifest's `orchestrator.owner: "go"` and `implemented: false`
+  describe a future external process-operation capability; they do not assign
+  the built-in scheduler to Go. Protocol v1 does not advertise the built-in
+  Rust `run` command, so that coordinator does not retroactively change the
+  manifest. Advertising it, advertising parallel execution, or changing
+  allowed operations requires a future protocol version and fixtures.
 - **Lua** remains the owner of a future workflow layer and remains
   `implemented: false`; there is no workflow language, parser, runtime, or
   sandbox.
@@ -210,11 +211,15 @@ private, safe temporary directory. The aggregate stores the Go record path as
 a reference. Go never reads or writes `.relay`, and Rust does not use the
 attempt record to reconstruct or override aggregate state.
 
-JSON success output contains `{ "state_path": ..., "run": ... }`. Human output
-reports the run ID and status plus each task's status, bounded reason, and Go
-record path when an attempt exists. A clean coordinator completion uses the
-ordinary success envelope even when the aggregate run status is `failed` or
-`cancelled`; callers must inspect `run.status` and task records.
+JSON task-outcome output contains `{ "state_path": ..., "run": ... }`, with
+`run` equal to the full persisted aggregate state. Human output reports the run
+ID and status plus each task's status, bounded reason, and Go record path when
+an attempt exists. Only `completed` exits zero. A clean `failed` or `cancelled`
+coordinator result exits nonzero but retains the ordinary `ok: true` success
+envelope on stdout, distinguishing a known task outcome from a Relay error. A
+supervisor boundary failure exits nonzero with an `ok: false`, `run_supervisor`
+error envelope on stderr whose `data` contains the same `state_path` and full
+persisted `run`, now marked `indeterminate`.
 
 ### Scheduling, failure, cancellation, and resume
 
@@ -230,10 +235,11 @@ attempt instead halts coordination without claiming or propagating an outcome.
 Catchable `SIGINT` or `SIGTERM` is forwarded through the Rust launcher to the
 active Go supervisor. A clean cancellation result marks that task `cancelled`,
 blocks its dependants, persists aggregate state, and stops scheduling further
-tasks in that invocation. A supervisor transport or response-protocol failure
-after launch marks the active task and run `indeterminate`, persists that fact,
-and returns an application error. Rust does not claim the child outcome in that
-case.
+tasks in that invocation. Any supervisor transport or response-protocol failure
+after Rust has durably marked the attempt `running` makes the task and run
+`indeterminate`, including a launcher failure before child spawn. Relay persists
+that uncertainty and returns an application error without claiming a child
+outcome.
 
 Resume always requires the caller to provide the plan again. Rust compares its
 sanitized form with the persisted plan, validates task identity and aggregate
@@ -268,20 +274,24 @@ supervisor infrastructure failures produce one output-schema-v1 error envelope
 on stderr and a nonzero supervisor exit. There is no JSON Lines stream or
 second child.
 
-The executable installs catchable `SIGINT`/`SIGTERM` handling and tags that
-cancellation source before validating the embedded canonical manifest or
-reading request framing. The bundled Rust launcher supplies the private
-`RELAY_SUPERVISOR_READY_FD` transport. Go strictly parses it as an inherited
-descriptor of 3 or greater, writes exactly one ASCII `R` readiness byte after
-signal registration, and then waits without reading the already-buffered
-request. Rust publishes the supervisor PID, enables forwarding, forwards any
-latched signal, writes exactly one ASCII `A`, and closes its endpoint. Go
-requires that exact `A` followed by EOF before it closes its endpoint and
-proceeds. An invalid descriptor or any write, acknowledgement, trailing-data,
-or close failure produces the ordinary structured error on stderr and a
-nonzero exit; the supervisor never reads or executes the request. The variable
-may be absent for direct, manual invocation and may be ignored by older or
-custom protocol-v1 supervisors.
+When launched through Rust, the executable installs catchable
+`SIGINT`/`SIGTERM` handling and tags that cancellation source before the private
+`RELAY_SUPERVISOR_READY_FD` handshake or request framing. Go strictly parses
+the inherited descriptor as 3 or greater, writes exactly one ASCII `R`
+readiness byte after signal registration, and then waits without reading the
+already-buffered request. Rust publishes the supervisor PID, enables
+forwarding, forwards any latched signal, writes exactly one ASCII `A`, and
+closes its endpoint. Go requires that exact `A` followed by EOF before it closes
+its endpoint and proceeds. An invalid descriptor or any write,
+acknowledgement, trailing-data, or close failure produces the ordinary
+structured error on stderr and a nonzero exit; the supervisor never reads or
+executes the request.
+
+For direct manual invocation without the readiness variable, request framing is
+read and decoded with the operating system's default signal disposition, so
+`SIGINT` or `SIGTERM` terminates promptly even while stdin remains open. Signal
+cancellation handling is installed after a complete valid request is decoded
+and before its child execution begins.
 
 For the bundled supervisor, this two-way barrier means Go owns
 `SIGINT`/`SIGTERM` before advertising `R`, while `A` proves Rust has made that

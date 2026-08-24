@@ -53,9 +53,9 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run a persisted task plan through the external Relay supervisor.
+    /// Run a persisted task plan through the built-in Rust coordinator and Go one-child supervisor.
     Run(RunArgs),
-    /// Run one absolute program through the external Relay supervisor.
+    /// Run one absolute program through the Rust launcher and Go one-child supervisor.
     Supervise(SuperviseArgs),
     /// Prints the negotiated, versioned Rust/Go process contract and launches nothing.
     Protocol,
