@@ -7,11 +7,13 @@ use chrono::Utc;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(any(debug_assertions, not(target_os = "linux")))]
+use std::fs::OpenOptions;
 use std::{
     collections::{HashMap, HashSet},
     env,
     ffi::OsStr,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
 };
@@ -499,6 +501,7 @@ fn preflight_tasks(
     Ok(())
 }
 
+#[cfg(debug_assertions)]
 fn test_pause(point: &str) -> Result<(), RunError> {
     if env::var_os("RELAY_TEST_RUN_PAUSE").as_deref() != Some(OsStr::new(point)) {
         return Ok(());
@@ -522,6 +525,11 @@ fn test_pause(point: &str) -> Result<(), RunError> {
     while !release.exists() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn test_pause(_point: &str) -> Result<(), RunError> {
     Ok(())
 }
 

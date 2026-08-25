@@ -1513,6 +1513,7 @@ fn one_aggregate_state_path_allows_only_one_coordinator() {
     run_document(&first_output);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn race_created_initial_state_is_not_overwritten() {
     let harness = Harness::new();
@@ -1552,6 +1553,45 @@ fn race_created_initial_state_is_not_overwritten() {
     assert!(harness.requests().is_empty());
 }
 
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_build_ignores_orchestration_pause_environment() {
+    for pause in [
+        "before_initial_install",
+        "before_supervisor_launch",
+        "after_supervisor_result",
+    ] {
+        let harness = Harness::new();
+        let plan = harness.plan(pause, json!([task("only", &[])]));
+        let state_path = harness.state(pause);
+        let marker = harness.directory.path().join(format!("{pause}.marker"));
+        let release = harness.directory.path().join(format!("{pause}.release"));
+        fs::write(&release, b"release\n").unwrap();
+
+        let output = harness
+            .command()
+            .env("RELAY_TEST_RUN_PAUSE", pause)
+            .env("RELAY_TEST_RUN_MARKER", &marker)
+            .env("RELAY_TEST_RUN_RELEASE", &release)
+            .args([
+                "--json",
+                "run",
+                "--supervisor",
+                harness.supervisor.to_str().unwrap(),
+                "--state-path",
+                state_path.to_str().unwrap(),
+                plan.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run release coordinator with inherited pause variables");
+
+        run_document(&output);
+        assert!(!marker.exists(), "release build reacted at {pause}");
+        assert_eq!(read_state(&state_path)["status"], "completed");
+    }
+}
+
+#[cfg(debug_assertions)]
 #[test]
 fn cancellation_before_launch_and_after_result_preserves_resumable_work() {
     for pause in ["before_supervisor_launch", "after_supervisor_result"] {
