@@ -4,10 +4,11 @@
 
 Relay contains a Rust CLI for recording project-local work sessions,
 checkpoints, categorized notes, handoffs, and bounded context for the next
-terminal agent, plus `relay supervise`, a Rust launcher for one explicitly
-requested local child process through the standalone Go supervisor. The Rust
-CLI does not implement an agent or model runtime, call model-provider APIs,
-inspect chat transcripts, or replace Git; the launcher is not a scheduler or orchestrator.
+terminal agent. It also provides a Rust-owned, one-shot `relay run` coordinator
+for deterministic sequential DAG plans and `relay supervise`, a Rust launcher
+for one explicitly requested local child process through the standalone Go
+supervisor. Relay does not implement an agent or model runtime, call
+model-provider APIs, inspect chat transcripts, or replace Git.
 
 ## Prerequisites and installation
 
@@ -43,6 +44,126 @@ go build -o relay-supervisor ./cmd/relay-supervisor
 `PATH` for the supervisor.
 Ensure `$HOME/.local/bin` is on `PATH` if that is where you install Relay;
 Relay does not currently claim prebuilt packages or a crates.io release.
+
+## Run a sequential task plan
+
+```sh
+relay run [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>
+relay run [--supervisor <ABSOLUTE_PATH>] --resume <ABSOLUTE_STATE_PATH> <PLAN>
+```
+
+`PLAN` is a JSON file. A new run accepts an optional absolute aggregate
+`--state-path`; `--state-path` and `--resume` are mutually exclusive. Supervisor
+discovery follows the same rules as `relay supervise`. Programs and working
+directories in the plan must be absolute. Arguments are passed directly as
+distinct argv elements: Relay never invokes or evaluates a shell. On the
+initial run, a task without `working_directory` uses Relay's invocation
+directory; that resolved absolute directory is persisted and reused on resume.
+
+Plan schema v1 is closed, so unknown fields are errors. This complete two-task
+plan creates a marker and verifies it:
+
+```json
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "prepare",
+      "depends_on": [],
+      "program": "/usr/bin/touch",
+      "arguments": ["/absolute/path/to/project/build.ready"],
+      "working_directory": "/absolute/path/to/project",
+      "timeout_ms": 10000,
+      "termination_grace_ms": 2000,
+      "stdout_limit_bytes": 1048576,
+      "stderr_limit_bytes": 1048576,
+      "log_limit_bytes": 65536,
+      "redact_argument_indexes": []
+    },
+    {
+      "id": "verify",
+      "depends_on": ["prepare"],
+      "program": "/usr/bin/test",
+      "arguments": ["-f", "/absolute/path/to/project/build.ready"],
+      "working_directory": "/absolute/path/to/project",
+      "timeout_ms": 10000,
+      "termination_grace_ms": 2000,
+      "stdout_limit_bytes": 1048576,
+      "stderr_limit_bytes": 1048576,
+      "log_limit_bytes": 65536,
+      "redact_argument_indexes": []
+    }
+  ]
+}
+```
+
+Plans contain 1–64 tasks in stable input order. IDs must be unique and match
+`[A-Za-z0-9][A-Za-z0-9._-]{0,47}`. `depends_on` defaults to `[]`; every named
+dependency must exist, may appear only once, cannot name the task itself, and
+the graph must be acyclic. `arguments` and `redact_argument_indexes` also
+default to `[]`. `timeout_ms` is required, finite, and between 1 ms and 24
+hours. The optional limits shown above are their defaults; termination grace
+may be 1–60,000 ms, stdout and stderr retention 1 byte–8 MiB each, and log
+retention 1 byte–4 MiB. Redaction indexes are zero-based indexes into
+`arguments`.
+
+Execution is deterministic and currently strictly sequential: the effective
+maximum parallelism is one, and Relay selects the first input-order pending
+task whose dependencies all succeeded. Only a supervisor result classified
+`completed`/`exit_zero` with exit code `0` succeeds. A nonzero exit, start
+failure, timeout, or kill fails the task. Cancellation stops the current
+invocation. If a task is active, Relay records its cancelled supervisor result;
+if the signal arrives between tasks, completed results remain completed.
+Not-yet-launched independent tasks stay pending. A failed or cancelled task
+blocks only its descendants, while independent ready tasks continue in input
+order after ordinary failures. A supervisor boundary error after the attempt is
+recorded as running makes the task and run `indeterminate`. The aggregate status
+is `completed` only when every task succeeds, `failed` when terminal work
+includes a failure or blocked descendant, `cancelled` when the invocation
+records cancellation, and `indeterminate` when certainty is lost.
+
+Rust atomically owns the aggregate record. Its default path is
+`<project>/.relay/runs/<run-uuid>.json`, where `<project>` is selected by the
+global scope rules; an explicit new-run path must be absolute. The aggregate
+contains run status, timestamps, ordered task records, clean execution
+summaries, and each attempt's Go state reference. It stores a sanitized copy of
+the plan: argument values named by `redact_argument_indexes` become
+`<redacted>`, so those declared raw values are not copied there. Review all
+other plan fields and captured process output for secrets. Each task attempt
+has a fresh UUID and a separate Go-owned record under
+`${TMPDIR}/relay/supervisor/<attempt-uuid>.json`; validation guarantees that
+path is outside Rust-owned `.relay`, but `TMPDIR` itself may point inside the
+selected project. Callers handling sensitive captured output should choose a
+private, safe temporary directory. Rust records the absolute path but does not
+treat the Go file as aggregate state. Resume validates the persisted path
+without requiring the resumed invocation to use the same `TMPDIR`.
+
+Human output prints the run ID and status, aggregate state path, and each
+task's status, reason, and Go state path. Shell exit is zero only when the
+aggregate status is `completed`. `failed` (including blocked descendants) and
+`cancelled` runs exit nonzero but still return the normal `ok: true`
+output-schema-v1 envelope on stdout, with the full persisted state under
+`data.run`; this keeps task outcome distinct from coordinator failure while
+making `relay run ... && deploy` safe. An indeterminate supervisor boundary
+failure instead exits nonzero and returns `ok: false` on stderr with
+`error.code: "run_supervisor"` plus the full persisted state under `data.run`
+and its canonical path under `data.state_path`.
+
+Resume always requires the original plan:
+
+```sh
+relay run --resume /absolute/path/to/run.json plan.json
+```
+
+Relay validates the record and compares the supplied sanitized plan with the
+persisted sanitized plan. Any plan containing `redact_argument_indexes` is
+non-resumable because Relay does not persist the redacted argument values. For
+resumable plans, Relay clears the prior invocation's run-level cancellation
+intent and never reruns `succeeded`, `failed`, `cancelled`, `blocked`, `running`,
+or `indeterminate` tasks; only still-`pending` independent work may continue.
+Resume is refused if any task is `running` or `indeterminate`, if the plan/task
+identities differ, or if state is inconsistent. There are no retries and no
+crash-safe reattachment to an active or uncertain attempt.
 
 ## Supervise one process
 
@@ -142,6 +263,11 @@ Relay supports these commands:
   `observation`, or `next_action`.
 - `context` emits bounded, recorded agent context; its filters are described
   below.
+- `run [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>`
+  executes a new sequential plan; replace `--state-path` with
+  `--resume <ABSOLUTE_STATE_PATH>` to continue only safe pending work.
+- `supervise [OPTIONS] -- <ABSOLUTE_PROGRAM> [ARG...]` launches one local
+  process through the external Go supervisor.
 - `doctor [--repair]` diagnoses storage consistency.
 - `completions <SHELL>` prints a Bash, Zsh, or Fish completion script.
 - `protocol` reports the project-independent, read-only orchestration process
@@ -150,9 +276,10 @@ Relay supports these commands:
 See the [orchestration process protocol](docs/orchestration-protocol.md) for
 the exact versioned manifest, one-child execution request/result, lifecycle,
 environment policy, limits, persistence, platform support, and security
-requirements. `relay supervise` is a one-child launcher, not an orchestrator:
-the immutable protocol-v1 manifest continues to report
-`orchestrator.implemented: false` and does not advertise launcher capability.
+requirements. That immutable protocol-v1 manifest continues to report
+`orchestrator.owner: "go"` and `orchestrator.implemented: false` for a future
+external orchestrator capability. It advertises neither the Rust-owned built-in
+`relay run` coordinator nor the `relay supervise` CLI surface.
 Allowed Git-aware Rust operations may invoke `git`; existing note editor
 behavior remains outside protocol v1.
 
@@ -305,6 +432,12 @@ are then limited to that subtree; sibling package changes do not affect its
 cleanliness. Use `--scope repository` when the whole worktree is one Relay
 project.
 
+`relay run` uses this selected project only to place its default aggregate
+record under `.relay/runs/`; task working directories still default to the
+invocation directory. An explicit aggregate state path may be elsewhere.
+`relay supervise` remains project-independent and neither discovers nor reads
+`.relay`.
+
 ## Files, compatibility, migration, and locking
 
 Relay's inspectable project-local layout is:
@@ -321,6 +454,8 @@ Relay's inspectable project-local layout is:
 │   └── <timestamp>-<id>.md
 ├── operations/
 │   └── <operation-id>.json
+├── runs/
+│   └── <run-id>.json
 ├── lock
 └── summary-<session-id>.md
 ```
@@ -343,11 +478,21 @@ events are appended as synced, newline-terminated records. An interruption can
 leave an operation marker or durable partial effects; Relay preserves them for
 diagnosis rather than guessing how to roll them back.
 
+Run aggregates use their own adjacent advisory lock and atomic replacement;
+they do not use the session mutation lock. The referenced per-attempt
+supervisor records are under `${TMPDIR}/relay/supervisor/`. Validation
+guarantees that they remain outside Rust-owned `.relay`, but `TMPDIR` itself
+may point inside the selected project. Callers handling sensitive captured
+output should choose a private, safe temporary directory.
+
 Choose your own version-control policy for `.relay/`. Ignore it for private
 local coordination, or intentionally share selected artifacts after reviewing
-their contents. Goals, notes, handoffs, summaries, branch names, commit IDs, and
-changed paths can contain sensitive information. Relay provides no encryption,
-redaction policy beyond context-path privacy, hosted sync, or access control.
+their contents. Goals, notes, handoffs, summaries, branch names, commit IDs,
+changed paths, plans, and process summaries can contain sensitive information.
+Relay provides no encryption, hosted sync, or access control. Run-plan
+redaction covers only explicitly indexed argument values in the sanitized
+aggregate plan; it is not a general redaction policy and does not sanitize
+other fields or captured output.
 
 ## Git behavior and operations
 
@@ -357,9 +502,10 @@ on Unix are rendered deterministically. Outside Git, lifecycle commands work
 and report Git fields as unavailable.
 
 Relay invokes read-only Git queries only. It never commits, stages, stashes,
-checks out, resets, rewrites history, pushes, or edits working files. Relay
-mutates only its selected `.relay/` storage and user-requested completion
-redirection targets.
+checks out, resets, rewrites history, or pushes. Session commands mutate the
+selected `.relay/` storage, a run may write its explicit aggregate path and
+Go-owned temporary records, and `relay run`/`relay supervise` execute the
+requested child programs with the caller's filesystem permissions.
 
 ## Doctor and recovery
 
@@ -377,15 +523,20 @@ back up `.relay/`, and resolve such damage manually.
 
 ## Current limitations
 
-Relay supports one active Rust session per selected project. Through
-`relay supervise`, the Go component supervises one local child per invocation
-on Linux; there is no queue, retries, remote execution, or multi-child
-orchestration. Relay has no daemon, TUI, hosted synchronization, provider
-integration, transcript import, automatic source inspection, semantic search,
-encryption, Lua runtime, or automatic recovery of ambiguous interrupted
-operations. Advisory locks depend on filesystem lock support. Context is
-deterministic selection and formatting, not model-generated summarization.
-Packaging is currently source installation or locally built binaries.
+Relay supports one active Rust session per selected project. On Linux,
+`relay run` coordinates a DAG but executes at most one task at a time; bounded
+parallelism above one is not implemented yet. The separate Go supervisor still
+owns exactly one local child per invocation/attempt. There are no retries,
+queue service, daemon, network or remote execution, model/provider runtime,
+transcript import, shell evaluation, Lua runtime, sandbox, or crash-safe
+reattachment to running or indeterminate work. Process-group cleanup cannot
+guarantee orphan freedom when a child escapes through `setsid`, self-regrouping,
+or an equivalent boundary. Relay also has no TUI, hosted synchronization,
+automatic source inspection, semantic search, encryption, or automatic
+recovery of ambiguous interrupted session operations. Advisory locks depend on
+filesystem lock support. Context is deterministic selection and formatting,
+not model-generated summarization. Packaging is currently source installation
+or locally built binaries.
 
 The files under `openspec/` describe development intent only. Relay has no
 runtime OpenSpec dependency.

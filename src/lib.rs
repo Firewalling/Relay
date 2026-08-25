@@ -3,6 +3,7 @@ pub mod cli;
 pub mod git;
 pub mod lock;
 pub mod model;
+pub mod orchestrate;
 pub mod project;
 pub mod storage;
 pub mod supervise;

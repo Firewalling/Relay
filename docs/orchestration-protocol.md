@@ -1,18 +1,20 @@
 # Relay orchestration process protocol v1
 
-Relay exposes a negotiated, versioned process boundary for a possible future
-orchestrator. The read-only `relay protocol` command reports compiled
+Relay exposes a negotiated, versioned external process boundary for a possible
+future orchestrator. The read-only `relay protocol` command reports compiled
 capabilities without discovering a project, reading or validating `.relay`, or
 creating files. The canonical v1 manifest is
 [`protocol/manifest-v1.json`](../protocol/manifest-v1.json).
 
-Relay also includes `relay supervise`, a project-independent Rust launcher for
-the standalone Go one-child supervisor at `cmd/relay-supervisor`. It is not
-advertised by manifest v1 and is not an orchestrator, scheduler, queue, daemon,
-remote executor, or Lua runtime. Child termination and child-output capture
-remain exclusively in Go rather than being duplicated by the launcher. Allowed
-Git-aware Rust operations may invoke `git`; existing note editor behavior
-remains outside protocol v1.
+Relay also includes two capabilities that manifest v1 does not advertise:
+`relay supervise`, a project-independent Rust launcher for the standalone Go
+one-child supervisor at `cmd/relay-supervisor`, and the built-in Rust
+`relay run` sequential DAG coordinator described separately below. Go
+supervises one child attempt; it is not a scheduler, queue, daemon, remote
+executor, or Lua runtime. Child termination and child-output capture remain
+exclusively in Go rather than being duplicated by Rust. Allowed Git-aware Rust
+operations may invoke `git`; existing note editor behavior remains outside
+protocol v1.
 
 ## Negotiation and versions
 
@@ -110,25 +112,155 @@ stdin data.
 ## Component responsibilities
 
 - **Rust** owns all `.relay` state, state validation, locking, Relay command
-  behavior, JSON envelopes, protocol manifest reporting, and the
-  project-independent `supervise` launcher. Schema-v1 state remains the source
-  of truth. Rust never reads or writes Go run records.
+  behavior, JSON envelopes, protocol manifest reporting, the
+  project-independent `supervise` launcher, and the built-in sequential DAG
+  coordinator. Rust exclusively owns aggregate coordinator state, including
+  the default project path under `.relay/runs`; it never writes Go attempt
+  records and reads only the bounded identity fields needed for the legacy-v1
+  startup proof described below.
 - **Go** owns strict decoding of the canonical manifest, one versioned
   execution request, direct process launch, filtered child environments,
-  bounded output metadata, cancellation and timeout handling, process-tree
-  cleanup, and versioned run records outside `.relay`.
-- **Orchestration and scheduling remain unimplemented.** The immutable
-  manifest still reports `orchestrator.implemented: false`: a one-child
-  launcher is not scheduling or orchestration. Manifest v1 does not advertise
-  launcher capability; advertising it or changing allowed operations requires
-  a future manifest version.
+  bounded output metadata, cancellation and timeout handling, process-group
+  cleanup, and one versioned attempt record outside `.relay`. It supervises
+  one child and never schedules DAG tasks or reads or writes Rust project state.
+- **The externally advertised orchestrator remains unimplemented.** The
+  immutable manifest's `orchestrator.owner: "go"` and `implemented: false`
+  describe a future external process-operation capability; they do not assign
+  the built-in scheduler to Go. Protocol v1 does not advertise the built-in
+  Rust `run` command, so that coordinator does not retroactively change the
+  manifest. Advertising it, advertising parallel execution, or changing
+  allowed operations requires a future protocol version and fixtures.
 - **Lua** remains the owner of a future workflow layer and remains
   `implemented: false`; there is no workflow language, parser, runtime, or
   sandbox.
 
-The Go records are a separately versioned, subordinate execution contract, not
-an extension to Rust state or to `manifest-v1.json`. Existing Rust commands,
-schema-v1 projects, and protocol-v1 consumers therefore remain compatible.
+The Rust aggregate run-state schema and Go attempt-record schema are separately
+versioned subordinate contracts, not extensions to Rust's existing project
+state schema or to `manifest-v1.json`. Existing Rust commands, schema-v1
+projects, and protocol-v1 consumers therefore remain compatible.
+
+## Built-in Rust sequential DAG coordinator
+
+`relay run` is a one-shot, project-scoped Rust coordinator above the typed
+one-child supervisor boundary:
+
+```text
+relay run [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>
+relay run [--supervisor <ABSOLUTE_PATH>] --resume <ABSOLUTE_STATE_PATH> <PLAN>
+```
+
+Rust reads the plan from `PLAN`, discovers the current project for its default
+aggregate state location, and uses the invocation directory as a task's
+working directory unless that task supplies an absolute one. Every task is
+launched by direct argv: `program` and each `arguments` element remain separate
+OS arguments and are never parsed, interpolated, or evaluated by a shell.
+
+### Closed plan v1
+
+Plan JSON is a closed schema that rejects unknown fields:
+
+```json
+{"schema_version": 1, "tasks": [{"id": "build", "program": "/usr/bin/make", "timeout_ms": 60000}]}
+```
+
+`tasks` contains 1–64 entries in stable input order. Each task has a unique ID
+matching `[A-Za-z0-9][A-Za-z0-9._-]{0,47}`, optional `depends_on`, an absolute
+`program`, default-empty `arguments`, an optional absolute
+`working_directory`, and a required finite `timeout_ms` from 1 ms through 24
+hours. Dependencies must exist, cannot repeat or refer to the task itself, and
+the graph must be acyclic.
+
+The optional execution controls are `termination_grace_ms` (default 2,000;
+maximum 60,000), `stdout_limit_bytes` and `stderr_limit_bytes` (default 1 MiB
+each; maximum 8 MiB each), `log_limit_bytes` (default 64 KiB; maximum 4 MiB),
+and `redact_argument_indexes` (at most 32 valid, unique indexes whose declared
+values total at most 64 KiB). All numeric limits have a minimum of one. The
+plan document is bounded to 1 MiB and NUL bytes are rejected in executable,
+working-directory, and argument strings.
+
+### Aggregate and attempt state ownership
+
+Aggregate run-state v1 is also a closed Rust schema. By default Rust atomically
+persists it at `<project>/.relay/runs/<run-uuid>.json`; `--state-path` selects
+an absolute custom path, which remains Rust-owned. A custom path containing a
+`.relay` component is accepted only beneath the current project's
+`.relay/runs` directory. Symlinked state-path components are rejected, an
+adjacent advisory lock prevents two coordinators from owning the same run, and
+resume reads are bounded to 4 MiB.
+
+The aggregate contains schema and run identity, creation/update timestamps,
+run status, the ordered task records, and a sanitized copy of the closed plan.
+Run status is one of `running`, `completed`, `failed`, `cancelled`, or
+`indeterminate`; task status is one of `pending`, `running`, `succeeded`,
+`failed`, `cancelled`, `blocked`, or `indeterminate`. Closed decoding and
+resume validation reject unknown status values and inconsistent aggregate/task
+state.
+Arguments selected by `redact_argument_indexes` are stored as `<redacted>`;
+raw declared values are not copied into aggregate state. Before a task starts,
+Rust persists `running` plus a fresh attempt UUID and its Go record path. After
+a clean typed supervisor response, Rust persists only a bounded execution
+summary—lifecycle, reason/failure, exit code, timestamps/duration, stream byte
+counts and truncation flags, and cancellation state—not captured stream text or
+environment values.
+
+Each attempt's complete Go-owned record is under
+`${TMPDIR}/relay/supervisor/<attempt-uuid>.json`. Validation guarantees that
+path is outside Rust-owned `.relay`, but `TMPDIR` itself may point inside the
+selected project. Callers handling sensitive captured output should choose a
+private, safe temporary directory. The aggregate stores the Go record path as
+a reference. Go never reads or writes `.relay`, and Rust does not use the
+attempt record to reconstruct or override aggregate state.
+
+JSON task-outcome output contains `{ "state_path": ..., "run": ... }`, with
+`run` equal to the full persisted aggregate state. Human output reports the run
+ID and status plus each task's status, bounded reason, and Go record path when
+an attempt exists. Only `completed` exits zero. A clean `failed` or `cancelled`
+coordinator result exits nonzero but retains the ordinary `ok: true` success
+envelope on stdout, distinguishing a known task outcome from a Relay error. A
+supervisor boundary failure exits nonzero with an `ok: false`, `run_supervisor`
+error envelope on stderr whose `data` contains the same `state_path` and full
+persisted `run`, now marked `indeterminate`.
+
+### Scheduling, failure, cancellation, and resume
+
+This milestone permits exactly one active task. Rust repeatedly selects the
+first input-order `pending` task whose dependencies all succeeded. A task
+succeeds only for the typed combination `completed`, `exit_zero`, and exit code
+zero. Nonzero exit, start failure, timeout, and non-cancellation forced cleanup
+are task failures; a clean cancellation outcome is `cancelled`. Failed and
+cancelled dependencies block their descendants transitively, while independent
+ready tasks continue in input order after ordinary failures. An indeterminate
+attempt instead halts coordination without claiming or propagating an outcome.
+
+Catchable `SIGINT` or `SIGTERM` is forwarded through the Rust launcher to the
+active Go supervisor. A clean cancellation result marks that task `cancelled`,
+blocks its dependants, persists aggregate state, and stops scheduling further
+tasks in that invocation. Any supervisor transport or response-protocol failure
+after Rust has durably marked the attempt `running` makes the task and run
+`indeterminate`, including a launcher failure before child spawn. Relay persists
+that uncertainty and returns an application error without claiming a child
+outcome.
+
+Resume always requires the caller to provide the plan again. Rust compares its
+sanitized form with the persisted plan, validates task identity and aggregate
+consistency, and refuses any state containing `running` or `indeterminate`
+work. It never reruns `succeeded`, `failed`, `cancelled`, `blocked`,
+`running`, or `indeterminate` tasks; it can continue only still-`pending`
+independent work after a prior clean terminal response. There are no retries
+and no recovery claim for work whose outcome is active or uncertain.
+
+### Coordinator limits and non-guarantees
+
+The coordinator and supervisor execution path is currently Linux-only. The
+single active-task limit is deliberate; it is not hidden parallelism. There is
+no daemon, queue, network or remote execution, authentication, provider,
+workflow inference, Lua runtime, sandbox, retry engine, or transcript scraping.
+Go's Linux process-group cleanup covers the direct child and descendants that
+remain in that group, subject to the supervisor limitations below. Neither the
+coordinator nor the supervisor guarantees containment or cleanup of a process
+that detaches into another session/group, nor recovery after supervisor
+`SIGKILL`, kernel failure, or machine loss; use an external cgroup or service
+boundary when those guarantees are required.
 
 ## Go one-child supervisor
 
@@ -142,10 +274,35 @@ supervisor infrastructure failures produce one output-schema-v1 error envelope
 on stderr and a nonzero supervisor exit. There is no JSON Lines stream or
 second child.
 
-The supervisor installs catchable termination-signal handling only after the
-complete stdin request has been read and decoded. Signals received while request
-framing is still incomplete are not interpreted as cancellation of a child,
-because no child has been launched.
+When launched through Rust, the executable installs catchable
+`SIGINT`/`SIGTERM` handling and tags that cancellation source before the private
+`RELAY_SUPERVISOR_READY_FD` handshake or request framing. Go strictly parses
+the inherited descriptor as 3 or greater, writes exactly one ASCII `R`
+readiness byte after signal registration, and then waits without reading the
+already-buffered request. Rust publishes the supervisor PID, enables
+forwarding, forwards any latched signal, writes exactly one ASCII `A`, and
+closes its endpoint. Go requires that exact `A` followed by EOF before it closes
+its endpoint and proceeds. An invalid descriptor or any write,
+acknowledgement, trailing-data, or close failure produces the ordinary
+structured error on stderr and a nonzero exit; the supervisor never reads or
+executes the request.
+
+For direct manual invocation without the readiness variable, request framing is
+read and decoded with the operating system's default signal disposition, so
+`SIGINT` or `SIGTERM` terminates promptly even while stdin remains open. Signal
+cancellation handling is installed after a complete valid request is decoded
+and before its child execution begins.
+
+For the bundled supervisor, this two-way barrier means Go owns
+`SIGINT`/`SIGTERM` before advertising `R`, while `A` proves Rust has made that
+ownership reachable through safe forwarding before Go can start request
+execution. The launcher also supports legacy v1 supervisors through the
+state-creation proof described below. No child is launched until the complete
+request has been read, decoded, and validated. Malformed and unsupported
+requests retain their error framing even if cancellation is already pending.
+Once a valid request is decoded, an early cancellation is persisted and
+reported in the ordinary success envelope as `accepted` → `cancelled`, without
+a child start.
 
 Before decoding requests, Go strictly decodes the same embedded
 [`manifest-v1.json`](../protocol/manifest-v1.json) used by Rust. It requires the
@@ -171,32 +328,73 @@ The remaining options are
 `--log-limit-bytes`, and repeatable `--redact-argument-index`. The default run
 ID is a UUID. The default state path is
 `<temporary-directory>/relay-runs/<run-id>.json`; `--state-path` selects a
-custom absolute Go-owned record path outside lexical `.relay`.
+custom absolute Go-owned record path outside lexical `.relay`. A prior record
+at that custom path may be reused: Go replaces it atomically for the new run.
 
 Rust validates the absolute program, run ID, limits, redaction indexes,
 absolute working directory, and state path before constructing every v1 request
 field with an empty user environment. It rejects an encoded request, including
 its terminating newline, above 1 MiB before spawning the supervisor. Otherwise
-it writes that document, closes supervisor stdin, and concurrently drains each
-response stream through EOF while retaining at most 32 MiB. It accepts only one
-strict envelope:
-exit status zero requires a success envelope on stdout and empty stderr; nonzero
-requires an error envelope on stderr and empty stdout. Rust verifies output
-schema `1`, command `supervise`, execution protocol `1`, matching run ID, the
-required summary fields, and a known final lifecycle. Execution
-outcomes—including child nonzero exit, start failure, timeout, and
-cancellation—are transport success. Its JSON outer data is
-`{ "state_path": ..., "execution": ... }`; human output summarizes lifecycle,
-reason, exit status, duration, state path, and retained stdout/stderr byte counts.
+it writes and closes the one-document request immediately after spawn, waits
+for startup proof, and then concurrently drains each response stream through
+EOF while retaining at most 32 MiB. It accepts only one strict envelope:
+exit status zero requires a success envelope on stdout and empty stderr;
+nonzero requires an error envelope on stderr and empty stdout.
 
-Before spawning on Linux, Rust blocks `SIGINT` and `SIGTERM` through supervisor
-PID publication, restores the pre-launch mask in the exec child, and then
-forwards either signal only to the active supervisor PID while it waits. It
-observes supervisor exit without reaping, disarms forwarding while that PID
-still cannot be reused, and only then reaps the process. Go alone performs
-child-group cleanup, with the limitations below. The launcher is
-project-independent and neither discovers, reads, nor writes `.relay` or Go run
-records.
+The Rust boundary strictly decodes the envelope, execution result, and every
+nested v1 execution object into closed typed structures; unknown fields,
+unknown enum values, missing fields, and wrong field types are rejected. It
+then validates cross-field consistency for lifecycle, termination, failure,
+timeout, cancellation, timestamps, stream counts, lifecycle history, and
+observation ordering/accounting. It binds the result to the request by
+requiring execution protocol `1`, the requested run ID and program, the exact
+requested arguments with declared positions redacted, and the configured
+timeout, termination grace, and observation-log limit. It also requires output
+schema `1`, command `supervise`, a nonempty supervisor version, and the proper
+success/error stream and exit-status pairing.
+
+Execution outcomes—including child nonzero exit, start failure, timeout, and
+cancellation—are transport success. The launcher's JSON data is
+`{ "state_path": ..., "execution": ... }`; human output summarizes lifecycle,
+reason, exit status, duration, state path, and retained stdout/stderr byte
+counts.
+
+The readiness transport is an additive private launcher optimization and safety
+handshake, not a field or requirement of JSON execution protocol v1. For each
+Linux launch, Rust creates a private close-on-exec Unix stream socketpair and
+normalizes both endpoints to descriptors 3 or greater even when a standard
+descriptor is closed. In the supervisor's pre-exec setup Rust marks every
+descriptor from 3 upward close-on-exec, then makes only the supervisor socket
+endpoint inheritable; descriptors 0–2 are left alone. Thus an unrelated ambient
+inheritable descriptor cannot cross the supervisor exec boundary. Rust passes
+the supervisor endpoint number only in `RELAY_SUPERVISOR_READY_FD` and closes
+its copy after spawn.
+
+Rust publishes the supervisor PID and enables signal forwarding after either
+of two startup proofs within five seconds. The current handshake starts with
+exactly one ASCII `R` byte from Go. Rust then publishes the PID, forwards any
+latched signal, writes exactly one ASCII `A`, and closes its launcher endpoint;
+Go requires `A` followed by EOF before processing the request. For an older or
+custom v1 supervisor that ignores the private environment variable, Rust
+instead accepts creation or replacement of the requested regular state file
+when a bounded decode shows `run_state_version: 1`, a nonempty supervisor
+version, execution protocol `1`, and the requested run ID. Rust snapshots any
+preexisting file before spawn, so an unchanged stale record cannot supply this
+proof; atomic replacement for explicit state-path reuse remains supported.
+Rust also checks this proof when the readiness socket reaches EOF or the
+supervisor has already exited, so a legacy v1 supervisor may atomically persist
+its matching record, emit its valid response, and exit immediately. This
+compatibility check does not make the Go record a Rust-owned result source—the
+final typed response remains authoritative.
+
+EOF or supervisor exit before `R` without a valid state proof, invalid readiness
+data, acknowledgement failure, and timeout are transport failures that trigger
+cleanup. After startup proof, Rust forwards pending or new `SIGINT`/`SIGTERM`
+only to the active supervisor PID while waiting. It observes supervisor exit
+without reaping, disarms forwarding while that PID still cannot be reused, and
+only then reaps the process. Go alone performs child-group cleanup, with the
+limitations below. The launcher is project-independent and neither discovers
+nor writes `.relay` or Go run records.
 
 ### Execution request
 
@@ -225,8 +423,11 @@ environment for programs that explicitly launch their own subprocesses.
 
 ### Lifecycle and result
 
-Every accepted execution records `accepted`, then `starting`; a successful OS
-start records `running`. The final lifecycle is one of:
+Normal started executions record
+`accepted` → `starting` → `running` → the terminal lifecycle. An OS start
+failure records `accepted` → `starting` → `failed_to_start`. Cancellation
+observed before starting may instead record `accepted` → `cancelled`. The final
+lifecycle is one of:
 
 - `completed` for a natural zero or nonzero direct-child exit after its `Wait`
   completes and any required in-group descendant cleanup is confirmed;
@@ -452,9 +653,11 @@ Protocol v1 and the supervisor require all of the following:
 - Treat JSON and child output as untrusted; require expected streams, one
   document, negotiated schema versions, and bounded retention.
 - Never read or write `.relay` from Go. Rust remains the only owner of project
-  state and locking.
-- Do not infer an implemented scheduler, workflow runtime, authentication
-  mechanism, credential discovery, network service, or telemetry.
+  state and locking; Go owns only separate per-attempt records outside `.relay`.
+- Do not infer an externally advertised or parallel orchestrator, queue,
+  workflow runtime, authentication mechanism, credential discovery, network
+  service, or telemetry. The built-in Rust coordinator is sequential and Go is
+  not its scheduler.
 - Filter the child environment, reject sensitive names, redact declared
   sensitive arguments, and persist metadata rather than environment values.
 - Keep stdout, stderr, and observation metadata bounded while continuing to
@@ -473,9 +676,9 @@ Language-neutral supervisor fixtures under
 golden request and response, malformed input, unsupported version, timeout,
 cancellation, truncated streams, start failure, and error envelopes. Go
 strictly decodes and deterministically reserializes all corresponding fixtures.
-Rust consumes the same fixture set to verify the existing
-output-schema-v1 envelope boundary without claiming ownership of Go execution
-semantics.
+Rust consumes the same fixture set through its closed typed response boundary,
+rejecting unknown nested execution fields and inconsistent or request-mismatched
+results without claiming ownership of Go execution semantics.
 
 A change to Relay transport, framing, streams, exit semantics,
 responsibilities, operation membership/templates, stdin behavior, or manifest
@@ -487,16 +690,20 @@ migration policy.
 
 ## Current limitations
 
-The Go component supervises exactly one local process and persists one local
-run record. `relay supervise` launches that one child but does not make
-`orchestrator.implemented` true: there is no scheduler, queue, dependency
-graph, retry/resume engine, daemon, remote execution, authentication,
-deployment layer, Lua parser, Lua runtime, or Lua sandbox. Execution is
-currently limited to Linux. Self-detaching descendants and uncatchable process
-or machine termination require an external OS containment boundary.
+The Go component supervises exactly one local process and persists one separate
+local attempt record outside `.relay`. The built-in Rust coordinator supplies a
+dependency graph
+and deterministic sequential scheduling, but neither it nor `relay supervise`
+makes the manifest's externally advertised `orchestrator.implemented` value
+true. There is no parallel scheduler, queue, retry engine, daemon, remote
+execution, authentication, deployment layer, Lua parser, Lua runtime, or Lua
+sandbox. Execution is currently limited to Linux. Self-detaching descendants
+and uncatchable process or machine termination require an external OS
+containment boundary.
 
 The configured supervisor is a trusted local executable. Rust's 32 MiB
 per-response-stream limit bounds memory, not the runtime of a supervisor that
-violates its contract. `timeout_ms: 0` permits the requested child to run
-indefinitely; Go's internal termination and drain windows remain bounded once
-cleanup begins.
+violates its contract. Standalone `relay supervise` permits `timeout_ms: 0`,
+so its requested child may run indefinitely; every built-in `relay run` task
+instead requires a finite timeout of at most 24 hours. Go's internal
+termination and drain windows remain bounded once cleanup begins.

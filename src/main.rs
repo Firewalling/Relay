@@ -3,8 +3,9 @@ use relay::{
     app,
     cli::{Cli, Command, generate_completions},
     model::{ErrorEnvelope, OUTPUT_SCHEMA_VERSION, OutputError, SuccessEnvelope},
-    project, supervise,
+    orchestrate, project, supervise,
 };
+use serde::Serialize;
 use std::{env, ffi::OsStr, io::Write, process::ExitCode};
 
 fn main() -> ExitCode {
@@ -31,6 +32,35 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Command::Run(args) = cli.command {
+        let project = match project::discover(&invocation_directory, cli.scope) {
+            Ok(project) => project,
+            Err(error) => {
+                emit_error(
+                    json_output,
+                    command_name,
+                    "project_discovery",
+                    &error.to_string(),
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        return match orchestrate::run(args, &invocation_directory, &project.relay_project_root) {
+            Ok(result) => {
+                let exit_code = if result.succeeded() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                };
+                emit_success(json_output, command_name, result.output);
+                exit_code
+            }
+            Err(error) => {
+                emit_run_error(json_output, command_name, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
     if let Command::Supervise(args) = cli.command {
         return match supervise::run(args, &invocation_directory) {
             Ok(output) => emit_success(json_output, command_name, output),
@@ -106,6 +136,54 @@ fn emit_success(json_output: bool, command: &str, output: app::RunOutput) -> Exi
         let _ = writeln!(stdout, "{}", output.human);
     }
     ExitCode::SUCCESS
+}
+
+#[derive(Serialize)]
+struct RunErrorEnvelope<'a> {
+    output_schema_version: u32,
+    ok: bool,
+    command: String,
+    error: OutputError,
+    data: RunErrorData<'a>,
+}
+
+#[derive(Serialize)]
+struct RunErrorData<'a> {
+    state_path: &'a str,
+    run: &'a orchestrate::RunState,
+}
+
+fn emit_run_error(json_output: bool, command: &str, error: &orchestrate::RunError) {
+    let message = error.to_string();
+    let Some(state) = error.state() else {
+        emit_error(json_output, command, error.code(), &message);
+        return;
+    };
+    if !json_output {
+        emit_error(false, command, error.code(), &message);
+        return;
+    }
+
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    let _ = writeln!(
+        stderr,
+        "{}",
+        serde_json::to_string(&RunErrorEnvelope {
+            output_schema_version: OUTPUT_SCHEMA_VERSION,
+            ok: false,
+            command: command.into(),
+            error: OutputError {
+                code: error.code().into(),
+                message,
+            },
+            data: RunErrorData {
+                state_path: &state.state_path,
+                run: state,
+            },
+        })
+        .expect("serializing a Relay run error envelope cannot fail")
+    );
 }
 
 fn emit_error(json_output: bool, command: &str, code: &str, message: &str) {
