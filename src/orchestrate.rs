@@ -477,6 +477,17 @@ pub fn run(
 
         let execution = match completion.result {
             Ok(result) => result.execution,
+            Err(SupervisorError::CancelledBeforeLaunch) => {
+                state.tasks[completion.index].status = TaskStatus::Pending;
+                state.tasks[completion.index].reason = None;
+                state.tasks[completion.index].summary = None;
+                state.tasks[completion.index].attempt_run_id = None;
+                state.tasks[completion.index].supervisor_state_path = None;
+                state.cancellation_requested = true;
+                state.status = derive_status(&state.tasks, true);
+                persist(&mut store, &mut state)?;
+                continue;
+            }
             Err(source) => {
                 state.tasks[completion.index].status = TaskStatus::Indeterminate;
                 state.tasks[completion.index].reason =

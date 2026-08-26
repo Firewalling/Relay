@@ -34,6 +34,7 @@ const SUPERVISOR_READY_BYTE: u8 = b'R';
 const SUPERVISOR_ACK_BYTE: u8 = b'A';
 const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ACTIVE_SUPERVISORS: usize = 64;
+const LEGACY_READY_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -49,6 +50,8 @@ pub enum SupervisorError {
         #[source]
         source: io::Error,
     },
+    #[error("supervisor launch cancelled before spawn")]
+    CancelledBeforeLaunch,
     #[error("could not communicate with supervisor: {0}")]
     Transport(#[source] io::Error),
     #[error("supervisor response exceeded the 32 MiB limit on {stream}")]
@@ -65,6 +68,7 @@ impl SupervisorError {
             Self::NotFound => "supervisor_not_found",
             Self::InvalidRequest(_) => "supervisor_invalid_request",
             Self::Spawn { .. } => "supervisor_spawn",
+            Self::CancelledBeforeLaunch => "supervisor_cancelled_before_launch",
             Self::Transport(_) => "supervisor_transport",
             Self::ResponseTooLarge { .. } => "supervisor_response_too_large",
             Self::InvalidResponse(_) => "supervisor_invalid_response",
@@ -392,7 +396,21 @@ fn execute_inner(
     configure_supervisor_child(&mut command, ready_child.as_raw_fd())?;
     let state_path = Path::new(&request.state_path);
     let initial_state = snapshot_state_path(state_path)?;
-    let mut child = command.spawn().map_err(|source| SupervisorError::Spawn {
+    let launch_reservation = match coordinator {
+        Some(coordinator) => coordinator
+            .reserve_launch()
+            .ok_or(SupervisorError::CancelledBeforeLaunch)
+            .map(Some)?,
+        None => None,
+    };
+    test_pause_before_supervisor_spawn()?;
+    if coordinator.is_some_and(CoordinatorSignals::cancellation_requested) {
+        drop(launch_reservation);
+        return Err(SupervisorError::CancelledBeforeLaunch);
+    }
+    let spawn_result = command.spawn();
+    drop(launch_reservation);
+    let mut child = spawn_result.map_err(|source| SupervisorError::Spawn {
         path: supervisor,
         source,
     })?;
@@ -412,22 +430,8 @@ fn execute_inner(
         write_error
     });
 
-    let readiness = match test_pause_after_supervisor_spawn().and_then(|_| {
-        wait_for_supervisor_ready(
-            &mut child,
-            ready_parent,
-            state_path,
-            initial_state,
-            &request.run_id,
-        )
-    }) {
-        Ok(readiness) => readiness,
-        Err(error) => {
-            kill_and_reap(&mut child);
-            join_failed_request_writer(request_writer)?;
-            return Err(error);
-        }
-    };
+    // Publish coordinator supervisor PIDs before readiness. Standalone
+    // supervise keeps legacy proof gating for stale-state safety.
     let signals = if let Some(coordinator) = coordinator {
         let active = match coordinator.activate(child.id() as i32) {
             Ok(active) => active,
@@ -437,7 +441,40 @@ fn execute_inner(
                 return Err(error);
             }
         };
-        SignalRegistration::Coordinator(active)
+        Some(SignalRegistration::Coordinator(active))
+    } else {
+        None
+    };
+
+    let readiness = match wait_for_supervisor_ready(
+        &mut child,
+        ready_parent,
+        state_path,
+        initial_state,
+        &request.run_id,
+    ) {
+        Ok(readiness) => readiness,
+        Err(error) => {
+            if let Some(signals) = signals {
+                kill_disarm_and_reap(&mut child, signals);
+            } else {
+                kill_and_reap(&mut child);
+            }
+            join_failed_request_writer(request_writer)?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = test_pause_after_supervisor_spawn() {
+        if let Some(signals) = signals {
+            kill_disarm_and_reap(&mut child, signals);
+        } else {
+            kill_and_reap(&mut child);
+        }
+        join_failed_request_writer(request_writer)?;
+        return Err(error);
+    }
+    let signals = if let Some(signals) = signals {
+        signals
     } else {
         match SignalForwarder::install(
             blocked_signals.expect("standalone execution blocks signals"),
@@ -1264,10 +1301,8 @@ fn human_output(state_path: &str, execution: &ExecutionResult) -> String {
 }
 
 #[cfg(debug_assertions)]
-fn test_pause_after_supervisor_spawn() -> Result<(), SupervisorError> {
-    if env::var_os("RELAY_TEST_SUPERVISOR_PAUSE").as_deref()
-        != Some(OsStr::new("after_spawn_before_activation"))
-    {
+fn test_pause(point: &str) -> Result<(), SupervisorError> {
+    if env::var_os("RELAY_TEST_SUPERVISOR_PAUSE").as_deref() != Some(OsStr::new(point)) {
         return Ok(());
     }
     let marker = env::var_os("RELAY_TEST_SUPERVISOR_MARKER")
@@ -1295,6 +1330,21 @@ fn test_pause_after_supervisor_spawn() -> Result<(), SupervisorError> {
     while !release.exists() {
         thread::sleep(std::time::Duration::from_millis(5));
     }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn test_pause_before_supervisor_spawn() -> Result<(), SupervisorError> {
+    test_pause("before_spawn_after_reservation")
+}
+
+#[cfg(debug_assertions)]
+fn test_pause_after_supervisor_spawn() -> Result<(), SupervisorError> {
+    test_pause("after_spawn_before_activation")
+}
+
+#[cfg(not(debug_assertions))]
+fn test_pause_before_supervisor_spawn() -> Result<(), SupervisorError> {
     Ok(())
 }
 
@@ -1432,6 +1482,11 @@ struct LegacyExecutionProof {
     run_id: String,
     protocol_version: u32,
 }
+#[derive(Deserialize)]
+struct LegacyDirectExecutionIdentity {
+    run_id: String,
+    protocol_version: u32,
+}
 
 fn snapshot_state_path(state_path: &Path) -> Result<Option<StatePathSnapshot>, SupervisorError> {
     match std::fs::symlink_metadata(state_path) {
@@ -1458,18 +1513,41 @@ fn legacy_state_ready(
         return Ok(false);
     }
 
-    let file = std::fs::File::open(state_path).map_err(SupervisorError::Transport)?;
-    let proof: LegacyStateProof =
-        match serde_json::from_reader(file.take(MAX_LEGACY_STATE_PROOF_BYTES)) {
-            Ok(proof) => proof,
-            Err(_) => return Ok(false),
-        };
-    Ok(proof.run_state_version == 1
-        && !proof.supervisor_version.is_empty()
-        && proof.execution.protocol_version == EXECUTION_PROTOCOL_VERSION
-        && proof.execution.run_id == run_id)
+    let mut bytes = Vec::new();
+    std::fs::File::open(state_path)
+        .map_err(SupervisorError::Transport)?
+        .take(MAX_LEGACY_STATE_PROOF_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(SupervisorError::Transport)?;
+    if let Ok(proof) = serde_json::from_slice::<LegacyStateProof>(&bytes) {
+        return Ok(proof.run_state_version == 1
+            && !proof.supervisor_version.is_empty()
+            && proof.execution.protocol_version == EXECUTION_PROTOCOL_VERSION
+            && proof.execution.run_id == run_id);
+    }
+    let execution = match serde_json::from_slice::<LegacyDirectExecutionIdentity>(&bytes) {
+        Ok(execution) => execution,
+        Err(_) => return Ok(false),
+    };
+    Ok(execution.protocol_version == EXECUTION_PROTOCOL_VERSION && execution.run_id == run_id)
 }
 
+fn legacy_state_ready_with_grace(
+    state_path: &Path,
+    initial_state: Option<StatePathSnapshot>,
+    run_id: &str,
+) -> Result<bool, SupervisorError> {
+    let deadline = Instant::now() + LEGACY_READY_GRACE;
+    loop {
+        if legacy_state_ready(state_path, initial_state, run_id)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
 enum SupervisorReadiness {
     Current(OwnedFd),
     Legacy(OwnedFd),
@@ -1559,6 +1637,9 @@ fn wait_for_supervisor_ready(
                 .map_err(SupervisorError::Transport)?
                 .is_some()
             {
+                if legacy_state_ready_with_grace(state_path, initial_state, run_id)? {
+                    return Ok(SupervisorReadiness::Legacy(ready_socket));
+                }
                 return Err(SupervisorError::Transport(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "supervisor exited before reporting readiness",
@@ -1582,7 +1663,7 @@ fn wait_for_supervisor_ready(
             return Err(SupervisorError::Transport(error));
         }
         if read_result == 0 {
-            if legacy_state_ready(state_path, initial_state, run_id)? {
+            if legacy_state_ready_with_grace(state_path, initial_state, run_id)? {
                 return Ok(SupervisorReadiness::Legacy(ready_socket));
             }
             return Err(SupervisorError::Transport(io::Error::new(
@@ -1733,7 +1814,7 @@ fn clear_active_supervisor(slot: usize, pid: i32) {
 
 #[cfg(target_os = "linux")]
 extern "C" fn forward_signal(signal: libc::c_int) {
-    CANCELLATION_SIGNAL.store(signal, std::sync::atomic::Ordering::Release);
+    CANCELLATION_SIGNAL.store(signal, std::sync::atomic::Ordering::SeqCst);
     let mut index = 0;
     while index < MAX_ACTIVE_SUPERVISORS {
         let pid = ACTIVE_SUPERVISOR_PIDS[index].load(std::sync::atomic::Ordering::Acquire);
@@ -1825,31 +1906,74 @@ impl Drop for SignalForwarder {
 #[cfg(target_os = "linux")]
 pub struct CoordinatorSignals {
     _forwarder: SignalForwarder,
+    launch_in_progress: std::sync::atomic::AtomicBool,
 }
 #[cfg(target_os = "linux")]
 impl CoordinatorSignals {
     pub fn install() -> Result<Self, SupervisorError> {
         let blocked = BlockedSignals::new()?;
-        CANCELLATION_SIGNAL.store(0, std::sync::atomic::Ordering::Release);
+        CANCELLATION_SIGNAL.store(0, std::sync::atomic::Ordering::SeqCst);
         clear_active_supervisors();
         Ok(Self {
             _forwarder: SignalForwarder::install(blocked, 0)?,
+            launch_in_progress: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub fn cancellation_requested(&self) -> bool {
-        CANCELLATION_SIGNAL.load(std::sync::atomic::Ordering::Acquire) != 0
+        CANCELLATION_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) != 0
+    }
+
+    fn reserve_launch(&self) -> Option<LaunchReservation<'_>> {
+        loop {
+            if self.cancellation_requested() {
+                return None;
+            }
+            if self
+                .launch_in_progress
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                if self.cancellation_requested() {
+                    self.release_launch();
+                    return None;
+                }
+                return Some(LaunchReservation { coordinator: self });
+            }
+            thread::yield_now();
+        }
+    }
+
+    fn release_launch(&self) {
+        self.launch_in_progress
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn activate(&self, pid: i32) -> Result<ActiveSupervisor, SupervisorError> {
         let slot = register_active_supervisor(pid)?;
-        let signal = CANCELLATION_SIGNAL.load(std::sync::atomic::Ordering::Acquire);
+        let signal = CANCELLATION_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
         if signal != 0 {
             unsafe {
                 libc::kill(pid, signal);
             }
         }
         Ok(ActiveSupervisor { pid, slot })
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LaunchReservation<'a> {
+    coordinator: &'a CoordinatorSignals,
+}
+#[cfg(target_os = "linux")]
+impl Drop for LaunchReservation<'_> {
+    fn drop(&mut self) {
+        self.coordinator.release_launch();
     }
 }
 
@@ -1898,10 +2022,15 @@ impl CoordinatorSignals {
     pub fn cancellation_requested(&self) -> bool {
         false
     }
+    fn reserve_launch(&self) -> Option<LaunchReservation> {
+        Some(LaunchReservation)
+    }
     fn activate(&self, _: i32) -> Result<ActiveSupervisor, SupervisorError> {
         Ok(ActiveSupervisor)
     }
 }
+#[cfg(not(target_os = "linux"))]
+struct LaunchReservation;
 #[cfg(not(target_os = "linux"))]
 struct ActiveSupervisor;
 #[cfg(not(target_os = "linux"))]

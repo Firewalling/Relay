@@ -1217,6 +1217,52 @@ fn signal_during_parallel_startup_cancels_all_without_new_launches() {
     assert_eq!(harness.requests().len(), 2);
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn cancellation_before_supervisor_spawn_does_not_launch_new_work() {
+    let harness = Harness::new();
+    harness.configure(&[("only", "hold")]);
+    let marker = harness.directory.path().join("before-spawn.marker");
+    let release = harness.directory.path().join("before-spawn.release");
+    let plan = harness.plan("before-spawn", json!([task("only", &[])]));
+    let state_path = harness.state("before-spawn");
+    let child = harness
+        .command()
+        .env(
+            "RELAY_TEST_SUPERVISOR_PAUSE",
+            "before_spawn_after_reservation",
+        )
+        .env("RELAY_TEST_SUPERVISOR_MARKER", &marker)
+        .env("RELAY_TEST_SUPERVISOR_RELEASE", &release)
+        .args([
+            "--json",
+            "run",
+            "--jobs",
+            "1",
+            "--supervisor",
+            harness.supervisor.to_str().unwrap(),
+            "--state-path",
+            state_path.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_path(&marker);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    fs::write(&release, b"release").unwrap();
+    run_document(&child.wait_with_output().unwrap());
+
+    let state = read_state(&state_path);
+    assert_eq!(state["status"], "cancelled");
+    assert_eq!(record(&state, "only")["status"], "pending");
+    assert!(record(&state, "only")["attempt_run_id"].is_null());
+    assert!(record(&state, "only")["supervisor_state_path"].is_null());
+    assert!(harness.requests().is_empty());
+}
+
 #[test]
 fn parallel_protocol_failure_is_indeterminate_without_stopping_unrelated_tasks() {
     let harness = Harness::new();
