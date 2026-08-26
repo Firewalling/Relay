@@ -83,6 +83,18 @@ if mode in ("hold", "wait_cancel"):
     else:
         mode = "success"
 
+if mode == "barrier":
+    barrier_directory = os.environ.get("RELAY_FAKE_BARRIER_DIR")
+    if not barrier_directory:
+        sys.stderr.write("RELAY_FAKE_BARRIER_DIR is required\n")
+        sys.exit(93)
+    os.makedirs(barrier_directory, exist_ok=True)
+    with open(os.path.join(barrier_directory, "started-" + name), "w", encoding="utf-8") as marker:
+        marker.write(str(os.getpid()))
+    release = os.path.join(barrier_directory, "release")
+    while not cancelled and not os.path.exists(release):
+        time.sleep(0.01)
+    mode = "cancelled" if cancelled else "success"
 lifecycle = "completed"
 reason = "exit_zero"
 exit_code = 0
@@ -229,10 +241,17 @@ impl Harness {
     }
 
     fn run_json(&self, plan: &Path, state: &Path) -> Output {
+        self.run_json_jobs(plan, state, 1)
+    }
+
+    fn run_json_jobs(&self, plan: &Path, state: &Path, jobs: usize) -> Output {
+        let jobs = jobs.to_string();
         self.command()
             .args([
                 "--json",
                 "run",
+                "--jobs",
+                jobs.as_str(),
                 "--supervisor",
                 self.supervisor.to_str().unwrap(),
                 "--state-path",
@@ -258,10 +277,17 @@ impl Harness {
     }
 
     fn resume_json(&self, plan: &Path, state: &Path) -> Output {
+        self.resume_json_jobs(plan, state, 1)
+    }
+
+    fn resume_json_jobs(&self, plan: &Path, state: &Path, jobs: usize) -> Output {
+        let jobs = jobs.to_string();
         self.command()
             .args([
                 "--json",
                 "run",
+                "--jobs",
+                jobs.as_str(),
                 "--supervisor",
                 self.supervisor.to_str().unwrap(),
                 "--resume",
@@ -273,10 +299,17 @@ impl Harness {
     }
 
     fn spawn_json(&self, plan: &Path, state: &Path) -> Child {
+        self.spawn_json_jobs(plan, state, 1)
+    }
+
+    fn spawn_json_jobs(&self, plan: &Path, state: &Path, jobs: usize) -> Child {
+        let jobs = jobs.to_string();
         self.command()
             .args([
                 "--json",
                 "run",
+                "--jobs",
+                jobs.as_str(),
                 "--supervisor",
                 self.supervisor.to_str().unwrap(),
                 "--state-path",
@@ -290,6 +323,33 @@ impl Harness {
             .expect("spawn relay coordinator")
     }
 
+    fn spawn_json_jobs_with_barrier(
+        &self,
+        plan: &Path,
+        state: &Path,
+        jobs: usize,
+        barrier: &Path,
+    ) -> Child {
+        let jobs = jobs.to_string();
+        self.command()
+            .env("RELAY_FAKE_BARRIER_DIR", barrier)
+            .args([
+                "--json",
+                "run",
+                "--jobs",
+                jobs.as_str(),
+                "--supervisor",
+                self.supervisor.to_str().unwrap(),
+                "--state-path",
+                state.to_str().unwrap(),
+                plan.to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn barrier relay coordinator")
+    }
     fn requests(&self) -> Vec<Value> {
         match File::open(&self.log) {
             Ok(file) => BufReader::new(file)
@@ -398,6 +458,18 @@ fn wait_for_path(path: &Path) {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+fn wait_for_file_size(path: &Path, minimum: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fs::metadata(path).map_or(0, |metadata| metadata.len()) < minimum {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {} bytes in {}",
+            minimum,
             path.display()
         );
         thread::sleep(Duration::from_millis(10));
@@ -546,6 +618,88 @@ fn real_go_supervisor_runs_two_task_dependency_dag_when_configured() {
             <= chrono::DateTime::parse_from_rfc3339(executions[1]["accepted_at"].as_str().unwrap())
                 .unwrap(),
         "dependent task started before its prerequisite completed"
+    );
+}
+
+#[test]
+fn real_go_supervisor_runs_independent_tasks_in_parallel() {
+    let Some(supervisor) = std::env::var_os("RELAY_SUPERVISOR_E2E_BIN") else {
+        return;
+    };
+    let supervisor = PathBuf::from(supervisor);
+    assert!(supervisor.is_absolute() && supervisor.is_file());
+
+    let directory = tempfile::tempdir().expect("create real-Go parallel directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).expect("create real-Go temporary directory");
+    let first_started = directory.path().join("first-started");
+    let second_started = directory.path().join("second-started");
+    let release = directory.path().join("release");
+    let state_path = directory.path().join("parallel.state.json");
+    let plan = directory.path().join("parallel.json");
+    let program = "/usr/bin/python3";
+    let script = r#"import pathlib,sys,time
+pathlib.Path(sys.argv[1]).touch()
+while not pathlib.Path(sys.argv[2]).exists():
+    time.sleep(0.01)
+"#;
+    fs::write(
+        &plan,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "tasks": [
+                {
+                    "id": "first",
+                    "depends_on": [],
+                    "program": program,
+                    "arguments": ["-c", script, first_started.to_str().unwrap(), release.to_str().unwrap()],
+                    "timeout_ms": 5_000
+                },
+                {
+                    "id": "second",
+                    "depends_on": [],
+                    "program": program,
+                    "arguments": ["-c", script, second_started.to_str().unwrap(), release.to_str().unwrap()],
+                    "timeout_ms": 5_000
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .expect("write real-Go parallel plan");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .current_dir(directory.path())
+        .env("TMPDIR", &temporary_root)
+        .args([
+            "--json",
+            "run",
+            "--jobs",
+            "2",
+            "--supervisor",
+            supervisor.to_str().unwrap(),
+            "--state-path",
+            state_path.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn real-Go parallel Relay run");
+    wait_for_path(&first_started);
+    wait_for_path(&second_started);
+    fs::write(&release, b"release").expect("release real-Go tasks");
+    let output = child
+        .wait_with_output()
+        .expect("wait for real-Go parallel run");
+    run_document(&output);
+    let state = read_state(&state_path);
+    assert_eq!(state["jobs"], 2);
+    assert!(
+        records(&state)
+            .iter()
+            .all(|record| record["status"] == "succeeded")
     );
 }
 
@@ -801,6 +955,328 @@ fn executes_literal_arguments_in_stable_dependency_order() {
             .iter()
             .all(|task| task["status"] == "succeeded")
     );
+}
+
+#[test]
+fn jobs_one_keeps_sequential_order_and_state() {
+    let harness = Harness::new();
+    let plan = harness.plan("jobs-one", json!([task("second", &[]), task("first", &[])]));
+    let state_path = harness.state("jobs-one");
+
+    run_document(&harness.run_json_jobs(&plan, &state_path, 1));
+
+    assert_eq!(request_names(&harness.requests()), ["second", "first"]);
+    let state = read_state(&state_path);
+    assert_eq!(state["jobs"], 1);
+    assert!(
+        records(&state)
+            .iter()
+            .all(|record| record["status"] == "succeeded")
+    );
+}
+
+#[test]
+fn jobs_two_overlaps_independent_tasks_and_persists_running_attempts() {
+    let harness = Harness::new();
+    harness.configure(&[("first", "barrier"), ("second", "barrier")]);
+    let barrier = harness.directory.path().join("overlap-barrier");
+    let plan = harness.plan("overlap", json!([task("first", &[]), task("second", &[])]));
+    let state_path = harness.state("overlap");
+    let child = harness.spawn_json_jobs_with_barrier(&plan, &state_path, 2, &barrier);
+
+    harness.wait_for_requests(2);
+    wait_for_path(&barrier.join("started-first"));
+    wait_for_path(&barrier.join("started-second"));
+    let running = read_state(&state_path);
+    assert_eq!(running["jobs"], 2);
+    assert_eq!(
+        records(&running)
+            .iter()
+            .filter(|record| record["status"] == "running")
+            .count(),
+        2
+    );
+    let first_attempt = record(&running, "first")["attempt_run_id"]
+        .as_str()
+        .expect("first running attempt");
+    let second_attempt = record(&running, "second")["attempt_run_id"]
+        .as_str()
+        .expect("second running attempt");
+    assert_ne!(first_attempt, second_attempt);
+    assert!(record(&running, "first")["supervisor_state_path"].is_string());
+    assert!(record(&running, "second")["supervisor_state_path"].is_string());
+
+    fs::write(barrier.join("release"), b"release").unwrap();
+    run_document(&child.wait_with_output().unwrap());
+    let completed = read_state(&state_path);
+    assert_eq!(completed["status"], "completed");
+}
+
+#[test]
+fn jobs_two_never_exceeds_limit_and_launches_ready_tasks_in_input_order() {
+    let harness = Harness::new();
+    harness.configure(&[
+        ("d", "barrier"),
+        ("b", "barrier"),
+        ("c", "barrier"),
+        ("a", "barrier"),
+    ]);
+    let barrier = harness.directory.path().join("limit-barrier");
+    let plan = harness.plan(
+        "limit-order",
+        json!([
+            task("d", &[]),
+            task("b", &[]),
+            task("c", &[]),
+            task("a", &[])
+        ]),
+    );
+    let state_path = harness.state("limit-order");
+    let child = harness.spawn_json_jobs_with_barrier(&plan, &state_path, 2, &barrier);
+
+    harness.wait_for_requests(2);
+    let initial_log = harness.requests();
+    let mut initial_names = request_names(&initial_log);
+    initial_names.sort_unstable();
+    assert_eq!(initial_names, ["b", "d"]);
+    assert!(!barrier.join("started-c").exists());
+    assert!(!barrier.join("started-a").exists());
+
+    fs::write(barrier.join("release"), b"release").unwrap();
+    harness.wait_for_requests(4);
+    run_document(&child.wait_with_output().unwrap());
+    let all_log = harness.requests();
+    let mut all_names = request_names(&all_log);
+    let mut initial_names = all_names[..2].to_vec();
+    initial_names.sort_unstable();
+    let mut later_names = all_names.split_off(2);
+    later_names.sort_unstable();
+    assert_eq!(initial_names, ["b", "d"]);
+    assert_eq!(later_names, ["a", "c"]);
+}
+
+#[test]
+fn parallel_fan_out_and_fan_in_wait_for_all_dependencies() {
+    let harness = Harness::new();
+    harness.configure(&[("right", "barrier"), ("left", "barrier")]);
+    let barrier = harness.directory.path().join("fan-barrier");
+    let plan = harness.plan(
+        "fan",
+        json!([
+            task("join", &["right", "left"]),
+            task("right", &["root"]),
+            task("left", &["root"]),
+            task("root", &[])
+        ]),
+    );
+    let state_path = harness.state("fan");
+    let child = harness.spawn_json_jobs_with_barrier(&plan, &state_path, 2, &barrier);
+
+    harness.wait_for_requests(3);
+    let initial_log = harness.requests();
+    let initial_names = request_names(&initial_log);
+    assert_eq!(initial_names[0], "root");
+    let mut branch_names = request_names(&initial_log[1..]);
+    branch_names.sort_unstable();
+    assert_eq!(branch_names, ["left", "right"]);
+    let running = read_state(&state_path);
+    assert_eq!(record(&running, "right")["status"], "running");
+    assert_eq!(record(&running, "left")["status"], "running");
+    assert_eq!(record(&running, "join")["status"], "pending");
+
+    fs::write(barrier.join("release"), b"release").unwrap();
+    harness.wait_for_requests(4);
+    let final_log = harness.requests();
+    let final_names = request_names(&final_log);
+    assert_eq!(final_names[0], "root");
+    assert_eq!(final_names[3], "join");
+    run_document(&child.wait_with_output().unwrap());
+    assert_eq!(read_state(&state_path)["status"], "completed");
+}
+
+#[test]
+fn parallel_failure_and_timeout_block_descendants_but_preserve_unrelated_work() {
+    let harness = Harness::new();
+    harness.configure(&[
+        ("failed", "nonzero"),
+        ("timeout", "timeout"),
+        ("other", "barrier"),
+    ]);
+    let barrier = harness.directory.path().join("failure-barrier");
+    let plan = harness.plan(
+        "parallel-failures",
+        json!([
+            task("failed-child", &["failed"]),
+            task("failed", &[]),
+            task("timeout-child", &["timeout"]),
+            task("timeout", &[]),
+            task("other", &[])
+        ]),
+    );
+    let state_path = harness.state("parallel-failures");
+    let child = harness.spawn_json_jobs_with_barrier(&plan, &state_path, 2, &barrier);
+
+    harness.wait_for_requests(3);
+    let request_log = harness.requests();
+    let names = request_names(&request_log);
+    let mut initial_names = names[..2].to_vec();
+    initial_names.sort_unstable();
+    assert_eq!(initial_names, ["failed", "timeout"]);
+    assert_eq!(names[2], "other");
+    fs::write(barrier.join("release"), b"release").unwrap();
+    run_document(&child.wait_with_output().unwrap());
+
+    let state = read_state(&state_path);
+    assert_eq!(state["status"], "failed");
+    assert_eq!(record(&state, "failed")["status"], "failed");
+    assert_eq!(record(&state, "timeout")["status"], "failed");
+    assert_eq!(record(&state, "failed-child")["status"], "blocked");
+    assert_eq!(record(&state, "timeout-child")["status"], "blocked");
+    assert_eq!(record(&state, "other")["status"], "succeeded");
+}
+
+#[test]
+fn parallel_cancellation_reaches_all_active_tasks_and_resume_runs_pending_work() {
+    let harness = Harness::new();
+    harness.configure(&[("first", "barrier"), ("second", "barrier")]);
+    let barrier = harness.directory.path().join("cancel-barrier");
+    let plan = harness.plan(
+        "parallel-cancel",
+        json!([task("first", &[]), task("second", &[]), task("later", &[])]),
+    );
+    let state_path = harness.state("parallel-cancel");
+    let child = harness.spawn_json_jobs_with_barrier(&plan, &state_path, 2, &barrier);
+    harness.wait_for_requests(2);
+    wait_for_path(&barrier.join("started-first"));
+    wait_for_path(&barrier.join("started-second"));
+
+    let output = terminate(child);
+    run_document(&output);
+    let cancelled = read_state(&state_path);
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(record(&cancelled, "first")["status"], "cancelled");
+    assert_eq!(record(&cancelled, "second")["status"], "cancelled");
+    assert_eq!(record(&cancelled, "later")["status"], "pending");
+    assert_eq!(harness.requests().len(), 2);
+
+    harness.configure(&[]);
+    run_document(&harness.resume_json_jobs(&plan, &state_path, 2));
+    let resumed = read_state(&state_path);
+    assert_eq!(resumed["status"], "cancelled");
+    assert_eq!(record(&resumed, "later")["status"], "succeeded");
+    assert_eq!(harness.requests().len(), 3);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn signal_during_parallel_startup_cancels_all_without_new_launches() {
+    let harness = Harness::new();
+    harness.configure(&[("first", "hold"), ("second", "hold")]);
+    let marker = harness.directory.path().join("parallel-start.marker");
+    let release = harness.directory.path().join("parallel-start.release");
+    let plan = harness.plan(
+        "parallel-startup",
+        json!([task("first", &[]), task("second", &[]), task("later", &[])]),
+    );
+    let state_path = harness.state("parallel-startup");
+    let jobs = "2";
+    let child = harness
+        .command()
+        .env(
+            "RELAY_TEST_SUPERVISOR_PAUSE",
+            "after_spawn_before_activation",
+        )
+        .env("RELAY_TEST_SUPERVISOR_MARKER", &marker)
+        .env("RELAY_TEST_SUPERVISOR_RELEASE", &release)
+        .args([
+            "--json",
+            "run",
+            "--jobs",
+            jobs,
+            "--supervisor",
+            harness.supervisor.to_str().unwrap(),
+            "--state-path",
+            state_path.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file_size(&marker, 2);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    fs::write(&release, b"release").unwrap();
+    run_document(&child.wait_with_output().unwrap());
+
+    let state = read_state(&state_path);
+    assert_eq!(state["status"], "cancelled");
+    assert_eq!(record(&state, "first")["status"], "cancelled");
+    assert_eq!(record(&state, "second")["status"], "cancelled");
+    assert_eq!(record(&state, "later")["status"], "pending");
+    assert_eq!(harness.requests().len(), 2);
+}
+
+#[test]
+fn parallel_protocol_failure_is_indeterminate_without_stopping_unrelated_tasks() {
+    let harness = Harness::new();
+    harness.configure(&[("broken", "malformed"), ("other", "barrier")]);
+    let barrier = harness.directory.path().join("protocol-barrier");
+    let plan = harness.plan(
+        "parallel-protocol",
+        json!([task("broken", &[]), task("other", &[]), task("later", &[])]),
+    );
+    let state_path = harness.state("parallel-protocol");
+    let child = harness.spawn_json_jobs_with_barrier(&plan, &state_path, 2, &barrier);
+    harness.wait_for_requests(3);
+    let request_log = harness.requests();
+    let mut names = request_names(&request_log);
+    names.sort_unstable();
+    assert_eq!(names, ["broken", "later", "other"]);
+    fs::write(barrier.join("release"), b"release").unwrap();
+
+    let error = error_document(&child.wait_with_output().unwrap());
+    assert_eq!(error["error"]["code"], "run_supervisor");
+    let state = read_state(&state_path);
+    assert_eq!(state["status"], "indeterminate");
+    assert_eq!(record(&state, "broken")["status"], "indeterminate");
+    assert_eq!(record(&state, "other")["status"], "succeeded");
+    assert_eq!(record(&state, "later")["status"], "succeeded");
+}
+
+#[test]
+fn resume_refuses_multiple_uncertain_active_attempts() {
+    let harness = Harness::new();
+    harness.configure(&[("first", "hold"), ("second", "hold")]);
+    let plan = harness.plan(
+        "uncertain-parallel",
+        json!([task("first", &[]), task("second", &[]), task("later", &[])]),
+    );
+    let state_path = harness.state("uncertain-parallel");
+    let mut child = harness.spawn_json_jobs(&plan, &state_path, 2);
+    harness.wait_for_requests(2);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+
+    let state = read_state(&state_path);
+    assert_eq!(record(&state, "first")["status"], "running");
+    assert_eq!(record(&state, "second")["status"], "running");
+    let before = harness.requests().len();
+    let error = error_document(&harness.resume_json_jobs(&plan, &state_path, 2));
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+    assert_eq!(harness.requests().len(), before);
+
+    for id in ["first", "second"] {
+        let attempt_state = PathBuf::from(
+            record(&state, id)["supervisor_state_path"]
+                .as_str()
+                .unwrap(),
+        );
+        let pid_path = PathBuf::from(format!("{}.pid", attempt_state.display()));
+        wait_for_path(&pid_path);
+        let pid: i32 = fs::read_to_string(pid_path).unwrap().parse().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    }
 }
 
 #[test]
@@ -1443,7 +1919,7 @@ fn resume_rejects_changed_plans_and_indeterminate_or_running_state() {
     let state = read_state(&indeterminate_state);
     assert_eq!(state["status"], "indeterminate");
     assert_eq!(record(&state, "broken")["status"], "indeterminate");
-    assert_eq!(record(&state, "pending")["status"], "pending");
+    assert_eq!(record(&state, "pending")["status"], "succeeded");
     let before = harness.requests().len();
     let unsafe_resume =
         error_document(&harness.resume_json(&indeterminate_plan, &indeterminate_state));
@@ -1672,7 +2148,7 @@ fn malformed_and_remote_supervisor_responses_persist_indeterminate_state() {
         let error = error_document(&harness.run_json(&plan, &state_path));
         assert_eq!(error["error"]["code"], "run_supervisor");
 
-        assert_eq!(request_names(&harness.requests()), [name]);
+        assert_eq!(request_names(&harness.requests()), [name, "later"]);
         let state = read_state(&state_path);
         let run_id = state["run_id"].as_str().expect("aggregate run ID");
         let canonical_state_path = state["state_path"]
@@ -1687,7 +2163,7 @@ fn malformed_and_remote_supervisor_responses_persist_indeterminate_state() {
         assert!(message.contains(canonical_state_path));
         assert_eq!(state["status"], "indeterminate");
         assert_eq!(record(&state, name)["status"], "indeterminate");
-        assert_eq!(record(&state, "later")["status"], "pending");
+        assert_eq!(record(&state, "later")["status"], "succeeded");
         assert!(record(&state, name)["reason"].as_str().is_some());
     }
 }

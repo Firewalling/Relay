@@ -5,7 +5,7 @@
 Relay contains a Rust CLI for recording project-local work sessions,
 checkpoints, categorized notes, handoffs, and bounded context for the next
 terminal agent. It also provides a Rust-owned, one-shot `relay run` coordinator
-for deterministic sequential DAG plans and `relay supervise`, a Rust launcher
+for deterministic bounded-parallel DAG plans and `relay supervise`, a Rust launcher
 for one explicitly requested local child process through the standalone Go
 supervisor. Relay does not implement an agent or model runtime, call
 model-provider APIs, inspect chat transcripts, or replace Git.
@@ -45,11 +45,11 @@ go build -o relay-supervisor ./cmd/relay-supervisor
 Ensure `$HOME/.local/bin` is on `PATH` if that is where you install Relay;
 Relay does not currently claim prebuilt packages or a crates.io release.
 
-## Run a sequential task plan
+## Run a bounded-parallel task plan
 
 ```sh
-relay run [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>
-relay run [--supervisor <ABSOLUTE_PATH>] --resume <ABSOLUTE_STATE_PATH> <PLAN>
+relay run [--jobs <N>] [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>
+relay run [--jobs <N>] [--supervisor <ABSOLUTE_PATH>] --resume <ABSOLUTE_STATE_PATH> <PLAN>
 ```
 
 `PLAN` is a JSON file. A new run accepts an optional absolute aggregate
@@ -107,20 +107,10 @@ may be 1–60,000 ms, stdout and stderr retention 1 byte–8 MiB each, and log
 retention 1 byte–4 MiB. Redaction indexes are zero-based indexes into
 `arguments`.
 
-Execution is deterministic and currently strictly sequential: the effective
-maximum parallelism is one, and Relay selects the first input-order pending
-task whose dependencies all succeeded. Only a supervisor result classified
-`completed`/`exit_zero` with exit code `0` succeeds. A nonzero exit, start
-failure, timeout, or kill fails the task. Cancellation stops the current
-invocation. If a task is active, Relay records its cancelled supervisor result;
-if the signal arrives between tasks, completed results remain completed.
-Not-yet-launched independent tasks stay pending. A failed or cancelled task
-blocks only its descendants, while independent ready tasks continue in input
-order after ordinary failures. A supervisor boundary error after the attempt is
-recorded as running makes the task and run `indeterminate`. The aggregate status
-is `completed` only when every task succeeds, `failed` when terminal work
-includes a failure or blocked descendant, `cancelled` when the invocation
-records cancellation, and `indeterminate` when certainty is lost.
+Execution is deterministic at scheduler selection and defaults to one active task. Use `--jobs N` to bound active tasks; each task starts only after every dependency succeeds, and independent ready tasks are selected in stable plan order. With `--jobs 1`, behavior remains sequential.
+Independent tasks may overlap when slots are available. Only a supervisor result classified `completed`/`exit_zero` with exit code `0` succeeds. A nonzero exit, start failure, timeout, or kill fails the task. Cancellation reaches every active supervisor and prevents new launches.
+If a task is active, Relay records its cancelled supervisor result; if the signal arrives between tasks, completed results remain completed. Not-yet-launched independent tasks stay pending. A failed, cancelled, or indeterminate task blocks only its descendants, while independent ready tasks continue.
+A supervisor boundary error after the attempt is recorded as running makes the task and run `indeterminate`. The aggregate status is `completed` only when every task succeeds, `failed` when terminal work includes a failure or blocked descendant, `cancelled` when the invocation records cancellation, and `indeterminate` when certainty is lost.
 
 Rust atomically owns the aggregate record. Its default path is
 `<project>/.relay/runs/<run-uuid>.json`, where `<project>` is selected by the
@@ -263,8 +253,8 @@ Relay supports these commands:
   `observation`, or `next_action`.
 - `context` emits bounded, recorded agent context; its filters are described
   below.
-- `run [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>`
-  executes a new sequential plan; replace `--state-path` with
+- `run [--jobs <N>] [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>`
+  executes a new bounded-parallel plan; replace `--state-path` with
   `--resume <ABSOLUTE_STATE_PATH>` to continue only safe pending work.
 - `supervise [OPTIONS] -- <ABSOLUTE_PROGRAM> [ARG...]` launches one local
   process through the external Go supervisor.

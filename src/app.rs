@@ -81,7 +81,7 @@ impl IntoRunOutput for ProtocolResult {
                  Transport: direct argv, one JSON document per process\n\
                  Output schema: {}\n\
                  State owner: Rust (schema {})\n\
-                 Built-in run coordinator: Rust (sequential)\n\
+                 Built-in run coordinator: Rust (bounded parallel DAG)\n\
                  Go one-child supervisor: implemented\n\
                  Manifest-v1 external orchestrator (owner Go): not implemented\n\
                  Lua workflow: not implemented\n\

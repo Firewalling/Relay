@@ -33,6 +33,7 @@ const SUPERVISOR_READY_ENV: &str = "RELAY_SUPERVISOR_READY_FD";
 const SUPERVISOR_READY_BYTE: u8 = b'R';
 const SUPERVISOR_ACK_BYTE: u8 = b'A';
 const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_ACTIVE_SUPERVISORS: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -428,7 +429,15 @@ fn execute_inner(
         }
     };
     let signals = if let Some(coordinator) = coordinator {
-        SignalRegistration::Coordinator(coordinator.activate(child.id() as i32))
+        let active = match coordinator.activate(child.id() as i32) {
+            Ok(active) => active,
+            Err(error) => {
+                kill_and_reap(&mut child);
+                join_failed_request_writer(request_writer)?;
+                return Err(error);
+            }
+        };
+        SignalRegistration::Coordinator(active)
     } else {
         match SignalForwarder::install(
             blocked_signals.expect("standalone execution blocks signals"),
@@ -1277,11 +1286,12 @@ fn test_pause_after_supervisor_spawn() -> Result<(), SupervisorError> {
                 "RELAY_TEST_SUPERVISOR_RELEASE is required",
             ))
         })?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut marker = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
         .open(marker)
         .map_err(SupervisorError::Transport)?;
+    marker.write_all(b"x").map_err(SupervisorError::Transport)?;
     while !release.exists() {
         thread::sleep(std::time::Duration::from_millis(5));
     }
@@ -1670,21 +1680,72 @@ struct SignalForwarder {
     previous_int: libc::sigaction,
     previous_term: libc::sigaction,
     previous_mask: libc::sigset_t,
+    slot: Option<usize>,
 }
 #[cfg(target_os = "linux")]
-static ACTIVE_SUPERVISOR_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static ACTIVE_SUPERVISOR_PIDS: [std::sync::atomic::AtomicI32; MAX_ACTIVE_SUPERVISORS] =
+    [const { std::sync::atomic::AtomicI32::new(0) }; MAX_ACTIVE_SUPERVISORS];
 #[cfg(target_os = "linux")]
 static CANCELLATION_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(target_os = "linux")]
+fn register_active_supervisor(pid: i32) -> Result<usize, SupervisorError> {
+    if pid <= 0 {
+        return Err(SupervisorError::Transport(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "supervisor PID must be positive",
+        )));
+    }
+    for (index, slot) in ACTIVE_SUPERVISOR_PIDS.iter().enumerate() {
+        if slot
+            .compare_exchange(
+                0,
+                pid,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Ok(index);
+        }
+    }
+    Err(SupervisorError::Transport(io::Error::other(
+        "active supervisor registry is full",
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn clear_active_supervisors() {
+    for slot in &ACTIVE_SUPERVISOR_PIDS {
+        slot.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn clear_active_supervisor(slot: usize, pid: i32) {
+    let _ = ACTIVE_SUPERVISOR_PIDS[slot].compare_exchange(
+        pid,
+        0,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
+}
+
 #[cfg(target_os = "linux")]
 extern "C" fn forward_signal(signal: libc::c_int) {
     CANCELLATION_SIGNAL.store(signal, std::sync::atomic::Ordering::Release);
-    let pid = ACTIVE_SUPERVISOR_PID.load(std::sync::atomic::Ordering::Acquire);
-    if pid > 0 {
-        unsafe {
-            libc::kill(pid, signal);
+    let mut index = 0;
+    while index < MAX_ACTIVE_SUPERVISORS {
+        let pid = ACTIVE_SUPERVISOR_PIDS[index].load(std::sync::atomic::Ordering::Acquire);
+        if pid > 0 {
+            unsafe {
+                libc::kill(pid, signal);
+            }
         }
+        index += 1;
     }
 }
+
 #[cfg(target_os = "linux")]
 impl SignalForwarder {
     fn install(blocked: BlockedSignals, pid: i32) -> Result<Self, SupervisorError> {
@@ -1706,11 +1767,24 @@ impl SignalForwarder {
                 libc::sigaction(libc::SIGINT, &previous_int, std::ptr::null_mut());
                 return Err(SupervisorError::Transport(error));
             }
-            ACTIVE_SUPERVISOR_PID.store(pid, std::sync::atomic::Ordering::Release);
+            let slot = if pid > 0 {
+                match register_active_supervisor(pid) {
+                    Ok(slot) => Some(slot),
+                    Err(error) => {
+                        libc::sigaction(libc::SIGINT, &previous_int, std::ptr::null_mut());
+                        libc::sigaction(libc::SIGTERM, &previous_term, std::ptr::null_mut());
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
             let previous_mask = match blocked.unblock() {
                 Ok(mask) => mask,
                 Err(error) => {
-                    ACTIVE_SUPERVISOR_PID.store(0, std::sync::atomic::Ordering::Release);
+                    if let Some(slot) = slot {
+                        clear_active_supervisor(slot, pid);
+                    }
                     libc::sigaction(libc::SIGINT, &previous_int, std::ptr::null_mut());
                     libc::sigaction(libc::SIGTERM, &previous_term, std::ptr::null_mut());
                     return Err(error);
@@ -1720,10 +1794,12 @@ impl SignalForwarder {
                 previous_int,
                 previous_term,
                 previous_mask,
+                slot,
             })
         }
     }
 }
+
 #[cfg(target_os = "linux")]
 impl Drop for SignalForwarder {
     fn drop(&mut self) {
@@ -1733,7 +1809,12 @@ impl Drop for SignalForwarder {
             libc::sigaddset(&mut signal_set, libc::SIGINT);
             libc::sigaddset(&mut signal_set, libc::SIGTERM);
             libc::pthread_sigmask(libc::SIG_BLOCK, &signal_set, std::ptr::null_mut());
-            ACTIVE_SUPERVISOR_PID.store(0, std::sync::atomic::Ordering::Release);
+            if let Some(slot) = self.slot {
+                clear_active_supervisor(
+                    slot,
+                    ACTIVE_SUPERVISOR_PIDS[slot].load(std::sync::atomic::Ordering::Acquire),
+                );
+            }
             libc::sigaction(libc::SIGINT, &self.previous_int, std::ptr::null_mut());
             libc::sigaction(libc::SIGTERM, &self.previous_term, std::ptr::null_mut());
             libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous_mask, std::ptr::null_mut());
@@ -1750,6 +1831,7 @@ impl CoordinatorSignals {
     pub fn install() -> Result<Self, SupervisorError> {
         let blocked = BlockedSignals::new()?;
         CANCELLATION_SIGNAL.store(0, std::sync::atomic::Ordering::Release);
+        clear_active_supervisors();
         Ok(Self {
             _forwarder: SignalForwarder::install(blocked, 0)?,
         })
@@ -1759,31 +1841,27 @@ impl CoordinatorSignals {
         CANCELLATION_SIGNAL.load(std::sync::atomic::Ordering::Acquire) != 0
     }
 
-    fn activate(&self, pid: i32) -> ActiveSupervisor {
-        ACTIVE_SUPERVISOR_PID.store(pid, std::sync::atomic::Ordering::Release);
+    fn activate(&self, pid: i32) -> Result<ActiveSupervisor, SupervisorError> {
+        let slot = register_active_supervisor(pid)?;
         let signal = CANCELLATION_SIGNAL.load(std::sync::atomic::Ordering::Acquire);
         if signal != 0 {
             unsafe {
                 libc::kill(pid, signal);
             }
         }
-        ActiveSupervisor { pid }
+        Ok(ActiveSupervisor { pid, slot })
     }
 }
 
 #[cfg(target_os = "linux")]
 struct ActiveSupervisor {
     pid: i32,
+    slot: usize,
 }
 #[cfg(target_os = "linux")]
 impl Drop for ActiveSupervisor {
     fn drop(&mut self) {
-        let _ = ACTIVE_SUPERVISOR_PID.compare_exchange(
-            self.pid,
-            0,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        );
+        clear_active_supervisor(self.slot, self.pid);
     }
 }
 #[cfg(target_os = "linux")]
@@ -1820,8 +1898,8 @@ impl CoordinatorSignals {
     pub fn cancellation_requested(&self) -> bool {
         false
     }
-    fn activate(&self, _: i32) -> ActiveSupervisor {
-        ActiveSupervisor
+    fn activate(&self, _: i32) -> Result<ActiveSupervisor, SupervisorError> {
+        Ok(ActiveSupervisor)
     }
 }
 #[cfg(not(target_os = "linux"))]
@@ -1844,6 +1922,8 @@ impl SignalRegistration {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
     fn accepts_protocol_run_ids_and_rejects_invalid_ones() {
         assert!(valid_run_id("run_1.2-3"));
@@ -1914,7 +1994,31 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn active_supervisor_registration_removal_is_race_safe() {
+        let _guard = SIGNAL_TEST_LOCK.lock().unwrap();
+        clear_active_supervisors();
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                scope.spawn(move || {
+                    for iteration in 0..128 {
+                        let pid = 10_000 + worker * 1_000 + iteration;
+                        let slot = register_active_supervisor(pid).unwrap();
+                        clear_active_supervisor(slot, pid);
+                    }
+                });
+            }
+        });
+        assert!(
+            ACTIVE_SUPERVISOR_PIDS
+                .iter()
+                .all(|slot| slot.load(std::sync::atomic::Ordering::Acquire) == 0)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn forwards_a_signal_delivered_before_supervisor_spawn() {
+        let _guard = SIGNAL_TEST_LOCK.lock().unwrap();
         let blocked = BlockedSignals::new().unwrap();
         assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
         let (ready_parent, ready_child) = supervisor_ready_socketpair().unwrap();
