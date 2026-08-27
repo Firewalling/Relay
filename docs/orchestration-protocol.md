@@ -9,7 +9,7 @@ creating files. The canonical v1 manifest is
 Relay also includes two capabilities that manifest v1 does not advertise:
 `relay supervise`, a project-independent Rust launcher for the standalone Go
 one-child supervisor at `cmd/relay-supervisor`, and the built-in Rust
-`relay run` sequential DAG coordinator described separately below. Go
+`relay run` bounded-parallel DAG coordinator described separately below. Go
 supervises one child attempt; it is not a scheduler, queue, daemon, remote
 executor, or Lua runtime. Child termination and child-output capture remain
 exclusively in Go rather than being duplicated by Rust. Allowed Git-aware Rust
@@ -26,7 +26,7 @@ output schema version, and on-disk state schema version are independent:
 - `protocol_version: 1` identifies this orchestration contract.
 - `relay_version` identifies the Relay binary that reported it.
 - `output_schema_version: 1` identifies Relay's success and error envelopes.
-- `state.schema_version: 1` identifies the Rust-owned `.relay` state schema.
+- aggregate run-state schema_version: 2 identifies the Rust-owned DAG state schema; the immutable protocol manifest remains v1.
 
 `relay protocol` is project-independent. Global options may precede or follow
 the subcommand, and even `--scope repository` does not trigger repository
@@ -113,7 +113,7 @@ stdin data.
 
 - **Rust** owns all `.relay` state, state validation, locking, Relay command
   behavior, JSON envelopes, protocol manifest reporting, the
-  project-independent `supervise` launcher, and the built-in sequential DAG
+  project-independent `supervise` launcher, and the built-in bounded-parallel DAG
   coordinator. Rust exclusively owns aggregate coordinator state, including
   the default project path under `.relay/runs`; it never writes Go attempt
   records and reads only the bounded identity fields needed for the legacy-v1
@@ -139,14 +139,14 @@ versioned subordinate contracts, not extensions to Rust's existing project
 state schema or to `manifest-v1.json`. Existing Rust commands, schema-v1
 projects, and protocol-v1 consumers therefore remain compatible.
 
-## Built-in Rust sequential DAG coordinator
+## Built-in Rust bounded-parallel DAG coordinator
 
 `relay run` is a one-shot, project-scoped Rust coordinator above the typed
 one-child supervisor boundary:
 
 ```text
-relay run [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>
-relay run [--supervisor <ABSOLUTE_PATH>] --resume <ABSOLUTE_STATE_PATH> <PLAN>
+relay run [--jobs <N>] [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>
+relay run [--jobs <N>] [--supervisor <ABSOLUTE_PATH>] --resume <ABSOLUTE_STATE_PATH> <PLAN>
 ```
 
 Rust reads the plan from `PLAN`, discovers the current project for its default
@@ -180,16 +180,19 @@ working-directory, and argument strings.
 
 ### Aggregate and attempt state ownership
 
-Aggregate run-state v1 is also a closed Rust schema. By default Rust atomically
+Aggregate run-state v2 is a closed Rust schema. By default Rust atomically
 persists it at `<project>/.relay/runs/<run-uuid>.json`; `--state-path` selects
-an absolute custom path, which remains Rust-owned. A custom path containing a
-`.relay` component is accepted only beneath the current project's
-`.relay/runs` directory. Symlinked state-path components are rejected, an
-adjacent advisory lock prevents two coordinators from owning the same run, and
+an absolute custom path, which remains Rust-owned. Valid aggregate v1 records
+omit `jobs`, imply sequential `jobs: 1`, and are migrated to v2 on safe resume.
+A v1 record with running or indeterminate task work remains non-resumable. A
+custom path containing a `.relay` component is accepted only beneath the current
+project's `.relay/runs` directory. Symlinked state-path components are rejected;
+an adjacent advisory lock prevents two coordinators from owning the same run, and
 resume reads are bounded to 4 MiB.
 
 The aggregate contains schema and run identity, creation/update timestamps,
-run status, the ordered task records, and a sanitized copy of the closed plan.
+run status, the requested jobs limit, ordered task records, and a sanitized copy
+of the closed plan.
 Run status is one of `running`, `completed`, `failed`, `cancelled`, or
 `indeterminate`; task status is one of `pending`, `running`, `succeeded`,
 `failed`, `cancelled`, `blocked`, or `indeterminate`. Closed decoding and
@@ -223,39 +226,46 @@ persisted `run`, now marked `indeterminate`.
 
 ### Scheduling, failure, cancellation, and resume
 
-This milestone permits exactly one active task. Rust repeatedly selects the
-first input-order `pending` task whose dependencies all succeeded. A task
-succeeds only for the typed combination `completed`, `exit_zero`, and exit code
-zero. Nonzero exit, start failure, timeout, and non-cancellation forced cleanup
-are task failures; a clean cancellation outcome is `cancelled`. Failed and
-cancelled dependencies block their descendants transitively, while independent
-ready tasks continue in input order after ordinary failures. An indeterminate
-attempt instead halts coordination without claiming or propagating an outcome.
+The coordinator permits up to N active tasks from `--jobs` (default `1`). It
+repeatedly fills available slots by selecting the first input-order `pending`
+task whose dependencies all succeeded. It persists each task as `running` with
+a fresh attempt UUID and Go record path before launch, then waits for any
+completion. `--jobs 1` preserves sequential behavior. Independent ready tasks
+may overlap when N is greater than one; selection remains deterministic even
+when completion order varies.
 
-Catchable `SIGINT` or `SIGTERM` is forwarded through the Rust launcher to the
-active Go supervisor. A clean cancellation result marks that task `cancelled`,
-blocks its dependants, persists aggregate state, and stops scheduling further
-tasks in that invocation. Any supervisor transport or response-protocol failure
-after Rust has durably marked the attempt `running` makes the task and run
-`indeterminate`, including a launcher failure before child spawn. Relay persists
-that uncertainty and returns an application error without claiming a child
-outcome.
+A task succeeds only for the typed combination `completed`, `exit_zero`, and
+exit code zero. Nonzero exit, start failure, timeout, and non-cancellation
+forced cleanup are task failures; a clean cancellation outcome is `cancelled`.
+Failed, cancelled, and indeterminate dependencies block descendants
+transitively, while unrelated ready tasks continue. An indeterminate attempt
+does not become rerunnable work; the coordinator continues only safe unrelated
+branches and returns an indeterminate application error.
+
+Catchable `SIGINT` or `SIGTERM` is latched globally and forwarded through a
+race-safe registry to every active Go supervisor. Registration during startup
+rechecks the latch, and once cancellation is latched no new DAG task is
+scheduled. Clean cancellation results are persisted per task; pending work
+remains resumable after a clean run exit. Coordinator state failures stop new
+launches, latch and forward cancellation, drain and join every active worker,
+classify safe completions, preserve uncertain attempts as indeterminate, and
+make a best-effort final aggregate persist before returning the original error.
 
 Resume always requires the caller to provide the plan again. Rust compares its
 sanitized form with the persisted plan, validates task identity and aggregate
 consistency, and refuses any state containing `running` or `indeterminate`
-work. It never reruns `succeeded`, `failed`, `cancelled`, `blocked`,
-`running`, or `indeterminate` tasks; it can continue only still-`pending`
-independent work after a prior clean terminal response. There are no retries
-and no recovery claim for work whose outcome is active or uncertain.
+work. It never reruns `succeeded`, `failed`, `cancelled`, `blocked`, `running`,
+or `indeterminate` tasks; it can continue only still-`pending` independent
+work after a prior clean terminal response. There are no retries and no
+recovery claim for work whose outcome is active or uncertain.
 
 ### Coordinator limits and non-guarantees
 
 The coordinator and supervisor execution path is currently Linux-only. The
-single active-task limit is deliberate; it is not hidden parallelism. There is
-no daemon, queue, network or remote execution, authentication, provider,
-workflow inference, Lua runtime, sandbox, retry engine, or transcript scraping.
-Go's Linux process-group cleanup covers the direct child and descendants that
+jobs limit is bounded by the plan's 64-task maximum; `--jobs 1` is deliberate
+sequential behavior, not hidden parallelism. There is no daemon, queue,
+network or remote execution, authentication, provider, workflow inference, Lua
+runtime, sandbox, retry engine, or transcript scraping. Go's Linux process-group cleanup covers the direct child and descendants that
 remain in that group, subject to the supervisor limitations below. Neither the
 coordinator nor the supervisor guarantees containment or cleanup of a process
 that detaches into another session/group, nor recovery after supervisor
@@ -654,10 +664,10 @@ Protocol v1 and the supervisor require all of the following:
   document, negotiated schema versions, and bounded retention.
 - Never read or write `.relay` from Go. Rust remains the only owner of project
   state and locking; Go owns only separate per-attempt records outside `.relay`.
-- Do not infer an externally advertised or parallel orchestrator, queue,
-  workflow runtime, authentication mechanism, credential discovery, network
-  service, or telemetry. The built-in Rust coordinator is sequential and Go is
-  not its scheduler.
+- Do not infer an externally advertised orchestrator, queue, workflow runtime,
+  authentication mechanism, credential discovery, network service, or telemetry.
+  The built-in Rust coordinator owns bounded parallel scheduling; Go is not its
+  scheduler.
 - Filter the child environment, reject sensitive names, redact declared
   sensitive arguments, and persist metadata rather than environment values.
 - Keep stdout, stderr, and observation metadata bounded while continuing to
@@ -692,12 +702,10 @@ migration policy.
 
 The Go component supervises exactly one local process and persists one separate
 local attempt record outside `.relay`. The built-in Rust coordinator supplies a
-dependency graph
-and deterministic sequential scheduling, but neither it nor `relay supervise`
-makes the manifest's externally advertised `orchestrator.implemented` value
-true. There is no parallel scheduler, queue, retry engine, daemon, remote
-execution, authentication, deployment layer, Lua parser, Lua runtime, or Lua
-sandbox. Execution is currently limited to Linux. Self-detaching descendants
+dependency graph and bounded parallel scheduling, but neither it nor `relay
+supervise` makes the manifest's externally advertised `orchestrator.implemented`
+value true. There is no queue, retry engine, daemon, remote execution,
+authentication, deployment layer, Lua parser, Lua runtime, or Lua sandbox. Execution is currently limited to Linux. Self-detaching descendants
 and uncatchable process or machine termination require an external OS
 containment boundary.
 

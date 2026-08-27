@@ -152,6 +152,9 @@ pub struct RunArgs {
     /// Absolute path to the relay-supervisor executable.
     #[arg(long)]
     pub supervisor: Option<std::path::PathBuf>,
+    /// Maximum number of DAG tasks to run simultaneously.
+    #[arg(long, default_value_t = 1, value_parser = parse_jobs)]
+    pub jobs: usize,
     /// Absolute aggregate run state path for a new run.
     #[arg(long)]
     pub state_path: Option<std::path::PathBuf>,
@@ -372,6 +375,17 @@ pub struct SearchArgs {
     pub limit: usize,
 }
 
+fn parse_jobs(value: &str) -> Result<usize, String> {
+    let jobs = value
+        .parse::<usize>()
+        .map_err(|_| "jobs must be a positive integer".to_owned())?;
+    if jobs > 0 {
+        Ok(jobs)
+    } else {
+        Err("jobs must be a positive integer".to_owned())
+    }
+}
+
 fn parse_rfc3339_utc(value: &str) -> Result<DateTime<Utc>, String> {
     DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.with_timezone(&Utc))
@@ -430,6 +444,23 @@ mod tests {
         assert_eq!(before.scope, ProjectScope::Repository);
         assert_eq!(after.global_options().output, OutputFormat::Json);
         assert_eq!(after.scope, ProjectScope::Current);
+    }
+
+    #[test]
+    fn run_jobs_default_is_one_and_positive_values_parse() {
+        let default = Cli::try_parse_from(["relay", "run", "plan.json"]).unwrap();
+        let explicit = Cli::try_parse_from(["relay", "run", "--jobs", "65", "plan.json"]).unwrap();
+        let zero = Cli::try_parse_from(["relay", "run", "--jobs", "0", "plan.json"]);
+
+        assert!(matches!(
+            default.command,
+            Command::Run(RunArgs { jobs: 1, .. })
+        ));
+        assert!(matches!(
+            explicit.command,
+            Command::Run(RunArgs { jobs: 65, .. })
+        ));
+        assert!(zero.is_err());
     }
 
     #[test]

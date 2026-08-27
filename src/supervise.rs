@@ -33,6 +33,8 @@ const SUPERVISOR_READY_ENV: &str = "RELAY_SUPERVISOR_READY_FD";
 const SUPERVISOR_READY_BYTE: u8 = b'R';
 const SUPERVISOR_ACK_BYTE: u8 = b'A';
 const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_ACTIVE_SUPERVISORS: usize = 64;
+const LEGACY_READY_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -48,6 +50,8 @@ pub enum SupervisorError {
         #[source]
         source: io::Error,
     },
+    #[error("supervisor launch cancelled before spawn")]
+    CancelledBeforeLaunch,
     #[error("could not communicate with supervisor: {0}")]
     Transport(#[source] io::Error),
     #[error("supervisor response exceeded the 32 MiB limit on {stream}")]
@@ -64,6 +68,7 @@ impl SupervisorError {
             Self::NotFound => "supervisor_not_found",
             Self::InvalidRequest(_) => "supervisor_invalid_request",
             Self::Spawn { .. } => "supervisor_spawn",
+            Self::CancelledBeforeLaunch => "supervisor_cancelled_before_launch",
             Self::Transport(_) => "supervisor_transport",
             Self::ResponseTooLarge { .. } => "supervisor_response_too_large",
             Self::InvalidResponse(_) => "supervisor_invalid_response",
@@ -391,10 +396,28 @@ fn execute_inner(
     configure_supervisor_child(&mut command, ready_child.as_raw_fd())?;
     let state_path = Path::new(&request.state_path);
     let initial_state = snapshot_state_path(state_path)?;
-    let mut child = command.spawn().map_err(|source| SupervisorError::Spawn {
+    let mut launch_reservation = match coordinator {
+        Some(coordinator) => coordinator
+            .reserve_launch()
+            .ok_or(SupervisorError::CancelledBeforeLaunch)
+            .map(Some)?,
+        None => None,
+    };
+    test_pause_before_supervisor_spawn()?;
+    if coordinator.is_some_and(CoordinatorSignals::cancellation_requested) {
+        drop(launch_reservation);
+        return Err(SupervisorError::CancelledBeforeLaunch);
+    }
+    test_pause("after_spawn_cancellation_check")?;
+    let spawn_result = command.spawn();
+    let mut child = spawn_result.map_err(|source| SupervisorError::Spawn {
         path: supervisor,
         source,
     })?;
+    let cancellation_at_spawn = coordinator.is_some_and(CoordinatorSignals::cancellation_requested);
+    if let Some(reservation) = launch_reservation.as_mut() {
+        reservation.release_spawn();
+    }
     drop(ready_child);
 
     // Start request delivery before readiness for request-first legacy
@@ -402,33 +425,57 @@ fn execute_inner(
     // Current supervisors leave the request buffered until Relay acknowledges
     // their installed signal handling.
     let mut stdin = child.stdin.take().expect("piped stdin is present");
-    let request_writer = thread::spawn(move || {
-        let write_error = stdin
-            .write_all(&request_bytes)
-            .and_then(|_| stdin.write_all(b"\n"))
-            .err();
-        drop(stdin);
-        write_error
-    });
+    let request_writer = thread::Builder::new()
+        .name("relay-supervisor-request-writer".into())
+        .spawn(move || {
+            let write_error = stdin
+                .write_all(&request_bytes)
+                .and_then(|_| stdin.write_all(b"\n"))
+                .err();
+            drop(stdin);
+            write_error
+        })
+        .map_err(|source| {
+            kill_and_reap(&mut child);
+            SupervisorError::Transport(source)
+        })?;
 
-    let readiness = match test_pause_after_supervisor_spawn().and_then(|_| {
-        wait_for_supervisor_ready(
-            &mut child,
-            ready_parent,
-            state_path,
-            initial_state,
-            &request.run_id,
-        )
-    }) {
+    // Publish coordinator supervisor PIDs before readiness. Standalone
+    // supervise keeps legacy proof gating for stale-state safety.
+    let signals = if let Some(coordinator) = coordinator {
+        let active = match coordinator.activate(child.id() as i32) {
+            Ok(active) => active,
+            Err(error) => {
+                kill_and_reap(&mut child);
+                join_failed_request_writer(request_writer)?;
+                return Err(error);
+            }
+        };
+        Some(SignalRegistration::Coordinator(active))
+    } else {
+        None
+    };
+
+    let readiness = match wait_for_supervisor_ready(
+        &mut child,
+        ready_parent,
+        state_path,
+        initial_state,
+        &request.run_id,
+    ) {
         Ok(readiness) => readiness,
         Err(error) => {
-            kill_and_reap(&mut child);
+            if let Some(signals) = signals {
+                kill_disarm_and_reap(&mut child, signals);
+            } else {
+                kill_and_reap(&mut child);
+            }
             join_failed_request_writer(request_writer)?;
             return Err(error);
         }
     };
-    let signals = if let Some(coordinator) = coordinator {
-        SignalRegistration::Coordinator(coordinator.activate(child.id() as i32))
+    let mut signals = if let Some(signals) = signals {
+        signals
     } else {
         match SignalForwarder::install(
             blocked_signals.expect("standalone execution blocks signals"),
@@ -442,6 +489,17 @@ fn execute_inner(
             }
         }
     };
+    if cancellation_at_spawn && matches!(&readiness, SupervisorReadiness::Current(_)) {
+        kill_disarm_and_reap(&mut child, signals);
+        join_failed_request_writer(request_writer)?;
+        return Err(SupervisorError::CancelledBeforeLaunch);
+    }
+    signals.commit_startup();
+    if let Err(error) = test_pause_after_supervisor_spawn() {
+        kill_disarm_and_reap(&mut child, signals);
+        join_failed_request_writer(request_writer)?;
+        return Err(error);
+    }
     if let Err(error) = finish_supervisor_readiness(readiness) {
         kill_disarm_and_reap(&mut child, signals);
         join_failed_request_writer(request_writer)?;
@@ -449,8 +507,29 @@ fn execute_inner(
     }
     let stdout = child.stdout.take().expect("piped stdout is present");
     let stderr = child.stderr.take().expect("piped stderr is present");
-    let stdout_reader = thread::spawn(move || read_bounded(stdout, "stdout"));
-    let stderr_reader = thread::spawn(move || read_bounded(stderr, "stderr"));
+    let stdout_reader = match thread::Builder::new()
+        .name("relay-supervisor-stdout-reader".into())
+        .spawn(move || read_bounded(stdout, "stdout"))
+    {
+        Ok(reader) => reader,
+        Err(source) => {
+            kill_disarm_and_reap(&mut child, signals);
+            let _ = request_writer.join();
+            return Err(SupervisorError::Transport(source));
+        }
+    };
+    let stderr_reader = match thread::Builder::new()
+        .name("relay-supervisor-stderr-reader".into())
+        .spawn(move || read_bounded(stderr, "stderr"))
+    {
+        Ok(reader) => reader,
+        Err(source) => {
+            kill_disarm_and_reap(&mut child, signals);
+            let _ = stdout_reader.join();
+            let _ = request_writer.join();
+            return Err(SupervisorError::Transport(source));
+        }
+    };
     let status = wait_for_supervisor(&mut child, signals);
     let stdout = stdout_reader
         .join()
@@ -1255,10 +1334,8 @@ fn human_output(state_path: &str, execution: &ExecutionResult) -> String {
 }
 
 #[cfg(debug_assertions)]
-fn test_pause_after_supervisor_spawn() -> Result<(), SupervisorError> {
-    if env::var_os("RELAY_TEST_SUPERVISOR_PAUSE").as_deref()
-        != Some(OsStr::new("after_spawn_before_activation"))
-    {
+fn test_pause(point: &str) -> Result<(), SupervisorError> {
+    if env::var_os("RELAY_TEST_SUPERVISOR_PAUSE").as_deref() != Some(OsStr::new(point)) {
         return Ok(());
     }
     let marker = env::var_os("RELAY_TEST_SUPERVISOR_MARKER")
@@ -1277,14 +1354,30 @@ fn test_pause_after_supervisor_spawn() -> Result<(), SupervisorError> {
                 "RELAY_TEST_SUPERVISOR_RELEASE is required",
             ))
         })?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut marker = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
         .open(marker)
         .map_err(SupervisorError::Transport)?;
+    marker.write_all(b"x").map_err(SupervisorError::Transport)?;
     while !release.exists() {
         thread::sleep(std::time::Duration::from_millis(5));
     }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn test_pause_before_supervisor_spawn() -> Result<(), SupervisorError> {
+    test_pause("before_spawn_after_reservation")
+}
+
+#[cfg(debug_assertions)]
+fn test_pause_after_supervisor_spawn() -> Result<(), SupervisorError> {
+    test_pause("after_spawn_before_activation")
+}
+
+#[cfg(not(debug_assertions))]
+fn test_pause_before_supervisor_spawn() -> Result<(), SupervisorError> {
     Ok(())
 }
 
@@ -1422,6 +1515,11 @@ struct LegacyExecutionProof {
     run_id: String,
     protocol_version: u32,
 }
+#[derive(Deserialize)]
+struct LegacyDirectExecutionIdentity {
+    run_id: String,
+    protocol_version: u32,
+}
 
 fn snapshot_state_path(state_path: &Path) -> Result<Option<StatePathSnapshot>, SupervisorError> {
     match std::fs::symlink_metadata(state_path) {
@@ -1448,18 +1546,41 @@ fn legacy_state_ready(
         return Ok(false);
     }
 
-    let file = std::fs::File::open(state_path).map_err(SupervisorError::Transport)?;
-    let proof: LegacyStateProof =
-        match serde_json::from_reader(file.take(MAX_LEGACY_STATE_PROOF_BYTES)) {
-            Ok(proof) => proof,
-            Err(_) => return Ok(false),
-        };
-    Ok(proof.run_state_version == 1
-        && !proof.supervisor_version.is_empty()
-        && proof.execution.protocol_version == EXECUTION_PROTOCOL_VERSION
-        && proof.execution.run_id == run_id)
+    let mut bytes = Vec::new();
+    std::fs::File::open(state_path)
+        .map_err(SupervisorError::Transport)?
+        .take(MAX_LEGACY_STATE_PROOF_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(SupervisorError::Transport)?;
+    if let Ok(proof) = serde_json::from_slice::<LegacyStateProof>(&bytes) {
+        return Ok(proof.run_state_version == 1
+            && !proof.supervisor_version.is_empty()
+            && proof.execution.protocol_version == EXECUTION_PROTOCOL_VERSION
+            && proof.execution.run_id == run_id);
+    }
+    let execution = match serde_json::from_slice::<LegacyDirectExecutionIdentity>(&bytes) {
+        Ok(execution) => execution,
+        Err(_) => return Ok(false),
+    };
+    Ok(execution.protocol_version == EXECUTION_PROTOCOL_VERSION && execution.run_id == run_id)
 }
 
+fn legacy_state_ready_with_grace(
+    state_path: &Path,
+    initial_state: Option<StatePathSnapshot>,
+    run_id: &str,
+) -> Result<bool, SupervisorError> {
+    let deadline = Instant::now() + LEGACY_READY_GRACE;
+    loop {
+        if legacy_state_ready(state_path, initial_state, run_id)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
 enum SupervisorReadiness {
     Current(OwnedFd),
     Legacy(OwnedFd),
@@ -1549,6 +1670,9 @@ fn wait_for_supervisor_ready(
                 .map_err(SupervisorError::Transport)?
                 .is_some()
             {
+                if legacy_state_ready_with_grace(state_path, initial_state, run_id)? {
+                    return Ok(SupervisorReadiness::Legacy(ready_socket));
+                }
                 return Err(SupervisorError::Transport(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "supervisor exited before reporting readiness",
@@ -1572,7 +1696,7 @@ fn wait_for_supervisor_ready(
             return Err(SupervisorError::Transport(error));
         }
         if read_result == 0 {
-            if legacy_state_ready(state_path, initial_state, run_id)? {
+            if legacy_state_ready_with_grace(state_path, initial_state, run_id)? {
                 return Ok(SupervisorReadiness::Legacy(ready_socket));
             }
             return Err(SupervisorError::Transport(io::Error::new(
@@ -1670,21 +1794,113 @@ struct SignalForwarder {
     previous_int: libc::sigaction,
     previous_term: libc::sigaction,
     previous_mask: libc::sigset_t,
+    slot: Option<usize>,
 }
 #[cfg(target_os = "linux")]
-static ACTIVE_SUPERVISOR_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static ACTIVE_SUPERVISOR_PIDS: [std::sync::atomic::AtomicI32; MAX_ACTIVE_SUPERVISORS] =
+    [const { std::sync::atomic::AtomicI32::new(0) }; MAX_ACTIVE_SUPERVISORS];
 #[cfg(target_os = "linux")]
 static CANCELLATION_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 #[cfg(target_os = "linux")]
-extern "C" fn forward_signal(signal: libc::c_int) {
-    CANCELLATION_SIGNAL.store(signal, std::sync::atomic::Ordering::Release);
-    let pid = ACTIVE_SUPERVISOR_PID.load(std::sync::atomic::Ordering::Acquire);
-    if pid > 0 {
-        unsafe {
-            libc::kill(pid, signal);
+fn register_active_supervisor(pid: i32) -> Result<usize, SupervisorError> {
+    if pid <= 0 {
+        return Err(SupervisorError::Transport(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "supervisor PID must be positive",
+        )));
+    }
+    for (index, slot) in ACTIVE_SUPERVISOR_PIDS.iter().enumerate() {
+        if slot
+            .compare_exchange(
+                0,
+                pid,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Ok(index);
         }
     }
+    Err(SupervisorError::Transport(io::Error::other(
+        "active supervisor registry is full",
+    )))
 }
+#[cfg(target_os = "linux")]
+fn register_starting_supervisor(pid: i32) -> Result<usize, SupervisorError> {
+    if pid <= 0 {
+        return Err(SupervisorError::Transport(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "supervisor PID must be positive",
+        )));
+    }
+    let registered_pid = -pid;
+    for (index, slot) in ACTIVE_SUPERVISOR_PIDS.iter().enumerate() {
+        if slot
+            .compare_exchange(
+                0,
+                registered_pid,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Ok(index);
+        }
+    }
+    Err(SupervisorError::Transport(io::Error::other(
+        "active supervisor registry is full",
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn clear_active_supervisors() {
+    for slot in &ACTIVE_SUPERVISOR_PIDS {
+        slot.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn clear_active_supervisor(slot: usize, pid: i32) {
+    let _ = ACTIVE_SUPERVISOR_PIDS[slot].compare_exchange(
+        pid,
+        0,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
+}
+
+#[cfg(target_os = "linux")]
+extern "C" fn forward_signal(signal: libc::c_int) {
+    latch_and_forward_signal(signal);
+}
+
+#[cfg(target_os = "linux")]
+fn latch_and_forward_signal(signal: libc::c_int) {
+    if CANCELLATION_SIGNAL
+        .compare_exchange(
+            0,
+            signal,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let mut index = 0;
+    while index < MAX_ACTIVE_SUPERVISORS {
+        let pid = ACTIVE_SUPERVISOR_PIDS[index].load(std::sync::atomic::Ordering::Acquire);
+        if pid > 0 {
+            unsafe {
+                libc::kill(pid, signal);
+            }
+        }
+        index += 1;
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl SignalForwarder {
     fn install(blocked: BlockedSignals, pid: i32) -> Result<Self, SupervisorError> {
@@ -1706,11 +1922,24 @@ impl SignalForwarder {
                 libc::sigaction(libc::SIGINT, &previous_int, std::ptr::null_mut());
                 return Err(SupervisorError::Transport(error));
             }
-            ACTIVE_SUPERVISOR_PID.store(pid, std::sync::atomic::Ordering::Release);
+            let slot = if pid > 0 {
+                match register_active_supervisor(pid) {
+                    Ok(slot) => Some(slot),
+                    Err(error) => {
+                        libc::sigaction(libc::SIGINT, &previous_int, std::ptr::null_mut());
+                        libc::sigaction(libc::SIGTERM, &previous_term, std::ptr::null_mut());
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
             let previous_mask = match blocked.unblock() {
                 Ok(mask) => mask,
                 Err(error) => {
-                    ACTIVE_SUPERVISOR_PID.store(0, std::sync::atomic::Ordering::Release);
+                    if let Some(slot) = slot {
+                        clear_active_supervisor(slot, pid);
+                    }
                     libc::sigaction(libc::SIGINT, &previous_int, std::ptr::null_mut());
                     libc::sigaction(libc::SIGTERM, &previous_term, std::ptr::null_mut());
                     return Err(error);
@@ -1720,10 +1949,12 @@ impl SignalForwarder {
                 previous_int,
                 previous_term,
                 previous_mask,
+                slot,
             })
         }
     }
 }
+
 #[cfg(target_os = "linux")]
 impl Drop for SignalForwarder {
     fn drop(&mut self) {
@@ -1733,7 +1964,12 @@ impl Drop for SignalForwarder {
             libc::sigaddset(&mut signal_set, libc::SIGINT);
             libc::sigaddset(&mut signal_set, libc::SIGTERM);
             libc::pthread_sigmask(libc::SIG_BLOCK, &signal_set, std::ptr::null_mut());
-            ACTIVE_SUPERVISOR_PID.store(0, std::sync::atomic::Ordering::Release);
+            if let Some(slot) = self.slot {
+                clear_active_supervisor(
+                    slot,
+                    ACTIVE_SUPERVISOR_PIDS[slot].load(std::sync::atomic::Ordering::Acquire),
+                );
+            }
             libc::sigaction(libc::SIGINT, &self.previous_int, std::ptr::null_mut());
             libc::sigaction(libc::SIGTERM, &self.previous_term, std::ptr::null_mut());
             libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous_mask, std::ptr::null_mut());
@@ -1744,46 +1980,132 @@ impl Drop for SignalForwarder {
 #[cfg(target_os = "linux")]
 pub struct CoordinatorSignals {
     _forwarder: SignalForwarder,
+    launch_in_progress: std::sync::atomic::AtomicBool,
 }
 #[cfg(target_os = "linux")]
 impl CoordinatorSignals {
     pub fn install() -> Result<Self, SupervisorError> {
         let blocked = BlockedSignals::new()?;
-        CANCELLATION_SIGNAL.store(0, std::sync::atomic::Ordering::Release);
+        CANCELLATION_SIGNAL.store(0, std::sync::atomic::Ordering::SeqCst);
+        clear_active_supervisors();
         Ok(Self {
             _forwarder: SignalForwarder::install(blocked, 0)?,
+            launch_in_progress: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub fn cancellation_requested(&self) -> bool {
-        CANCELLATION_SIGNAL.load(std::sync::atomic::Ordering::Acquire) != 0
+        CANCELLATION_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) != 0
     }
 
-    fn activate(&self, pid: i32) -> ActiveSupervisor {
-        ACTIVE_SUPERVISOR_PID.store(pid, std::sync::atomic::Ordering::Release);
-        let signal = CANCELLATION_SIGNAL.load(std::sync::atomic::Ordering::Acquire);
-        if signal != 0 {
-            unsafe {
-                libc::kill(pid, signal);
+    pub fn request_cancellation(&self) {
+        latch_and_forward_signal(libc::SIGTERM);
+    }
+
+    fn reserve_launch(&self) -> Option<LaunchReservation<'_>> {
+        loop {
+            if self.cancellation_requested() {
+                return None;
             }
+            if self
+                .launch_in_progress
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                if self.cancellation_requested() {
+                    self.release_launch();
+                    return None;
+                }
+                return Some(LaunchReservation {
+                    coordinator: self,
+                    spawn_reserved: true,
+                });
+            }
+            thread::yield_now();
         }
-        ActiveSupervisor { pid }
+    }
+
+    fn release_launch(&self) {
+        self.launch_in_progress
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn activate(&self, pid: i32) -> Result<ActiveSupervisor, SupervisorError> {
+        let slot = register_starting_supervisor(pid)?;
+        Ok(ActiveSupervisor {
+            pid,
+            slot,
+            startup: true,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LaunchReservation<'a> {
+    coordinator: &'a CoordinatorSignals,
+    spawn_reserved: bool,
+}
+#[cfg(target_os = "linux")]
+impl LaunchReservation<'_> {
+    fn release_spawn(&mut self) {
+        if self.spawn_reserved {
+            self.coordinator.release_launch();
+            self.spawn_reserved = false;
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for LaunchReservation<'_> {
+    fn drop(&mut self) {
+        self.release_spawn();
     }
 }
 
 #[cfg(target_os = "linux")]
 struct ActiveSupervisor {
     pid: i32,
+    slot: usize,
+    startup: bool,
+}
+#[cfg(target_os = "linux")]
+impl ActiveSupervisor {
+    fn commit_startup(&mut self) {
+        if !self.startup {
+            return;
+        }
+        let _ = ACTIVE_SUPERVISOR_PIDS[self.slot].compare_exchange(
+            self.pid.wrapping_neg(),
+            self.pid,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        self.startup = false;
+        let signal = CANCELLATION_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+        if signal != 0 {
+            unsafe {
+                libc::kill(self.pid, signal);
+            }
+        }
+    }
 }
 #[cfg(target_os = "linux")]
 impl Drop for ActiveSupervisor {
     fn drop(&mut self) {
-        let _ = ACTIVE_SUPERVISOR_PID.compare_exchange(
-            self.pid,
-            0,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        );
+        if self.startup {
+            let _ = ACTIVE_SUPERVISOR_PIDS[self.slot].compare_exchange(
+                self.pid.wrapping_neg(),
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        } else {
+            clear_active_supervisor(self.slot, self.pid);
+        }
     }
 }
 #[cfg(target_os = "linux")]
@@ -1820,18 +2142,37 @@ impl CoordinatorSignals {
     pub fn cancellation_requested(&self) -> bool {
         false
     }
-    fn activate(&self, _: i32) -> ActiveSupervisor {
-        ActiveSupervisor
+    pub fn request_cancellation(&self) {}
+    fn reserve_launch(&self) -> Option<LaunchReservation> {
+        Some(LaunchReservation)
+    }
+    fn activate(&self, _: i32) -> Result<ActiveSupervisor, SupervisorError> {
+        Ok(ActiveSupervisor)
     }
 }
 #[cfg(not(target_os = "linux"))]
+struct LaunchReservation;
+#[cfg(not(target_os = "linux"))]
+impl LaunchReservation {
+    fn release_spawn(&mut self) {}
+}
+#[cfg(not(target_os = "linux"))]
 struct ActiveSupervisor;
+#[cfg(not(target_os = "linux"))]
+impl ActiveSupervisor {
+    fn commit_startup(&mut self) {}
+}
 #[cfg(not(target_os = "linux"))]
 enum SignalRegistration {
     Standalone(Box<SignalForwarder>),
     Coordinator(ActiveSupervisor),
 }
 impl SignalRegistration {
+    fn commit_startup(&mut self) {
+        if let Self::Coordinator(supervisor) = self {
+            supervisor.commit_startup();
+        }
+    }
     fn disarm(self) {
         match self {
             Self::Standalone(forwarder) => drop(forwarder),
@@ -1844,6 +2185,8 @@ impl SignalRegistration {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
     fn accepts_protocol_run_ids_and_rejects_invalid_ones() {
         assert!(valid_run_id("run_1.2-3"));
@@ -1914,7 +2257,31 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn active_supervisor_registration_removal_is_race_safe() {
+        let _guard = SIGNAL_TEST_LOCK.lock().unwrap();
+        clear_active_supervisors();
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                scope.spawn(move || {
+                    for iteration in 0..128 {
+                        let pid = 10_000 + worker * 1_000 + iteration;
+                        let slot = register_active_supervisor(pid).unwrap();
+                        clear_active_supervisor(slot, pid);
+                    }
+                });
+            }
+        });
+        assert!(
+            ACTIVE_SUPERVISOR_PIDS
+                .iter()
+                .all(|slot| slot.load(std::sync::atomic::Ordering::Acquire) == 0)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn forwards_a_signal_delivered_before_supervisor_spawn() {
+        let _guard = SIGNAL_TEST_LOCK.lock().unwrap();
         let blocked = BlockedSignals::new().unwrap();
         assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
         let (ready_parent, ready_child) = supervisor_ready_socketpair().unwrap();

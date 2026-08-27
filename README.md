@@ -5,7 +5,7 @@
 Relay contains a Rust CLI for recording project-local work sessions,
 checkpoints, categorized notes, handoffs, and bounded context for the next
 terminal agent. It also provides a Rust-owned, one-shot `relay run` coordinator
-for deterministic sequential DAG plans and `relay supervise`, a Rust launcher
+for deterministic bounded-parallel DAG plans and `relay supervise`, a Rust launcher
 for one explicitly requested local child process through the standalone Go
 supervisor. Relay does not implement an agent or model runtime, call
 model-provider APIs, inspect chat transcripts, or replace Git.
@@ -45,11 +45,11 @@ go build -o relay-supervisor ./cmd/relay-supervisor
 Ensure `$HOME/.local/bin` is on `PATH` if that is where you install Relay;
 Relay does not currently claim prebuilt packages or a crates.io release.
 
-## Run a sequential task plan
+## Run a bounded-parallel task plan
 
 ```sh
-relay run [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>
-relay run [--supervisor <ABSOLUTE_PATH>] --resume <ABSOLUTE_STATE_PATH> <PLAN>
+relay run [--jobs <N>] [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>
+relay run [--jobs <N>] [--supervisor <ABSOLUTE_PATH>] --resume <ABSOLUTE_STATE_PATH> <PLAN>
 ```
 
 `PLAN` is a JSON file. A new run accepts an optional absolute aggregate
@@ -107,20 +107,10 @@ may be 1–60,000 ms, stdout and stderr retention 1 byte–8 MiB each, and log
 retention 1 byte–4 MiB. Redaction indexes are zero-based indexes into
 `arguments`.
 
-Execution is deterministic and currently strictly sequential: the effective
-maximum parallelism is one, and Relay selects the first input-order pending
-task whose dependencies all succeeded. Only a supervisor result classified
-`completed`/`exit_zero` with exit code `0` succeeds. A nonzero exit, start
-failure, timeout, or kill fails the task. Cancellation stops the current
-invocation. If a task is active, Relay records its cancelled supervisor result;
-if the signal arrives between tasks, completed results remain completed.
-Not-yet-launched independent tasks stay pending. A failed or cancelled task
-blocks only its descendants, while independent ready tasks continue in input
-order after ordinary failures. A supervisor boundary error after the attempt is
-recorded as running makes the task and run `indeterminate`. The aggregate status
-is `completed` only when every task succeeds, `failed` when terminal work
-includes a failure or blocked descendant, `cancelled` when the invocation
-records cancellation, and `indeterminate` when certainty is lost.
+Execution is deterministic at scheduler selection and defaults to one active task. Use `--jobs N` to bound active tasks; each task starts only after every dependency succeeds, and independent ready tasks are selected in stable plan order. With `--jobs 1`, behavior remains sequential.
+Independent tasks may overlap when slots are available. Only a supervisor result classified `completed`/`exit_zero` with exit code `0` succeeds. A nonzero exit, start failure, timeout, or kill fails the task. Cancellation reaches every active supervisor and prevents new launches.
+If a task is active, Relay records its cancelled supervisor result; if the signal arrives between tasks, completed results remain completed. Not-yet-launched independent tasks stay pending. A failed, cancelled, or indeterminate task blocks only its descendants, while independent ready tasks continue.
+A supervisor boundary error after the attempt is recorded as running makes the task and run `indeterminate`. The aggregate status is `completed` only when every task succeeds, `failed` when terminal work includes a failure or blocked descendant, `cancelled` when the invocation records cancellation, and `indeterminate` when certainty is lost. Aggregate run-state schema v2 stores `jobs`; valid v1 records without `jobs` imply sequential `jobs: 1` and are rewritten as v2 on safe resume. Running or indeterminate v1 records remain non-resumable.
 
 Rust atomically owns the aggregate record. Its default path is
 `<project>/.relay/runs/<run-uuid>.json`, where `<project>` is selected by the
@@ -263,8 +253,8 @@ Relay supports these commands:
   `observation`, or `next_action`.
 - `context` emits bounded, recorded agent context; its filters are described
   below.
-- `run [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>`
-  executes a new sequential plan; replace `--state-path` with
+- `run [--jobs <N>] [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>`
+  executes a new bounded-parallel plan; replace `--state-path` with
   `--resume <ABSOLUTE_STATE_PATH>` to continue only safe pending work.
 - `supervise [OPTIONS] -- <ABSOLUTE_PROGRAM> [ARG...]` launches one local
   process through the external Go supervisor.
@@ -460,13 +450,14 @@ Relay's inspectable project-local layout is:
 └── summary-<session-id>.md
 ```
 
-JSON records and JSON Lines events currently use on-disk `schema_version: 1`;
+Session JSON records and JSON Lines events use on-disk `schema_version: 1`;
 the crate version is independent. Optional continuation fields are
-backward-compatible. A valid earlier single-current-session layout remains
-readable without mutation. On the next normal locked mutation, Relay
-materializes the missing `sessions/<id>.json` record while preserving the
-existing current record and history. Unsupported schema versions and malformed
-JSON/JSONL are reported, never silently upgraded, discarded, or overwritten.
+backward-compatible. Rust-owned run aggregates use separate closed
+`schema_version: 2`; valid aggregate v1 records omit `jobs`, imply `jobs: 1`,
+and are rewritten as v2 during safe resume. Aggregate v1 records with running
+or indeterminate tasks remain non-resumable. Unsupported aggregate versions,
+unknown fields, and malformed JSON/JSONL are reported, never silently
+upgraded, discarded, or overwritten.
 Back up `.relay/` before manual migration or repair.
 
 Mutating commands take a nonblocking advisory project lock. Contention fails
@@ -524,8 +515,8 @@ back up `.relay/`, and resolve such damage manually.
 ## Current limitations
 
 Relay supports one active Rust session per selected project. On Linux,
-`relay run` coordinates a DAG but executes at most one task at a time; bounded
-parallelism above one is not implemented yet. The separate Go supervisor still
+`relay run` coordinates a DAG with bounded parallelism up to `--jobs`; `--jobs
+1` preserves sequential behavior. The separate Go supervisor still
 owns exactly one local child per invocation/attempt. There are no retries,
 queue service, daemon, network or remote execution, model/provider runtime,
 transcript import, shell evaluation, Lua runtime, sandbox, or crash-safe
