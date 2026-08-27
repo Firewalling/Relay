@@ -651,6 +651,7 @@ fn retry_fail_once_then_succeeds_with_fresh_attempt_records() {
 
     let state = read_state(&state_path);
     let history = attempts(&state, "flaky");
+    assert_eq!(state["plan"]["schema_version"], 2);
     assert_eq!(state["status"], "completed");
     assert_eq!(history.len(), 2);
     assert_eq!(history[0]["status"], "failed");
@@ -1004,9 +1005,23 @@ fn retry_schema_is_explicit_and_bounds_invalid_policies() {
         error["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("unknown field `retry`")
+            .contains("retry field is not allowed")
     );
     assert!(!v1_state.exists());
+
+    let mut v1_null_task = task("v1-null", &[]);
+    v1_null_task["retry"] = Value::Null;
+    let v1_null_retry = harness.plan_with_schema("retry-v1-null", 1, json!([v1_null_task]));
+    let v1_null_state = harness.state("retry-v1-null");
+    let error = error_document(&harness.run_json(&v1_null_retry, &v1_null_state));
+    assert_eq!(error["error"]["code"], "run_plan_invalid");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("retry field is not allowed")
+    );
+    assert!(!v1_null_state.exists());
 
     let invalid = harness.plan_v2("retry-invalid", json!([retry_task("invalid", &[], 11, 0)]));
     let invalid_state = harness.state("retry-invalid");

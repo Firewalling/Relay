@@ -144,6 +144,15 @@ struct PlanTaskV1 {
     log_limit_bytes: i64,
     #[serde(default)]
     redact_argument_indexes: Vec<usize>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    retry: Option<Value>,
+}
+
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -191,6 +200,11 @@ fn decode_plan_value(value: Value) -> Result<Plan, String> {
             let plan: PlanV1 = serde_json::from_value(value).map_err(|error| {
                 format!("invalid plan schema_version {LEGACY_PLAN_SCHEMA_VERSION}: {error}")
             })?;
+            if plan.tasks.iter().any(|task| task.retry.is_some()) {
+                return Err(format!(
+                    "invalid plan schema_version {LEGACY_PLAN_SCHEMA_VERSION}: retry field is not allowed"
+                ));
+            }
             Ok(Plan {
                 schema_version: plan.schema_version,
                 tasks: plan.tasks.into_iter().map(Into::into).collect(),
