@@ -60,8 +60,9 @@ distinct argv elements: Relay never invokes or evaluates a shell. On the
 initial run, a task without `working_directory` uses Relay's invocation
 directory; that resolved absolute directory is persisted and reused on resume.
 
-Plan schema v1 is closed, so unknown fields are errors. This complete two-task
-plan creates a marker and verifies it:
+Plan schema v1 is closed, so unknown fields are errors. Plan schema v2 is also
+closed and adds optional per-task retries; a `retry` field is invalid in v1.
+This complete two-task plan creates a marker and verifies it:
 
 ```json
 {
@@ -105,28 +106,41 @@ default to `[]`. `timeout_ms` is required, finite, and between 1 ms and 24
 hours. The optional limits shown above are their defaults; termination grace
 may be 1–60,000 ms, stdout and stderr retention 1 byte–8 MiB each, and log
 retention 1 byte–4 MiB. Redaction indexes are zero-based indexes into
-`arguments`.
+`arguments`. In schema v2, `retry.max_attempts` is 1–10 and includes the
+initial attempt; `retry.delay_ms` is 0–86,400,000. Missing `retry` means no
+retry.
 
-Execution is deterministic at scheduler selection and defaults to one active task. Use `--jobs N` to bound active tasks; each task starts only after every dependency succeeds, and independent ready tasks are selected in stable plan order. With `--jobs 1`, behavior remains sequential.
-Independent tasks may overlap when slots are available. Only a supervisor result classified `completed`/`exit_zero` with exit code `0` succeeds. A nonzero exit, start failure, timeout, or kill fails the task. Cancellation reaches every active supervisor and prevents new launches.
-If a task is active, Relay records its cancelled supervisor result; if the signal arrives between tasks, completed results remain completed. Not-yet-launched independent tasks stay pending. A failed, cancelled, or indeterminate task blocks only its descendants, while independent ready tasks continue.
-A supervisor boundary error after the attempt is recorded as running makes the task and run `indeterminate`. The aggregate status is `completed` only when every task succeeds, `failed` when terminal work includes a failure or blocked descendant, `cancelled` when the invocation records cancellation, and `indeterminate` when certainty is lost. Aggregate run-state schema v2 stores `jobs`; valid v1 records without `jobs` imply sequential `jobs: 1` and are rewritten as v2 on safe resume. Running or indeterminate v1 records remain non-resumable.
+Execution is deterministic at scheduler selection and defaults to one active
+task. Use `--jobs N` to bound active tasks; `--jobs 1` remains sequential.
+Independent ready tasks overlap only within that cap and are selected in stable
+plan order. Only typed `completed`/`exit_zero` with exit code `0` succeeds.
 
-Rust atomically owns the aggregate record. Its default path is
-`<project>/.relay/runs/<run-uuid>.json`, where `<project>` is selected by the
-global scope rules; an explicit new-run path must be absolute. The aggregate
-contains run status, timestamps, ordered task records, clean execution
-summaries, and each attempt's Go state reference. It stores a sanitized copy of
-the plan: argument values named by `redact_argument_indexes` become
-`<redacted>`, so those declared raw values are not copied there. Review all
-other plan fields and captured process output for secrets. Each task attempt
-has a fresh UUID and a separate Go-owned record under
+Schema-v2 tasks may retry known non-cancellation failures: nonzero exit, start
+failure, timeout, or definite non-cancellation forced cleanup. Relay never
+retries supervisor transport/protocol errors, indeterminate outcomes, or
+cancellation. A retry waits as pending, consumes no job slot, and keeps
+descendants unready; unrelated ready work continues. Exhausted failures block
+descendants. Aggregate run-state schema v3 stores retry history; valid v1/v2
+records migrate to v3 on safe resume, while running or indeterminate attempts
+remain non-resumable.
+
+Rust atomically owns aggregate record. Its default path is
+`<project>/.relay/runs/<run-uuid>.json`, where `<project>` is selected by
+global scope rules; explicit new-run paths must be absolute. Aggregate run-state
+v3 contains run status, timestamps, ordered task records, retry deadlines, and
+bounded `attempts` history. Each history entry retains attempt number, fresh
+UUID, Go state path, terminal status, reason, and bounded execution summary.
+The plan copy is sanitized: argument values named by
+`redact_argument_indexes` become `<redacted>`. Review other plan fields and
+captured process output for secrets.
+
+Each attempt has a fresh UUID and separate Go-owned record under
 `${TMPDIR}/relay/supervisor/<attempt-uuid>.json`; validation guarantees that
-path is outside Rust-owned `.relay`, but `TMPDIR` itself may point inside the
-selected project. Callers handling sensitive captured output should choose a
-private, safe temporary directory. Rust records the absolute path but does not
-treat the Go file as aggregate state. Resume validates the persisted path
-without requiring the resumed invocation to use the same `TMPDIR`.
+path is outside Rust-owned `.relay`, but `TMPDIR` may point inside project.
+Rust records every attempt path and never overwrites earlier history. Pending
+retry state clears current-attempt fields and stores `retry_ready_at`; resume
+can continue it after validating its failed history. Resume validates persisted
+paths without requiring same `TMPDIR`.
 
 Human output prints the run ID and status, aggregate state path, and each
 task's status, reason, and Go state path. Shell exit is zero only when the
@@ -145,15 +159,18 @@ Resume always requires the original plan:
 relay run --resume /absolute/path/to/run.json plan.json
 ```
 
-Relay validates the record and compares the supplied sanitized plan with the
-persisted sanitized plan. Any plan containing `redact_argument_indexes` is
-non-resumable because Relay does not persist the redacted argument values. For
-resumable plans, Relay clears the prior invocation's run-level cancellation
-intent and never reruns `succeeded`, `failed`, `cancelled`, `blocked`, `running`,
-or `indeterminate` tasks; only still-`pending` independent work may continue.
-Resume is refused if any task is `running` or `indeterminate`, if the plan/task
-identities differ, or if state is inconsistent. There are no retries and no
-crash-safe reattachment to an active or uncertain attempt.
+Relay validates record and compares supplied sanitized plan with persisted
+sanitized plan. Any plan containing `redact_argument_indexes` is non-resumable
+because raw argument values are not persisted. It clears prior run-level
+cancellation intent, never reruns terminal or blocked tasks, and continues only
+safe pending work. A pending task with `retry_ready_at` resumes its explicitly
+configured next attempt after its prior typed failure; a future deadline is
+waited without occupying a job slot.
+
+Resume is refused for any `running` or `indeterminate` attempt, malformed
+history, changed plan/task identities, or inconsistent state. Failed attempts
+are never retried unless they have a validated pending retry state; no process
+reattachment or idempotency inference exists.
 
 ## Supervise one process
 
@@ -453,11 +470,12 @@ Relay's inspectable project-local layout is:
 Session JSON records and JSON Lines events use on-disk `schema_version: 1`;
 the crate version is independent. Optional continuation fields are
 backward-compatible. Rust-owned run aggregates use separate closed
-`schema_version: 2`; valid aggregate v1 records omit `jobs`, imply `jobs: 1`,
-and are rewritten as v2 during safe resume. Aggregate v1 records with running
-or indeterminate tasks remain non-resumable. Unsupported aggregate versions,
-unknown fields, and malformed JSON/JSONL are reported, never silently
-upgraded, discarded, or overwritten.
+`schema_version: 3` with bounded retry history. Aggregate v1 records omit
+`jobs` and imply `jobs: 1`; aggregate v2 records store `jobs` but no retry
+history. Clean v1/v2 records migrate to v3 on safe resume. Running or
+indeterminate records remain non-resumable. Unsupported versions, unknown
+fields, and malformed JSON/JSONL are reported, never silently upgraded,
+discarded, or overwritten.
 Back up `.relay/` before manual migration or repair.
 
 Mutating commands take a nonblocking advisory project lock. Contention fails
@@ -517,11 +535,12 @@ back up `.relay/`, and resolve such damage manually.
 Relay supports one active Rust session per selected project. On Linux,
 `relay run` coordinates a DAG with bounded parallelism up to `--jobs`; `--jobs
 1` preserves sequential behavior. The separate Go supervisor still
-owns exactly one local child per invocation/attempt. There are no retries,
-queue service, daemon, network or remote execution, model/provider runtime,
-transcript import, shell evaluation, Lua runtime, sandbox, or crash-safe
-reattachment to running or indeterminate work. Process-group cleanup cannot
-guarantee orphan freedom when a child escapes through `setsid`, self-regrouping,
+owns exactly one local child per invocation/attempt. Retries are explicit per
+task only: there is no global retry engine, backoff, jitter, predicate, or
+idempotency detection. There is no queue service, daemon, network or remote
+execution, model/provider runtime, transcript import, shell evaluation, Lua
+runtime, sandbox, or crash-safe reattachment to running or indeterminate work.
+Process-group cleanup cannot guarantee orphan freedom when a child escapes through `setsid`, self-regrouping,
 or an equivalent boundary. Relay also has no TUI, hosted synchronization,
 automatic source inspection, semantic search, encryption, or automatic
 recovery of ambiguous interrupted session operations. Advisory locks depend on

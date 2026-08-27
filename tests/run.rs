@@ -19,6 +19,7 @@ import os
 import signal
 import sys
 import time
+import fcntl
 
 cancelled = False
 def cancel(_signal, _frame):
@@ -27,6 +28,9 @@ def cancel(_signal, _frame):
 signal.signal(signal.SIGINT, cancel)
 signal.signal(signal.SIGTERM, cancel)
 legacy = os.environ.get("RELAY_FAKE_LEGACY") == "1"
+if os.environ.get("RELAY_FAKE_TRANSPORT") == "1":
+    time.sleep(0.05)
+    sys.exit(0)
 if not legacy:
     ready_fd = int(os.environ["RELAY_SUPERVISOR_READY_FD"])
     os.write(ready_fd, b"R")
@@ -52,8 +56,22 @@ if legacy:
     os.replace(temporary, state_path)
 control_path = os.environ["RELAY_FAKE_CONTROL"]
 log_path = os.environ["RELAY_FAKE_LOG"]
-with open(control_path, "r", encoding="utf-8") as source:
-    control = json.load(source)
+name = os.path.basename(request["program"])
+with open(control_path, "r+", encoding="utf-8") as control_file:
+    fcntl.flock(control_file, fcntl.LOCK_EX)
+    control = json.load(control_file)
+    configured = control.get(name, "success")
+    if isinstance(configured, list):
+        mode = configured.pop(0) if configured else "success"
+        control[name] = configured
+        control_file.seek(0)
+        control_file.truncate()
+        json.dump(control, control_file, separators=(",", ":"))
+        control_file.flush()
+        os.fsync(control_file.fileno())
+    else:
+        mode = configured
+    fcntl.flock(control_file, fcntl.LOCK_UN)
 record = json.dumps(request, separators=(",", ":")) + "\n"
 fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 try:
@@ -63,8 +81,6 @@ finally:
 
 with open(request["state_path"] + ".pid", "w", encoding="utf-8") as pid_file:
     pid_file.write(str(os.getpid()))
-name = os.path.basename(request["program"])
-mode = control.get(name, "success")
 if mode == "malformed":
     sys.stdout.write("{not-json\n")
     sys.exit(0)
@@ -216,11 +232,29 @@ impl Harness {
         fs::write(&self.control, serde_json::to_vec(&value).unwrap()).unwrap();
     }
 
+    fn configure_sequences(&self, outcomes: &[(&str, &[&str])]) {
+        let value = Value::Object(
+            outcomes
+                .iter()
+                .map(|(task, sequence)| ((*task).to_owned(), json!(sequence)))
+                .collect(),
+        );
+        fs::write(&self.control, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
     fn plan(&self, name: &str, tasks: Value) -> PathBuf {
+        self.plan_with_schema(name, 1, tasks)
+    }
+
+    fn plan_v2(&self, name: &str, tasks: Value) -> PathBuf {
+        self.plan_with_schema(name, 2, tasks)
+    }
+
+    fn plan_with_schema(&self, name: &str, schema_version: u32, tasks: Value) -> PathBuf {
         let path = self.directory.path().join(format!("{name}.json"));
         fs::write(
             &path,
-            serde_json::to_vec(&json!({"schema_version":1,"tasks":tasks})).unwrap(),
+            serde_json::to_vec(&json!({"schema_version":schema_version,"tasks":tasks})).unwrap(),
         )
         .unwrap();
         path
@@ -382,6 +416,11 @@ fn task(id: &str, dependencies: &[&str]) -> Value {
         "timeout_ms":5000
     })
 }
+fn retry_task(id: &str, dependencies: &[&str], max_attempts: u32, delay_ms: u64) -> Value {
+    let mut task = task(id, dependencies);
+    task["retry"] = json!({"max_attempts":max_attempts,"delay_ms":delay_ms});
+    task
+}
 
 fn run_document(output: &Output) -> Value {
     assert!(
@@ -513,14 +552,606 @@ fn supervisor_pid_path(state: &Value, id: &str) -> PathBuf {
     ))
 }
 
-fn downgrade_to_v1(path: &Path) {
+fn downgrade_to_version(path: &Path, schema_version: u32) {
     let mut state = read_state(path);
-    state["schema_version"] = json!(1);
-    state
-        .as_object_mut()
-        .expect("aggregate state object")
-        .remove("jobs");
+    state["schema_version"] = json!(schema_version);
+    for task in state["tasks"].as_array_mut().unwrap() {
+        task.as_object_mut().unwrap().remove("attempts");
+        task.as_object_mut().unwrap().remove("retry_ready_at");
+    }
+    if schema_version == 1 {
+        state
+            .as_object_mut()
+            .expect("aggregate state object")
+            .remove("jobs");
+    }
     fs::write(path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+}
+
+fn downgrade_to_v1(path: &Path) {
+    downgrade_to_version(path, 1);
+}
+
+fn downgrade_to_v2(path: &Path) {
+    downgrade_to_version(path, 2);
+}
+
+fn wait_for_retry_pending(path: &Path, id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if path.is_file() {
+            let state = read_state(path);
+            let task = record(&state, id);
+            if task["status"] == "pending" && task["retry_ready_at"].is_string() {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for retry scheduling"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn attempts<'a>(state: &'a Value, id: &str) -> &'a [Value] {
+    record(state, id)["attempts"]
+        .as_array()
+        .expect("retained attempt history")
+}
+fn wait_for_running_task(path: &Path, id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if path.is_file() {
+            let state = read_state(path);
+            let task = record(&state, id);
+            if task["status"] == "running" && task["supervisor_state_path"].is_string() {
+                return state;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for running task"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn no_retry_is_default_and_first_success_has_one_attempt() {
+    let harness = Harness::new();
+    harness.configure(&[("failed", "nonzero")]);
+    let failed_plan = harness.plan("default-failure", json!([task("failed", &[])]));
+    let failed_state = harness.state("default-failure");
+    run_document(&harness.run_json(&failed_plan, &failed_state));
+    let failed = read_state(&failed_state);
+    assert_eq!(failed["plan"]["schema_version"], 1);
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(harness.requests().len(), 1);
+    assert_eq!(attempts(&failed, "failed").len(), 1);
+    assert_eq!(attempts(&failed, "failed")[0]["status"], "failed");
+
+    harness.configure(&[]);
+    let success_plan = harness.plan("default-success", json!([task("success", &[])]));
+    let success_state = harness.state("default-success");
+    run_document(&harness.run_json(&success_plan, &success_state));
+    let success = read_state(&success_state);
+    assert_eq!(record(&success, "success")["status"], "succeeded");
+    assert_eq!(attempts(&success, "success").len(), 1);
+}
+
+#[test]
+fn retry_fail_once_then_succeeds_with_fresh_attempt_records() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("flaky", &["nonzero", "success"])]);
+    let plan = harness.plan_v2("retry-success", json!([retry_task("flaky", &[], 2, 0)]));
+    let state_path = harness.state("retry-success");
+
+    run_document(&harness.run_json(&plan, &state_path));
+
+    let state = read_state(&state_path);
+    let history = attempts(&state, "flaky");
+    assert_eq!(state["status"], "completed");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["status"], "failed");
+    assert_eq!(history[1]["status"], "succeeded");
+    assert_ne!(history[0]["run_id"], history[1]["run_id"]);
+    assert_ne!(
+        history[0]["supervisor_state_path"],
+        history[1]["supervisor_state_path"]
+    );
+    assert_eq!(
+        record(&state, "flaky")["attempt_run_id"],
+        history[1]["run_id"]
+    );
+    assert_eq!(harness.requests().len(), 2);
+}
+
+#[test]
+fn exhausted_retries_block_descendants_and_continue_unrelated_work() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("failed", &["nonzero", "nonzero"])]);
+    let plan = harness.plan_v2(
+        "retry-exhausted",
+        json!([
+            task("child", &["failed"]),
+            retry_task("failed", &[], 2, 0),
+            task("other", &[])
+        ]),
+    );
+    let state_path = harness.state("retry-exhausted");
+
+    run_document(&harness.run_json(&plan, &state_path));
+
+    let state = read_state(&state_path);
+    assert_eq!(state["status"], "failed");
+    assert_eq!(record(&state, "failed")["status"], "failed");
+    assert_eq!(record(&state, "child")["status"], "blocked");
+    assert_eq!(record(&state, "other")["status"], "succeeded");
+    assert_eq!(attempts(&state, "failed").len(), 2);
+    assert_eq!(
+        request_names(&harness.requests()),
+        ["failed", "failed", "other"]
+    );
+}
+
+#[test]
+fn retry_delay_leaves_slot_free_for_unrelated_ready_work() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("flaky", &["nonzero", "success"]), ("other", &["barrier"])]);
+    let barrier = harness.directory.path().join("retry-delay-barrier");
+    let plan = harness.plan_v2(
+        "retry-delay",
+        json!([retry_task("flaky", &[], 2, 200), task("other", &[])]),
+    );
+    let state_path = harness.state("retry-delay");
+    let child = harness.spawn_json_jobs_with_barrier(&plan, &state_path, 1, &barrier);
+
+    harness.wait_for_requests(2);
+    wait_for_retry_pending(&state_path, "flaky");
+    assert_eq!(request_names(&harness.requests()), ["flaky", "other"]);
+    let running = read_state(&state_path);
+    assert_eq!(record(&running, "flaky")["status"], "pending");
+    assert_eq!(record(&running, "other")["status"], "running");
+    assert_eq!(attempts(&running, "flaky").len(), 1);
+
+    fs::write(barrier.join("release"), b"release").unwrap();
+    harness.wait_for_requests(3);
+    run_document(&child.wait_with_output().unwrap());
+    assert_eq!(read_state(&state_path)["status"], "completed");
+}
+
+#[test]
+fn descendants_wait_for_eventual_retry_success() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("root", &["nonzero", "success"])]);
+    let plan = harness.plan_v2(
+        "retry-descendant",
+        json!([task("child", &["root"]), retry_task("root", &[], 2, 0)]),
+    );
+    let state_path = harness.state("retry-descendant");
+
+    run_document(&harness.run_json(&plan, &state_path));
+
+    let state = read_state(&state_path);
+    assert_eq!(state["status"], "completed");
+    assert_eq!(
+        request_names(&harness.requests()),
+        ["root", "root", "child"]
+    );
+    assert_eq!(record(&state, "child")["status"], "succeeded");
+}
+
+#[test]
+fn resume_after_scheduled_retry_keeps_failed_attempt_history() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("flaky", &["nonzero", "success"])]);
+    let plan = harness.plan_v2("retry-resume", json!([retry_task("flaky", &[], 2, 200)]));
+    let state_path = harness.state("retry-resume");
+    let mut child = harness.spawn_json(&plan, &state_path);
+    harness.wait_for_requests(1);
+    wait_for_retry_pending(&state_path, "flaky");
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+
+    let waiting = read_state(&state_path);
+    assert_eq!(waiting["status"], "running");
+    assert_eq!(attempts(&waiting, "flaky").len(), 1);
+    assert_eq!(record(&waiting, "flaky")["status"], "pending");
+
+    run_document(&harness.resume_json(&plan, &state_path));
+    let resumed = read_state(&state_path);
+    assert_eq!(resumed["status"], "completed");
+    assert_eq!(attempts(&resumed, "flaky").len(), 2);
+    assert_eq!(harness.requests().len(), 2);
+}
+
+#[test]
+fn cancellation_during_retry_delay_prevents_next_launch() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("flaky", &["nonzero", "success"])]);
+    let plan = harness.plan_v2(
+        "retry-delay-cancel",
+        json!([retry_task("flaky", &[], 2, 1000)]),
+    );
+    let state_path = harness.state("retry-delay-cancel");
+    let child = harness.spawn_json(&plan, &state_path);
+    harness.wait_for_requests(1);
+    wait_for_retry_pending(&state_path, "flaky");
+
+    run_document(&terminate(child));
+    let cancelled = read_state(&state_path);
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(record(&cancelled, "flaky")["status"], "pending");
+    assert_eq!(attempts(&cancelled, "flaky").len(), 1);
+    assert_eq!(harness.requests().len(), 1);
+}
+
+#[test]
+fn cancellation_during_retry_attempt_is_not_retried() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("flaky", &["nonzero", "hold"])]);
+    let plan = harness.plan_v2(
+        "retry-active-cancel",
+        json!([retry_task("flaky", &[], 3, 0)]),
+    );
+    let state_path = harness.state("retry-active-cancel");
+    let child = harness.spawn_json(&plan, &state_path);
+    harness.wait_for_requests(2);
+    let running = wait_for_running_task(&state_path, "flaky");
+    wait_for_path(&supervisor_pid_path(&running, "flaky"));
+
+    run_document(&terminate(child));
+    let cancelled = read_state(&state_path);
+    let history = attempts(&cancelled, "flaky");
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["status"], "failed");
+    assert_eq!(history[1]["status"], "cancelled");
+    assert_eq!(harness.requests().len(), 2);
+}
+
+#[test]
+fn timeout_is_retryable_only_when_plan_opts_in() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("timed", &["timeout", "success"])]);
+    let plan = harness.plan_v2("retry-timeout", json!([retry_task("timed", &[], 2, 0)]));
+    let state_path = harness.state("retry-timeout");
+
+    run_document(&harness.run_json(&plan, &state_path));
+
+    let state = read_state(&state_path);
+    let history = attempts(&state, "timed");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["status"], "failed");
+    assert_eq!(
+        history[0]["summary"]["termination_reason"],
+        "timeout_terminated"
+    );
+    assert_eq!(history[1]["status"], "succeeded");
+}
+
+#[test]
+fn protocol_and_remote_uncertainty_never_retries() {
+    let harness = Harness::new();
+    harness.configure(&[("malformed", "malformed"), ("remote", "remote")]);
+    let plan = harness.plan_v2(
+        "retry-uncertain",
+        json!([
+            retry_task("malformed", &[], 3, 0),
+            retry_task("remote", &[], 3, 0)
+        ]),
+    );
+    let state_path = harness.state("retry-uncertain");
+
+    let error = error_document(&harness.run_json(&plan, &state_path));
+    assert_eq!(error["error"]["code"], "run_supervisor");
+    let state = read_state(&state_path);
+    assert_eq!(state["status"], "indeterminate");
+    for id in ["malformed", "remote"] {
+        assert_eq!(record(&state, id)["status"], "indeterminate");
+        assert_eq!(attempts(&state, id).len(), 1);
+        assert_eq!(attempts(&state, id)[0]["status"], "indeterminate");
+    }
+    let before_resume = harness.requests().len();
+    assert_eq!(
+        error_document(&harness.resume_json(&plan, &state_path))["error"]["code"],
+        "run_state_invalid"
+    );
+    assert_eq!(harness.requests().len(), before_resume);
+}
+
+#[test]
+fn supervisor_transport_uncertainty_never_retries() {
+    let harness = Harness::new();
+    let plan = harness.plan_v2(
+        "retry-transport",
+        json!([retry_task("transport", &[], 3, 0)]),
+    );
+    let state_path = harness.state("retry-transport");
+    let output = harness
+        .command()
+        .env("RELAY_FAKE_TRANSPORT", "1")
+        .args([
+            "--json",
+            "run",
+            "--jobs",
+            "1",
+            "--supervisor",
+            harness.supervisor.to_str().unwrap(),
+            "--state-path",
+            state_path.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run transport uncertainty plan");
+    assert_eq!(error_document(&output)["error"]["code"], "run_supervisor");
+    let state = read_state(&state_path);
+    assert_eq!(record(&state, "transport")["status"], "indeterminate");
+    assert_eq!(attempts(&state, "transport").len(), 1);
+    assert_eq!(attempts(&state, "transport")[0]["status"], "indeterminate");
+    assert!(harness.requests().is_empty());
+}
+
+#[test]
+fn running_retry_attempt_refuses_resume() {
+    let harness = Harness::new();
+    harness.configure(&[("running", "hold")]);
+    let plan = harness.plan_v2("retry-running", json!([retry_task("running", &[], 2, 0)]));
+    let state_path = harness.state("retry-running");
+    let mut child = harness.spawn_json(&plan, &state_path);
+    harness.wait_for_requests(1);
+    let state = read_state(&state_path);
+    assert_eq!(attempts(&state, "running")[0]["status"], "running");
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+
+    let before_resume = harness.requests().len();
+    assert_eq!(
+        error_document(&harness.resume_json(&plan, &state_path))["error"]["code"],
+        "run_state_invalid"
+    );
+    assert_eq!(harness.requests().len(), before_resume);
+    let pid_path = supervisor_pid_path(&state, "running");
+    wait_for_path(&pid_path);
+    assert_eq!(unsafe { libc::kill(read_pid(&pid_path), libc::SIGTERM) }, 0);
+    wait_for_process_exit(&pid_path);
+}
+
+#[test]
+fn parallel_retries_respect_jobs_cap_and_keep_history_bounded() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[
+        ("left", &["nonzero", "barrier"]),
+        ("right", &["nonzero", "barrier"]),
+    ]);
+    let barrier = harness.directory.path().join("parallel-retry-barrier");
+    let plan = harness.plan_v2(
+        "parallel-retries",
+        json!([
+            retry_task("right", &[], 2, 100),
+            retry_task("left", &[], 2, 100)
+        ]),
+    );
+    let state_path = harness.state("parallel-retries");
+    let child = harness.spawn_json_jobs_with_barrier(&plan, &state_path, 2, &barrier);
+
+    harness.wait_for_requests(4);
+    let running = read_state(&state_path);
+    assert_eq!(
+        records(&running)
+            .iter()
+            .filter(|task| task["status"] == "running")
+            .count(),
+        2
+    );
+    assert!(
+        records(&running)
+            .iter()
+            .all(|task| attempts(&running, task["id"].as_str().unwrap()).len() <= 2)
+    );
+    fs::write(barrier.join("release"), b"release").unwrap();
+    run_document(&child.wait_with_output().unwrap());
+    let completed = read_state(&state_path);
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(attempts(&completed, "left").len(), 2);
+    assert_eq!(attempts(&completed, "right").len(), 2);
+}
+
+#[test]
+fn retry_history_is_tightly_bounded_by_maximum_attempts() {
+    let harness = Harness::new();
+    let outcomes = vec!["nonzero"; 10];
+    harness.configure_sequences(&[("bounded", outcomes.as_slice())]);
+    let plan = harness.plan_v2("retry-bound", json!([retry_task("bounded", &[], 10, 0)]));
+    let state_path = harness.state("retry-bound");
+
+    run_document(&harness.run_json(&plan, &state_path));
+
+    let state = read_state(&state_path);
+    assert_eq!(state["status"], "failed");
+    assert_eq!(attempts(&state, "bounded").len(), 10);
+    assert_eq!(harness.requests().len(), 10);
+}
+
+#[test]
+fn jobs_one_retry_order_remains_deterministic() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("first", &["nonzero", "success"]), ("second", &["success"])]);
+    let plan = harness.plan_v2(
+        "retry-jobs-one",
+        json!([retry_task("first", &[], 2, 0), task("second", &[])]),
+    );
+    let state_path = harness.state("retry-jobs-one");
+
+    run_document(&harness.run_json_jobs(&plan, &state_path, 1));
+
+    assert_eq!(
+        request_names(&harness.requests()),
+        ["first", "first", "second"]
+    );
+    assert_eq!(read_state(&state_path)["status"], "completed");
+}
+
+#[test]
+fn retry_schema_is_explicit_and_bounds_invalid_policies() {
+    let harness = Harness::new();
+    let v1_retry = harness.plan_with_schema("retry-v1", 1, json!([retry_task("v1", &[], 2, 0)]));
+    let v1_state = harness.state("retry-v1");
+    let error = error_document(&harness.run_json(&v1_retry, &v1_state));
+    assert_eq!(error["error"]["code"], "run_plan_invalid");
+    assert!(!v1_state.exists());
+
+    let invalid = harness.plan_v2("retry-invalid", json!([retry_task("invalid", &[], 11, 0)]));
+    let invalid_state = harness.state("retry-invalid");
+    let error = error_document(&harness.run_json(&invalid, &invalid_state));
+    assert_eq!(error["error"]["code"], "run_plan_invalid");
+    assert!(!invalid_state.exists());
+    assert!(harness.requests().is_empty());
+}
+
+#[test]
+fn real_go_supervisor_retries_known_failure_then_succeeds() {
+    let Some(supervisor) = std::env::var_os("RELAY_SUPERVISOR_E2E_BIN") else {
+        return;
+    };
+    let supervisor = PathBuf::from(supervisor);
+    assert!(supervisor.is_absolute() && supervisor.is_file());
+
+    let directory = tempfile::tempdir().expect("create real-Go retry directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).expect("create real-Go retry temporary directory");
+    let script = directory.path().join("fail-once.py");
+    let marker = directory.path().join("failed-once");
+    fs::write(
+        &script,
+        "import pathlib,sys
+marker=pathlib.Path(sys.argv[1])
+if marker.exists():
+    sys.exit(0)
+marker.touch()
+sys.exit(17)
+",
+    )
+    .expect("write real-Go retry script");
+    let plan = directory.path().join("real-go-retry.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&json!({
+            "schema_version": 2,
+            "tasks": [{
+                "id": "flaky",
+                "program": "/usr/bin/python3",
+                "arguments": [script.to_str().unwrap(), marker.to_str().unwrap()],
+                "timeout_ms": 5_000,
+                "retry": {"max_attempts": 2, "delay_ms": 0}
+            }]
+        }))
+        .unwrap(),
+    )
+    .expect("write real-Go retry plan");
+    let state_path = directory.path().join("real-go-retry.state.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .current_dir(directory.path())
+        .env("TMPDIR", &temporary_root)
+        .args([
+            "--json",
+            "run",
+            "--jobs",
+            "1",
+            "--supervisor",
+            supervisor.to_str().unwrap(),
+            "--state-path",
+            state_path.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run real-Go retry plan");
+    run_document(&output);
+    let state = read_state(&state_path);
+    let history = attempts(&state, "flaky");
+    assert_eq!(state["status"], "completed");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["status"], "failed");
+    assert_eq!(history[0]["summary"]["termination_reason"], "exit_nonzero");
+    assert_eq!(history[1]["status"], "succeeded");
+    assert!(Path::new(history[0]["supervisor_state_path"].as_str().unwrap()).is_file());
+    assert!(Path::new(history[1]["supervisor_state_path"].as_str().unwrap()).is_file());
+}
+
+#[test]
+fn real_go_supervisor_cancellation_during_retry_attempt_is_not_retried() {
+    let Some(supervisor) = std::env::var_os("RELAY_SUPERVISOR_E2E_BIN") else {
+        return;
+    };
+    let supervisor = PathBuf::from(supervisor);
+    assert!(supervisor.is_absolute() && supervisor.is_file());
+
+    let directory = tempfile::tempdir().expect("create real-Go cancellation directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).expect("create real-Go cancellation temporary directory");
+    let plan = directory.path().join("real-go-cancel-retry.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&json!({
+            "schema_version": 2,
+            "tasks": [{
+                "id": "sleep",
+                "program": "/usr/bin/sleep",
+                "arguments": ["10"],
+                "timeout_ms": 60_000,
+                "retry": {"max_attempts": 3, "delay_ms": 0}
+            }]
+        }))
+        .unwrap(),
+    )
+    .expect("write real-Go cancellation plan");
+    let state_path = directory.path().join("real-go-cancel-retry.state.json");
+    let child = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .current_dir(directory.path())
+        .env("TMPDIR", &temporary_root)
+        .args([
+            "--json",
+            "run",
+            "--jobs",
+            "1",
+            "--supervisor",
+            supervisor.to_str().unwrap(),
+            "--state-path",
+            state_path.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn real-Go cancellation run");
+    wait_for_path(&state_path);
+    let running = wait_for_running_task(&state_path, "sleep");
+    let go_state = PathBuf::from(
+        record(&running, "sleep")["supervisor_state_path"]
+            .as_str()
+            .unwrap(),
+    );
+    wait_for_path(&go_state);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    run_document(
+        &child
+            .wait_with_output()
+            .expect("wait for real-Go cancellation"),
+    );
+
+    let cancelled = read_state(&state_path);
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(record(&cancelled, "sleep")["status"], "cancelled");
+    assert_eq!(attempts(&cancelled, "sleep").len(), 1);
+    assert_eq!(attempts(&cancelled, "sleep")[0]["status"], "cancelled");
+    let go_record = read_state(&go_state);
+    assert_eq!(go_record["execution"]["lifecycle"], "cancelled");
+    assert_eq!(
+        go_record["execution"]["termination_reason"],
+        "cancelled_terminated"
+    );
 }
 
 #[test]
@@ -1362,7 +1993,7 @@ fn persistence_failure_during_cancellation_drains_two_active_workers() {
     let error = error_document(&terminate(child));
     assert_eq!(error["error"]["code"], "run_state_invalid");
     let state = read_state(&state_path);
-    assert_eq!(state["schema_version"], 2);
+    assert_eq!(state["schema_version"], 3);
     assert_eq!(state["jobs"], 2);
     assert_eq!(state["status"], "cancelled");
     assert_eq!(state["cancellation_requested"], true);
@@ -1416,7 +2047,7 @@ fn persistence_failure_after_one_completion_drains_remaining_worker() {
     let error = error_document(&child.wait_with_output().unwrap());
     assert_eq!(error["error"]["code"], "run_state_invalid");
     let state = read_state(&state_path);
-    assert_eq!(state["schema_version"], 2);
+    assert_eq!(state["schema_version"], 3);
     assert_eq!(state["jobs"], 2);
     assert_eq!(record(&state, "first")["status"], "succeeded");
     assert_eq!(record(&state, "second")["status"], "cancelled");
@@ -1506,11 +2137,34 @@ fn migrates_clean_v1_state_and_resumes_pending_work() {
     run_document(&harness.resume_json(&plan, &state_path));
 
     let migrated = read_state(&state_path);
-    assert_eq!(migrated["schema_version"], 2);
+    assert_eq!(migrated["schema_version"], 3);
     assert_eq!(migrated["jobs"], 1);
     assert_eq!(record(&migrated, "waiting")["status"], "cancelled");
     assert_eq!(record(&migrated, "later")["status"], "succeeded");
     assert_eq!(request_names(&harness.requests()), ["waiting", "later"]);
+}
+
+#[test]
+fn migrates_clean_v2_state_and_resumes_pending_work() {
+    let harness = Harness::new();
+    harness.configure(&[("waiting", "cancelled")]);
+    let plan = harness.plan(
+        "legacy-v2-pending",
+        json!([task("waiting", &[]), task("later", &[])]),
+    );
+    let state_path = harness.state("legacy-v2-pending");
+    run_document(&harness.run_json(&plan, &state_path));
+    downgrade_to_v2(&state_path);
+    let legacy = read_state(&state_path);
+    assert_eq!(legacy["schema_version"], 2);
+    assert!(legacy["tasks"][0]["attempts"].is_null());
+
+    harness.configure(&[]);
+    run_document(&harness.resume_json(&plan, &state_path));
+    let migrated = read_state(&state_path);
+    assert_eq!(migrated["schema_version"], 3);
+    assert_eq!(attempts(&migrated, "waiting").len(), 1);
+    assert_eq!(record(&migrated, "later")["status"], "succeeded");
 }
 
 #[test]
@@ -1737,7 +2391,7 @@ fn successful_state_has_unique_attempt_identities_and_sanitizes_secrets() {
 
     let state: Value = serde_json::from_str(&persisted).unwrap();
     assert_eq!(document["data"]["run"], state);
-    assert_eq!(state["schema_version"], 2);
+    assert_eq!(state["schema_version"], 3);
     assert_eq!(state["jobs"], 1);
     assert_eq!(state["status"], "completed");
     let first = record(&state, "first");

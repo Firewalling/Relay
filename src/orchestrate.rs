@@ -3,10 +3,10 @@ use crate::{
     cli::{RunArgs, SuperviseArgs},
     supervise::{self, ExecutionResult, Lifecycle, SupervisorError, TerminationReason},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 #[cfg(any(debug_assertions, not(target_os = "linux")))]
 use std::fs::OpenOptions;
 use std::{
@@ -30,8 +30,10 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const PLAN_SCHEMA_VERSION: u32 = 1;
-const RUN_STATE_SCHEMA_VERSION: u32 = 2;
+const PLAN_SCHEMA_VERSION: u32 = 2;
+const LEGACY_PLAN_SCHEMA_VERSION: u32 = 1;
+const RUN_STATE_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_RUN_STATE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_RUN_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_PLAN_BYTES: u64 = 1 << 20;
 const MAX_STATE_BYTES: u64 = 4 << 20;
@@ -43,6 +45,9 @@ const MAX_LOG_BYTES: i64 = 4 * 1024 * 1024;
 const MAX_REDACTIONS: usize = 32;
 const MAX_REDACTED_BYTES: usize = 64 * 1024;
 const MAX_SUMMARY_MESSAGE_BYTES: usize = 4096;
+const MAX_RETRY_ATTEMPTS: u32 = 10;
+const MAX_RETRY_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
+const RETRY_POLL_INTERVAL_MS: u64 = 10;
 
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -108,6 +113,15 @@ struct PlanTask {
     log_limit_bytes: i64,
     #[serde(default)]
     redact_argument_indexes: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry: Option<RetryPolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetryPolicy {
+    max_attempts: u32,
+    delay_ms: u64,
 }
 
 const fn default_grace_ms() -> i64 {
@@ -202,6 +216,29 @@ pub struct TaskRecord {
     pub attempt_run_id: Option<String>,
     pub supervisor_state_path: Option<String>,
     pub summary: Option<ExecutionSummary>,
+    pub attempts: Vec<AttemptRecord>,
+    pub retry_ready_at: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Indeterminate,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptRecord {
+    pub attempt: u32,
+    pub run_id: String,
+    pub supervisor_state_path: String,
+    pub status: AttemptStatus,
+    pub reason: Option<String>,
+    pub summary: Option<ExecutionSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -249,7 +286,18 @@ struct RunStateWire {
     #[serde(default, deserialize_with = "deserialize_jobs_field")]
     jobs: JobsField,
     plan: Plan,
-    tasks: Vec<TaskRecord>,
+    tasks: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyTaskRecord {
+    id: String,
+    status: TaskStatus,
+    reason: Option<String>,
+    attempt_run_id: Option<String>,
+    supervisor_state_path: Option<String>,
+    summary: Option<ExecutionSummary>,
 }
 
 pub struct RunResult {
@@ -267,6 +315,19 @@ struct TaskCompletion {
     index: usize,
     result: Result<supervise::SupervisedExecution, SupervisorError>,
 }
+fn receive_completion(
+    receiver: &mpsc::Receiver<TaskCompletion>,
+    wait: Option<std::time::Duration>,
+) -> Result<Option<TaskCompletion>, ()> {
+    match wait {
+        Some(wait) => match receiver.recv_timeout(wait) {
+            Ok(completion) => Ok(Some(completion)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
+        },
+        None => receiver.recv().map(Some).map_err(|_| ()),
+    }
+}
 
 fn supervisor_error(state: &RunState, source: SupervisorError) -> RunError {
     RunError::Supervisor {
@@ -283,13 +344,84 @@ fn reset_task_to_pending(task: &mut TaskRecord) {
     task.attempt_run_id = None;
     task.supervisor_state_path = None;
     task.summary = None;
+    task.retry_ready_at = None;
+}
+
+fn rollback_unlaunched_attempt(task: &mut TaskRecord) {
+    if task
+        .attempts
+        .last()
+        .is_some_and(|attempt| attempt.status == AttemptStatus::Running)
+    {
+        task.attempts.pop();
+    }
+    reset_task_to_pending(task);
+    if !task.attempts.is_empty() {
+        task.retry_ready_at = Some(now());
+    }
 }
 
 fn mark_task_indeterminate(task: &mut TaskRecord, reason: String) {
     task.status = TaskStatus::Indeterminate;
-    task.reason = Some(reason);
+    task.reason = Some(reason.clone());
     task.summary = None;
+    task.retry_ready_at = None;
+    if let Some(attempt) = task.attempts.last_mut()
+        && attempt.status == AttemptStatus::Running
+    {
+        attempt.status = AttemptStatus::Indeterminate;
+        attempt.reason = Some(reason);
+    }
 }
+
+fn complete_attempt(
+    task: &mut TaskRecord,
+    status: AttemptStatus,
+    reason: Option<String>,
+    summary: Option<ExecutionSummary>,
+) -> bool {
+    let Some(attempt) = task.attempts.last_mut() else {
+        return false;
+    };
+    if attempt.status != AttemptStatus::Running {
+        return false;
+    }
+    attempt.status = status;
+    attempt.reason = reason;
+    attempt.summary = summary;
+    true
+}
+
+fn execution_was_cancelled(execution: &ExecutionResult) -> bool {
+    execution.lifecycle == Lifecycle::Cancelled
+        || matches!(
+            execution.termination_reason,
+            TerminationReason::CancelledTerminated | TerminationReason::CancelledKilled
+        )
+        || execution.cancellation.requested
+}
+
+fn execution_is_retryable_failure(execution: &ExecutionResult) -> bool {
+    !execution.task_succeeded()
+        && !execution_was_cancelled(execution)
+        && matches!(
+            (execution.lifecycle, execution.termination_reason),
+            (
+                Lifecycle::Completed,
+                TerminationReason::ExitNonzero | TerminationReason::DescendantsTerminated
+            ) | (Lifecycle::FailedToStart, TerminationReason::StartError)
+                | (Lifecycle::TimedOut, TerminationReason::TimeoutTerminated)
+                | (
+                    Lifecycle::Killed,
+                    TerminationReason::TimeoutKilled | TerminationReason::DescendantsKilled
+                )
+        )
+}
+
+fn retry_ready_at(delay_ms: u64) -> String {
+    (Utc::now() + chrono::Duration::milliseconds(delay_ms as i64)).to_rfc3339()
+}
+
 fn record_shutdown_failure(
     cleanup_source: &mut Option<SupervisorError>,
     uncertain_tasks: &mut HashSet<usize>,
@@ -308,6 +440,7 @@ fn record_shutdown_failure(
         *cleanup_source = Some(source);
     }
 }
+
 fn queue_shutdown_completion(
     completion: TaskCompletion,
     active: &HashMap<usize, thread::JoinHandle<()>>,
@@ -360,22 +493,65 @@ fn apply_completion(
     match completion.result {
         Ok(result) => {
             let execution = result.execution;
-            let execution_cancelled = execution.lifecycle == Lifecycle::Cancelled
-                || matches!(
-                    execution.termination_reason,
-                    TerminationReason::CancelledTerminated | TerminationReason::CancelledKilled
-                )
-                || execution.cancellation.requested;
-            state.tasks[completion.index].summary = Some(summarize(&execution));
-            if execution.task_succeeded() {
-                state.tasks[completion.index].status = TaskStatus::Succeeded;
-                state.tasks[completion.index].reason = None;
+            let execution_cancelled = execution_was_cancelled(&execution);
+            let succeeded = execution.task_succeeded();
+            let summary = summarize(&execution);
+            let reason = (!succeeded).then(|| result_reason(&execution)).flatten();
+            let attempt_status = if succeeded {
+                AttemptStatus::Succeeded
             } else if execution_cancelled {
-                state.tasks[completion.index].status = TaskStatus::Cancelled;
-                state.tasks[completion.index].reason = result_reason(&execution);
+                AttemptStatus::Cancelled
             } else {
-                state.tasks[completion.index].status = TaskStatus::Failed;
-                state.tasks[completion.index].reason = result_reason(&execution);
+                AttemptStatus::Failed
+            };
+            if !complete_attempt(
+                &mut state.tasks[completion.index],
+                attempt_status,
+                reason.clone(),
+                Some(summary.clone()),
+            ) {
+                let source = SupervisorError::Transport(io::Error::other(
+                    "task completion did not match a running attempt",
+                ));
+                mark_task_indeterminate(
+                    &mut state.tasks[completion.index],
+                    truncate(&source.to_string(), MAX_SUMMARY_MESSAGE_BYTES),
+                );
+                return Some(source);
+            }
+            let retry_delay_ms = if !succeeded && !execution_cancelled {
+                plan.tasks[completion.index]
+                    .retry
+                    .as_ref()
+                    .and_then(|policy| {
+                        (state.tasks[completion.index].attempts.len()
+                            < policy.max_attempts as usize)
+                            .then_some(policy.delay_ms)
+                    })
+            } else {
+                None
+            };
+            let task = &mut state.tasks[completion.index];
+            task.retry_ready_at = None;
+            task.summary = Some(summary);
+            if succeeded {
+                task.status = TaskStatus::Succeeded;
+                task.reason = None;
+            } else if execution_cancelled {
+                task.status = TaskStatus::Cancelled;
+                task.reason = reason;
+            } else if let Some(delay_ms) =
+                retry_delay_ms.filter(|_| execution_is_retryable_failure(&execution))
+            {
+                task.status = TaskStatus::Pending;
+                task.reason = None;
+                task.attempt_run_id = None;
+                task.supervisor_state_path = None;
+                task.summary = None;
+                task.retry_ready_at = Some(retry_ready_at(delay_ms));
+            } else {
+                task.status = TaskStatus::Failed;
+                task.reason = reason;
             }
             mark_blocked(plan, state);
             if execution_cancelled {
@@ -384,7 +560,7 @@ fn apply_completion(
             None
         }
         Err(SupervisorError::CancelledBeforeLaunch) => {
-            reset_task_to_pending(&mut state.tasks[completion.index]);
+            rollback_unlaunched_attempt(&mut state.tasks[completion.index]);
             state.cancellation_requested = true;
             None
         }
@@ -423,7 +599,7 @@ fn shutdown_and_drain(
         store,
     } = context;
     if let Some(index) = unlaunched_index {
-        reset_task_to_pending(&mut state.tasks[index]);
+        rollback_unlaunched_attempt(&mut state.tasks[index]);
     }
     coordinator.request_cancellation();
     state.cancellation_requested = true;
@@ -745,6 +921,8 @@ pub fn run(
                     attempt_run_id: None,
                     supervisor_state_path: None,
                     summary: None,
+                    attempts: Vec::new(),
+                    retry_ready_at: None,
                 })
                 .collect(),
         };
@@ -804,13 +982,36 @@ pub fn run(
                 }
                 break;
             }
-            let Some(index) = next_ready(&plan, &state.tasks) else {
+            let Some(index) = next_ready(&plan, &state.tasks, Utc::now()) else {
                 break;
             };
 
             let task = &plan.tasks[index];
-            let (attempt_run_id, supervisor_state_path) = &attempts[index];
-            let supervisor_state_path_string = match path_string(supervisor_state_path) {
+            let (attempt_run_id, supervisor_state_path) = if state.tasks[index].attempts.is_empty()
+            {
+                attempts[index].clone()
+            } else {
+                let run_id = Uuid::new_v4().to_string();
+                let path = match supervisor_state_path(&run_id) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        return Err(shutdown_and_drain(
+                            error,
+                            ShutdownContext {
+                                coordinator: coordinator.as_ref(),
+                                active: &mut active,
+                                completed_receiver: &completed_receiver,
+                                plan: &plan,
+                                state: &mut state,
+                                store: &mut store,
+                            },
+                            None,
+                        ));
+                    }
+                };
+                (run_id, path)
+            };
+            let supervisor_state_path_string = match path_string(&supervisor_state_path) {
                 Ok(path) => path,
                 Err(error) => {
                     return Err(shutdown_and_drain(
@@ -827,9 +1028,19 @@ pub fn run(
                     ));
                 }
             };
+            let attempt_number = state.tasks[index].attempts.len() as u32 + 1;
+            state.tasks[index].attempts.push(AttemptRecord {
+                attempt: attempt_number,
+                run_id: attempt_run_id.clone(),
+                supervisor_state_path: supervisor_state_path_string.clone(),
+                status: AttemptStatus::Running,
+                reason: None,
+                summary: None,
+            });
             state.tasks[index].status = TaskStatus::Running;
             state.tasks[index].reason = None;
             state.tasks[index].summary = None;
+            state.tasks[index].retry_ready_at = None;
             state.tasks[index].attempt_run_id = Some(attempt_run_id.clone());
             state.tasks[index].supervisor_state_path = Some(supervisor_state_path_string);
             state.status = RunStatus::Running;
@@ -863,7 +1074,7 @@ pub fn run(
                 ));
             }
             if coordinator.cancellation_requested() {
-                reset_task_to_pending(&mut state.tasks[index]);
+                rollback_unlaunched_attempt(&mut state.tasks[index]);
                 state.cancellation_requested = true;
                 state.status = derive_status(&state.tasks, true);
                 if let Err(error) = persist_at(&mut store, &mut state, "cancellation") {
@@ -939,15 +1150,26 @@ pub fn run(
 
         if active.is_empty() {
             mark_blocked(&plan, &mut state);
-            if state.cancellation_requested || next_ready(&plan, &state.tasks).is_none() {
+            if state.cancellation_requested {
                 break;
             }
-            continue;
+            if next_ready(&plan, &state.tasks, Utc::now()).is_some() {
+                continue;
+            }
+            if next_retry_wait(&plan, &state.tasks).is_none() {
+                break;
+            }
         }
 
-        let completion = match completed_receiver.recv() {
-            Ok(completion) => completion,
-            Err(_) => {
+        let wait = if active.len() < args.jobs {
+            next_retry_wait(&plan, &state.tasks)
+        } else {
+            None
+        };
+        let completion = match receive_completion(&completed_receiver, wait) {
+            Ok(Some(completion)) => completion,
+            Ok(None) => continue,
+            Err(()) => {
                 let source =
                     SupervisorError::Transport(io::Error::other("task completion channel closed"));
                 return Err(shutdown_and_drain(
@@ -1161,10 +1383,20 @@ fn test_pause(_point: &str) -> Result<(), RunError> {
 }
 
 fn validate_plan(plan: &Plan, invocation_directory: &Path) -> Result<(), RunError> {
-    if plan.schema_version != PLAN_SCHEMA_VERSION {
+    if !matches!(
+        plan.schema_version,
+        LEGACY_PLAN_SCHEMA_VERSION | PLAN_SCHEMA_VERSION
+    ) {
         return Err(RunError::Plan(format!(
-            "schema_version must be {PLAN_SCHEMA_VERSION}"
+            "schema_version must be {LEGACY_PLAN_SCHEMA_VERSION} or {PLAN_SCHEMA_VERSION}"
         )));
+    }
+    if plan.schema_version == LEGACY_PLAN_SCHEMA_VERSION
+        && plan.tasks.iter().any(|task| task.retry.is_some())
+    {
+        return Err(RunError::Plan(
+            "retry requires plan schema_version 2".into(),
+        ));
     }
     if !(1..=MAX_TASKS).contains(&plan.tasks.len()) {
         return Err(RunError::Plan(format!(
@@ -1299,6 +1531,20 @@ fn validate_task(task: &PlanTask) -> Result<(), RunError> {
             "task {:?} redacted values exceed {MAX_REDACTED_BYTES} bytes",
             task.id
         )));
+    }
+    if let Some(retry) = &task.retry {
+        if !(1..=MAX_RETRY_ATTEMPTS).contains(&retry.max_attempts) {
+            return Err(RunError::Plan(format!(
+                "task {:?} retry.max_attempts must be between 1 and {MAX_RETRY_ATTEMPTS}",
+                task.id
+            )));
+        }
+        if retry.delay_ms > MAX_RETRY_DELAY_MS {
+            return Err(RunError::Plan(format!(
+                "task {:?} retry.delay_ms must be at most {MAX_RETRY_DELAY_MS}",
+                task.id
+            )));
+        }
     }
     Ok(())
 }
@@ -2110,15 +2356,15 @@ fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
                 ));
             }
         },
-        RUN_STATE_SCHEMA_VERSION => match jobs {
+        PREVIOUS_RUN_STATE_SCHEMA_VERSION | RUN_STATE_SCHEMA_VERSION => match jobs {
             JobsField::Value(jobs) if jobs > 0 => jobs,
             JobsField::Value(_) => {
                 return Err(RunError::State("jobs must be a positive integer".into()));
             }
             JobsField::Null | JobsField::Missing => {
-                return Err(RunError::State(
-                    "schema_version 2 aggregate state requires jobs".into(),
-                ));
+                return Err(RunError::State(format!(
+                    "schema_version {schema_version} aggregate state requires jobs"
+                )));
             }
         },
         schema_version => {
@@ -2126,6 +2372,24 @@ fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
                 "unsupported aggregate state schema_version {schema_version}"
             )));
         }
+    };
+    let tasks = match schema_version {
+        LEGACY_RUN_STATE_SCHEMA_VERSION | PREVIOUS_RUN_STATE_SCHEMA_VERSION => tasks
+            .into_iter()
+            .map(|value| decode_legacy_task(value, path))
+            .collect::<Result<Vec<_>, _>>()?,
+        RUN_STATE_SCHEMA_VERSION => tasks
+            .into_iter()
+            .map(|value| {
+                serde_json::from_value(value).map_err(|error| {
+                    RunError::State(format!(
+                        "could not decode task in {}: {error}",
+                        path.display()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<TaskRecord>, _>>()?,
+        _ => unreachable!("unsupported state schema rejected above"),
     };
     Ok(RunState {
         schema_version: RUN_STATE_SCHEMA_VERSION,
@@ -2139,6 +2403,59 @@ fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
         plan,
         tasks,
     })
+}
+
+fn decode_legacy_task(value: Value, path: &Path) -> Result<TaskRecord, RunError> {
+    let legacy: LegacyTaskRecord = serde_json::from_value(value).map_err(|error| {
+        RunError::State(format!(
+            "could not decode legacy task in {}: {error}",
+            path.display()
+        ))
+    })?;
+    let LegacyTaskRecord {
+        id,
+        status,
+        reason,
+        attempt_run_id,
+        supervisor_state_path,
+        summary,
+    } = legacy;
+    let attempts = match (
+        attempt_run_id.as_deref(),
+        supervisor_state_path.as_deref(),
+        attempt_status_from_task_status(status),
+    ) {
+        (Some(run_id), Some(supervisor_state_path), Some(status)) => vec![AttemptRecord {
+            attempt: 1,
+            run_id: run_id.into(),
+            supervisor_state_path: supervisor_state_path.into(),
+            status,
+            reason: reason.clone(),
+            summary: summary.clone(),
+        }],
+        _ => Vec::new(),
+    };
+    Ok(TaskRecord {
+        id,
+        status,
+        reason,
+        attempt_run_id,
+        supervisor_state_path,
+        summary,
+        attempts,
+        retry_ready_at: None,
+    })
+}
+
+fn attempt_status_from_task_status(status: TaskStatus) -> Option<AttemptStatus> {
+    match status {
+        TaskStatus::Running => Some(AttemptStatus::Running),
+        TaskStatus::Succeeded => Some(AttemptStatus::Succeeded),
+        TaskStatus::Failed => Some(AttemptStatus::Failed),
+        TaskStatus::Cancelled => Some(AttemptStatus::Cancelled),
+        TaskStatus::Indeterminate => Some(AttemptStatus::Indeterminate),
+        TaskStatus::Pending | TaskStatus::Blocked => None,
+    }
 }
 
 fn validate_resume_state(state: &RunState, plan: &Plan, state_path: &Path) -> Result<(), RunError> {
@@ -2207,113 +2524,274 @@ fn validate_resume_state(state: &RunState, plan: &Plan, state_path: &Path) -> Re
         ));
     }
     validate_resume_dependencies(plan, &state.tasks)?;
+
     let mut attempt_ids = HashSet::new();
     let mut supervisor_paths = HashSet::new();
-    for task in &state.tasks {
-        let has_attempt = task.attempt_run_id.is_some() && task.supervisor_state_path.is_some();
+    for (index, task) in state.tasks.iter().enumerate() {
+        let plan_task = &plan.tasks[index];
+        validate_attempt_history(task, plan_task, &mut attempt_ids, &mut supervisor_paths)?;
+        let has_current = task.attempt_run_id.is_some() && task.supervisor_state_path.is_some();
         if task.attempt_run_id.is_some() != task.supervisor_state_path.is_some() {
             return Err(RunError::State(format!(
-                "task {:?} has an incomplete attempt identity",
+                "task {:?} has an incomplete current attempt identity",
                 task.id
             )));
         }
         match task.status {
-            TaskStatus::Pending | TaskStatus::Blocked if has_attempt => {
-                return Err(RunError::State(format!(
-                    "task {:?} has an attempt despite status {}",
-                    task.id,
-                    task.status.as_str()
-                )));
+            TaskStatus::Pending => {
+                if has_current || task.summary.is_some() || task.reason.is_some() {
+                    return Err(RunError::State(format!(
+                        "pending task {:?} has current attempt data",
+                        task.id
+                    )));
+                }
+                if let Some(ready_at) = &task.retry_ready_at {
+                    if parse_retry_deadline(ready_at).is_none() {
+                        return Err(RunError::State(format!(
+                            "task {:?} retry_ready_at is invalid",
+                            task.id
+                        )));
+                    }
+                    let retryable = plan_task.retry.as_ref().is_some_and(|policy| {
+                        task.attempts.last().is_some_and(|attempt| {
+                            attempt.status == AttemptStatus::Failed
+                                && task.attempts.len() < policy.max_attempts as usize
+                        })
+                    });
+                    if !retryable {
+                        return Err(RunError::State(format!(
+                            "task {:?} has an invalid scheduled retry",
+                            task.id
+                        )));
+                    }
+                } else if !task.attempts.is_empty() {
+                    return Err(RunError::State(format!(
+                        "pending task {:?} has attempt history without a retry deadline",
+                        task.id
+                    )));
+                }
             }
-            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled if !has_attempt => {
+            TaskStatus::Blocked => {
+                if has_current
+                    || task.summary.is_some()
+                    || !task.attempts.is_empty()
+                    || task.retry_ready_at.is_some()
+                {
+                    return Err(RunError::State(format!(
+                        "blocked task {:?} has execution data",
+                        task.id
+                    )));
+                }
+            }
+            TaskStatus::Running => {
+                if !has_current || task.summary.is_some() || task.retry_ready_at.is_some() {
+                    return Err(RunError::State(format!(
+                        "running task {:?} has inconsistent current attempt data",
+                        task.id
+                    )));
+                }
+                if task.attempts.last().map(|attempt| attempt.status)
+                    != Some(AttemptStatus::Running)
+                {
+                    return Err(RunError::State(format!(
+                        "running task {:?} has no running attempt",
+                        task.id
+                    )));
+                }
+            }
+            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled => {
+                if !has_current || task.summary.is_none() || task.retry_ready_at.is_some() {
+                    return Err(RunError::State(format!(
+                        "terminal task {:?} has inconsistent current attempt data",
+                        task.id
+                    )));
+                }
+                let Some(summary) = &task.summary else {
+                    unreachable!("terminal summary checked above");
+                };
+                let Some(summary_status) = task_status_from_summary(summary) else {
+                    return Err(RunError::State(format!(
+                        "terminal task {:?} has an invalid execution summary",
+                        task.id
+                    )));
+                };
+                if task.status != summary_status {
+                    return Err(RunError::State(format!(
+                        "terminal task {:?} status {} conflicts with its execution summary",
+                        task.id,
+                        task.status.as_str()
+                    )));
+                }
+                let reason_is_valid = if task.status == TaskStatus::Succeeded {
+                    task.reason.is_none()
+                } else {
+                    task.reason.is_some()
+                };
+                if !reason_is_valid {
+                    return Err(RunError::State(format!(
+                        "terminal task {:?} has an inconsistent reason",
+                        task.id
+                    )));
+                }
+                let expected = match task.status {
+                    TaskStatus::Succeeded => AttemptStatus::Succeeded,
+                    TaskStatus::Failed => AttemptStatus::Failed,
+                    TaskStatus::Cancelled => AttemptStatus::Cancelled,
+                    _ => unreachable!(),
+                };
+                if task.attempts.last().map(|attempt| attempt.status) != Some(expected) {
+                    return Err(RunError::State(format!(
+                        "terminal task {:?} does not match its latest attempt",
+                        task.id
+                    )));
+                }
+            }
+            TaskStatus::Indeterminate => {
+                if !has_current || task.summary.is_some() || task.retry_ready_at.is_some() {
+                    return Err(RunError::State(format!(
+                        "indeterminate task {:?} has inconsistent current attempt data",
+                        task.id
+                    )));
+                }
+                if task.attempts.last().map(|attempt| attempt.status)
+                    != Some(AttemptStatus::Indeterminate)
+                {
+                    return Err(RunError::State(format!(
+                        "indeterminate task {:?} has no indeterminate attempt",
+                        task.id
+                    )));
+                }
+            }
+        }
+        if has_current {
+            let Some(latest) = task.attempts.last() else {
                 return Err(RunError::State(format!(
-                    "terminal task {:?} has no attempt identity",
+                    "task {:?} has current attempt without history",
                     task.id
                 )));
-            }
-            _ => {}
-        }
-        if let Some(attempt) = &task.attempt_run_id
-            && attempt.parse::<Uuid>().is_err()
-        {
-            return Err(RunError::State(format!(
-                "task {:?} has an invalid attempt_run_id",
-                task.id
-            )));
-        }
-        if let Some(supervisor_path) = &task.supervisor_state_path {
-            let attempt = task.attempt_run_id.as_deref().ok_or_else(|| {
-                RunError::State(format!(
-                    "task {:?} supervisor state has no attempt identity",
-                    task.id
-                ))
-            })?;
-            let supervisor_path = Path::new(supervisor_path);
-            validate_supervisor_state_path(supervisor_path)?;
-            if supervisor_path.file_stem() != Some(OsStr::new(attempt))
-                || supervisor_path.extension() != Some(OsStr::new("json"))
+            };
+            if task.attempt_run_id.as_deref() != Some(latest.run_id.as_str())
+                || task.supervisor_state_path.as_deref()
+                    != Some(latest.supervisor_state_path.as_str())
             {
                 return Err(RunError::State(format!(
-                    "task {:?} supervisor state path does not match its attempt identity",
-                    task.id
-                )));
-            }
-            if !attempt_ids.insert(attempt) || !supervisor_paths.insert(supervisor_path) {
-                return Err(RunError::State(format!(
-                    "task {:?} reuses another task's attempt identity or supervisor state path",
+                    "task {:?} current attempt does not match its history",
                     task.id
                 )));
             }
         }
-        if matches!(task.status, TaskStatus::Pending | TaskStatus::Blocked)
-            && task.summary.is_some()
-        {
+    }
+    Ok(())
+}
+
+fn validate_attempt_history<'a>(
+    task: &'a TaskRecord,
+    plan_task: &PlanTask,
+    attempt_ids: &mut HashSet<&'a str>,
+    supervisor_paths: &mut HashSet<&'a Path>,
+) -> Result<(), RunError> {
+    if task.attempts.len() > MAX_RETRY_ATTEMPTS as usize {
+        return Err(RunError::State(format!(
+            "task {:?} has too many retained attempts",
+            task.id
+        )));
+    }
+    for (index, attempt) in task.attempts.iter().enumerate() {
+        let expected = u32::try_from(index + 1).map_err(|_| {
+            RunError::State(format!("task {:?} attempt number overflowed", task.id))
+        })?;
+        if attempt.attempt != expected {
             return Err(RunError::State(format!(
-                "non-executed task {:?} has an execution summary",
+                "task {:?} attempt numbers are not sequential",
                 task.id
             )));
         }
-        if matches!(
-            task.status,
-            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
-        ) && task.summary.is_none()
-        {
+        if attempt.run_id.parse::<Uuid>().is_err() {
             return Err(RunError::State(format!(
-                "terminal task {:?} has no execution summary",
+                "task {:?} has an invalid historical attempt_run_id",
                 task.id
             )));
         }
-        if let Some(summary) = &task.summary
-            && matches!(
-                task.status,
-                TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
-            )
+        let supervisor_path = Path::new(&attempt.supervisor_state_path);
+        validate_supervisor_state_path(supervisor_path)?;
+        if supervisor_path.file_stem() != Some(OsStr::new(&attempt.run_id))
+            || supervisor_path.extension() != Some(OsStr::new("json"))
         {
-            let Some(summary_status) = task_status_from_summary(summary) else {
-                return Err(RunError::State(format!(
-                    "terminal task {:?} has an invalid execution summary",
-                    task.id
-                )));
-            };
-            if task.status != summary_status {
-                return Err(RunError::State(format!(
-                    "terminal task {:?} status {} conflicts with its execution summary",
-                    task.id,
-                    task.status.as_str()
-                )));
+            return Err(RunError::State(format!(
+                "task {:?} historical supervisor state path does not match its attempt identity",
+                task.id
+            )));
+        }
+        if !attempt_ids.insert(attempt.run_id.as_str()) || !supervisor_paths.insert(supervisor_path)
+        {
+            return Err(RunError::State(format!(
+                "task {:?} reuses a historical attempt identity or supervisor state path",
+                task.id
+            )));
+        }
+        match attempt.status {
+            AttemptStatus::Running => {
+                if index + 1 != task.attempts.len()
+                    || attempt.reason.is_some()
+                    || attempt.summary.is_some()
+                {
+                    return Err(RunError::State(format!(
+                        "task {:?} has an invalid running attempt history",
+                        task.id
+                    )));
+                }
             }
-            let reason_is_valid = if task.status == TaskStatus::Succeeded {
-                task.reason.is_none()
-            } else {
-                task.reason.is_some()
-            };
-            if !reason_is_valid {
-                return Err(RunError::State(format!(
-                    "terminal task {:?} has an inconsistent reason",
-                    task.id
-                )));
+            AttemptStatus::Indeterminate => {
+                if index + 1 != task.attempts.len()
+                    || attempt.reason.is_none()
+                    || attempt.summary.is_some()
+                {
+                    return Err(RunError::State(format!(
+                        "task {:?} has an invalid indeterminate attempt history",
+                        task.id
+                    )));
+                }
+            }
+            AttemptStatus::Succeeded | AttemptStatus::Failed | AttemptStatus::Cancelled => {
+                let Some(summary) = &attempt.summary else {
+                    return Err(RunError::State(format!(
+                        "task {:?} terminal attempt has no execution summary",
+                        task.id
+                    )));
+                };
+                let expected_status = match task_status_from_summary(summary) {
+                    Some(TaskStatus::Succeeded) => AttemptStatus::Succeeded,
+                    Some(TaskStatus::Failed) => AttemptStatus::Failed,
+                    Some(TaskStatus::Cancelled) => AttemptStatus::Cancelled,
+                    _ => {
+                        return Err(RunError::State(format!(
+                            "task {:?} has an invalid historical execution summary",
+                            task.id
+                        )));
+                    }
+                };
+                if attempt.status != expected_status
+                    || (attempt.status == AttemptStatus::Succeeded && attempt.reason.is_some())
+                    || (attempt.status != AttemptStatus::Succeeded && attempt.reason.is_none())
+                {
+                    return Err(RunError::State(format!(
+                        "task {:?} has inconsistent historical attempt data",
+                        task.id
+                    )));
+                }
             }
         }
+    }
+    if task.attempts.len()
+        > plan_task
+            .retry
+            .as_ref()
+            .map_or(1, |policy| policy.max_attempts as usize)
+    {
+        return Err(RunError::State(format!(
+            "task {:?} exceeds its retry policy",
+            task.id
+        )));
     }
     Ok(())
 }
@@ -2442,19 +2920,64 @@ fn validate_resume_dependencies(plan: &Plan, records: &[TaskRecord]) -> Result<(
     Ok(())
 }
 
-fn next_ready(plan: &Plan, records: &[TaskRecord]) -> Option<usize> {
+fn parse_retry_deadline(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn next_ready(plan: &Plan, records: &[TaskRecord], now: DateTime<Utc>) -> Option<usize> {
     let statuses: HashMap<&str, TaskStatus> = records
         .iter()
         .map(|record| (record.id.as_str(), record.status))
         .collect();
     plan.tasks.iter().enumerate().find_map(|(index, task)| {
+        let retry_ready = records[index]
+            .retry_ready_at
+            .as_deref()
+            .is_none_or(|ready| {
+                parse_retry_deadline(ready).is_some_and(|deadline| deadline <= now)
+            });
         (records[index].status == TaskStatus::Pending
+            && retry_ready
             && task
                 .depends_on
                 .iter()
                 .all(|dependency| statuses[dependency.as_str()] == TaskStatus::Succeeded))
         .then_some(index)
     })
+}
+
+fn next_retry_wait(plan: &Plan, records: &[TaskRecord]) -> Option<std::time::Duration> {
+    let now = Utc::now();
+    let statuses: HashMap<&str, TaskStatus> = records
+        .iter()
+        .map(|record| (record.id.as_str(), record.status))
+        .collect();
+    let deadline = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(|(index, task)| {
+            records[*index].status == TaskStatus::Pending
+                && records[*index].retry_ready_at.is_some()
+                && task
+                    .depends_on
+                    .iter()
+                    .all(|dependency| statuses[dependency.as_str()] == TaskStatus::Succeeded)
+        })
+        .filter_map(|(index, _)| {
+            records[index]
+                .retry_ready_at
+                .as_deref()
+                .and_then(parse_retry_deadline)
+        })
+        .min();
+    let remaining = deadline?
+        .signed_duration_since(now)
+        .to_std()
+        .unwrap_or_default();
+    Some(remaining.min(std::time::Duration::from_millis(RETRY_POLL_INTERVAL_MS)))
 }
 
 fn mark_blocked(plan: &Plan, state: &mut RunState) {
