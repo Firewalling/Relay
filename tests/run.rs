@@ -1000,6 +1000,12 @@ fn retry_schema_is_explicit_and_bounds_invalid_policies() {
     let v1_state = harness.state("retry-v1");
     let error = error_document(&harness.run_json(&v1_retry, &v1_state));
     assert_eq!(error["error"]["code"], "run_plan_invalid");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown field `retry`")
+    );
     assert!(!v1_state.exists());
 
     let invalid = harness.plan_v2("retry-invalid", json!([retry_task("invalid", &[], 11, 0)]));

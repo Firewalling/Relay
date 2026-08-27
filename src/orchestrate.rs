@@ -85,8 +85,7 @@ impl RunError {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct Plan {
     schema_version: u32,
     tasks: Vec<PlanTask>,
@@ -117,6 +116,98 @@ struct PlanTask {
     retry: Option<RetryPolicy>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PlanV1 {
+    schema_version: u32,
+    tasks: Vec<PlanTaskV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PlanTaskV1 {
+    id: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    program: String,
+    #[serde(default)]
+    arguments: Vec<String>,
+    working_directory: Option<String>,
+    timeout_ms: i64,
+    #[serde(default = "default_grace_ms")]
+    termination_grace_ms: i64,
+    #[serde(default = "default_output_limit")]
+    stdout_limit_bytes: i64,
+    #[serde(default = "default_output_limit")]
+    stderr_limit_bytes: i64,
+    #[serde(default = "default_log_limit")]
+    log_limit_bytes: i64,
+    #[serde(default)]
+    redact_argument_indexes: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PlanV2 {
+    schema_version: u32,
+    tasks: Vec<PlanTask>,
+}
+
+impl From<PlanTaskV1> for PlanTask {
+    fn from(task: PlanTaskV1) -> Self {
+        Self {
+            id: task.id,
+            depends_on: task.depends_on,
+            program: task.program,
+            arguments: task.arguments,
+            working_directory: task.working_directory,
+            timeout_ms: task.timeout_ms,
+            termination_grace_ms: task.termination_grace_ms,
+            stdout_limit_bytes: task.stdout_limit_bytes,
+            stderr_limit_bytes: task.stderr_limit_bytes,
+            log_limit_bytes: task.log_limit_bytes,
+            redact_argument_indexes: task.redact_argument_indexes,
+            retry: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Plan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        decode_plan_value(Value::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+fn decode_plan_value(value: Value) -> Result<Plan, String> {
+    let schema_version = value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "schema_version must be an integer".to_owned())?;
+    match schema_version {
+        version if version == u64::from(LEGACY_PLAN_SCHEMA_VERSION) => {
+            let plan: PlanV1 = serde_json::from_value(value).map_err(|error| {
+                format!("invalid plan schema_version {LEGACY_PLAN_SCHEMA_VERSION}: {error}")
+            })?;
+            Ok(Plan {
+                schema_version: plan.schema_version,
+                tasks: plan.tasks.into_iter().map(Into::into).collect(),
+            })
+        }
+        version if version == u64::from(PLAN_SCHEMA_VERSION) => {
+            let plan: PlanV2 = serde_json::from_value(value).map_err(|error| {
+                format!("invalid plan schema_version {PLAN_SCHEMA_VERSION}: {error}")
+            })?;
+            Ok(Plan {
+                schema_version: plan.schema_version,
+                tasks: plan.tasks,
+            })
+        }
+        schema_version => Err(format!("unsupported plan schema_version {schema_version}")),
+    }
+}
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RetryPolicy {
