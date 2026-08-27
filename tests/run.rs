@@ -1028,6 +1028,28 @@ fn retry_schema_is_explicit_and_bounds_invalid_policies() {
     let error = error_document(&harness.run_json(&invalid, &invalid_state));
     assert_eq!(error["error"]["code"], "run_plan_invalid");
     assert!(!invalid_state.exists());
+
+    let mut v2_null_task = task("v2-null", &[]);
+    v2_null_task["retry"] = Value::Null;
+    let v2_null = harness.plan_v2("retry-v2-null", json!([v2_null_task]));
+    let v2_null_state = harness.state("retry-v2-null");
+    let error = error_document(&harness.run_json(&v2_null, &v2_null_state));
+    assert_eq!(error["error"]["code"], "run_plan_invalid");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("retry must be an object")
+    );
+    assert!(!v2_null_state.exists());
+
+    let mut v2_wrong_task = task("v2-wrong", &[]);
+    v2_wrong_task["retry"] = json!("wrong-type");
+    let v2_wrong = harness.plan_v2("retry-v2-wrong", json!([v2_wrong_task]));
+    let v2_wrong_state = harness.state("retry-v2-wrong");
+    let error = error_document(&harness.run_json(&v2_wrong, &v2_wrong_state));
+    assert_eq!(error["error"]["code"], "run_plan_invalid");
+    assert!(!v2_wrong_state.exists());
     assert!(harness.requests().is_empty());
 }
 

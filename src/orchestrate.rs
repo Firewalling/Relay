@@ -112,7 +112,11 @@ struct PlanTask {
     log_limit_bytes: i64,
     #[serde(default)]
     redact_argument_indexes: Vec<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_retry_policy",
+        skip_serializing_if = "Option::is_none"
+    )]
     retry: Option<RetryPolicy>,
 }
 
@@ -227,6 +231,18 @@ fn decode_plan_value(value: Value) -> Result<Plan, String> {
 struct RetryPolicy {
     max_attempts: u32,
     delay_ms: u64,
+}
+fn deserialize_retry_policy<'de, D>(deserializer: D) -> Result<Option<RetryPolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Err(serde::de::Error::custom("retry must be an object"));
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
 }
 
 const fn default_grace_ms() -> i64 {
