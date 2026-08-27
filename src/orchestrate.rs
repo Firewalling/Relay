@@ -10,7 +10,7 @@ use serde_json::json;
 #[cfg(any(debug_assertions, not(target_os = "linux")))]
 use std::fs::OpenOptions;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     env,
     ffi::OsStr,
     fs::{self, File},
@@ -30,7 +30,9 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 1;
+const PLAN_SCHEMA_VERSION: u32 = 1;
+const RUN_STATE_SCHEMA_VERSION: u32 = 2;
+const LEGACY_RUN_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_PLAN_BYTES: u64 = 1 << 20;
 const MAX_STATE_BYTES: u64 = 4 << 20;
 const MAX_TASKS: usize = 64;
@@ -116,9 +118,6 @@ const fn default_output_limit() -> i64 {
 }
 const fn default_log_limit() -> i64 {
     64 << 10
-}
-const fn default_jobs() -> usize {
-    1
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -215,10 +214,42 @@ pub struct RunState {
     pub updated_at: String,
     pub status: RunStatus,
     pub cancellation_requested: bool,
-    #[serde(default = "default_jobs")]
     pub jobs: usize,
     plan: Plan,
     pub tasks: Vec<TaskRecord>,
+}
+
+#[derive(Debug, Default)]
+enum JobsField {
+    #[default]
+    Missing,
+    Null,
+    Value(usize),
+}
+
+fn deserialize_jobs_field<'de, D>(deserializer: D) -> Result<JobsField, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<usize>::deserialize(deserializer)? {
+        Some(jobs) => JobsField::Value(jobs),
+        None => JobsField::Null,
+    })
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunStateWire {
+    schema_version: u32,
+    run_id: String,
+    state_path: String,
+    created_at: String,
+    updated_at: String,
+    status: RunStatus,
+    cancellation_requested: bool,
+    #[serde(default, deserialize_with = "deserialize_jobs_field")]
+    jobs: JobsField,
+    plan: Plan,
+    tasks: Vec<TaskRecord>,
 }
 
 pub struct RunResult {
@@ -235,6 +266,386 @@ impl RunResult {
 struct TaskCompletion {
     index: usize,
     result: Result<supervise::SupervisedExecution, SupervisorError>,
+}
+
+fn supervisor_error(state: &RunState, source: SupervisorError) -> RunError {
+    RunError::Supervisor {
+        run_id: state.run_id.clone(),
+        state_path: state.state_path.clone(),
+        state: Box::new(state.clone()),
+        source,
+    }
+}
+
+fn reset_task_to_pending(task: &mut TaskRecord) {
+    task.status = TaskStatus::Pending;
+    task.reason = None;
+    task.attempt_run_id = None;
+    task.supervisor_state_path = None;
+    task.summary = None;
+}
+
+fn mark_task_indeterminate(task: &mut TaskRecord, reason: String) {
+    task.status = TaskStatus::Indeterminate;
+    task.reason = Some(reason);
+    task.summary = None;
+}
+fn record_shutdown_failure(
+    cleanup_source: &mut Option<SupervisorError>,
+    uncertain_tasks: &mut HashSet<usize>,
+    state: &mut RunState,
+    index: Option<usize>,
+    source: SupervisorError,
+) {
+    if let Some(index) = index.filter(|&index| index < state.tasks.len()) {
+        uncertain_tasks.insert(index);
+        mark_task_indeterminate(
+            &mut state.tasks[index],
+            truncate(&source.to_string(), MAX_SUMMARY_MESSAGE_BYTES),
+        );
+    }
+    if cleanup_source.is_none() {
+        *cleanup_source = Some(source);
+    }
+}
+fn queue_shutdown_completion(
+    completion: TaskCompletion,
+    active: &HashMap<usize, thread::JoinHandle<()>>,
+    pending: &mut HashMap<usize, TaskCompletion>,
+    cleanup_source: &mut Option<SupervisorError>,
+    uncertain_tasks: &mut HashSet<usize>,
+    state: &mut RunState,
+) {
+    let index = completion.index;
+    if !active.contains_key(&index) {
+        record_shutdown_failure(
+            cleanup_source,
+            uncertain_tasks,
+            state,
+            Some(index),
+            SupervisorError::Transport(io::Error::other(
+                "task completion did not match an active worker during shutdown",
+            )),
+        );
+    }
+    if let Entry::Vacant(entry) = pending.entry(index) {
+        entry.insert(completion);
+    } else {
+        record_shutdown_failure(
+            cleanup_source,
+            uncertain_tasks,
+            state,
+            Some(index),
+            SupervisorError::Transport(io::Error::other(
+                "duplicate task completion during shutdown",
+            )),
+        );
+    }
+}
+
+fn apply_completion(
+    plan: &Plan,
+    state: &mut RunState,
+    completion: TaskCompletion,
+    coordinator_cancelled: bool,
+) -> Option<SupervisorError> {
+    if completion.index >= state.tasks.len() {
+        return Some(SupervisorError::Transport(io::Error::other(
+            "task completion index is out of range",
+        )));
+    }
+    if coordinator_cancelled {
+        state.cancellation_requested = true;
+    }
+    match completion.result {
+        Ok(result) => {
+            let execution = result.execution;
+            let execution_cancelled = execution.lifecycle == Lifecycle::Cancelled
+                || matches!(
+                    execution.termination_reason,
+                    TerminationReason::CancelledTerminated | TerminationReason::CancelledKilled
+                )
+                || execution.cancellation.requested;
+            state.tasks[completion.index].summary = Some(summarize(&execution));
+            if execution.task_succeeded() {
+                state.tasks[completion.index].status = TaskStatus::Succeeded;
+                state.tasks[completion.index].reason = None;
+            } else if execution_cancelled {
+                state.tasks[completion.index].status = TaskStatus::Cancelled;
+                state.tasks[completion.index].reason = result_reason(&execution);
+            } else {
+                state.tasks[completion.index].status = TaskStatus::Failed;
+                state.tasks[completion.index].reason = result_reason(&execution);
+            }
+            mark_blocked(plan, state);
+            if execution_cancelled {
+                state.cancellation_requested = true;
+            }
+            None
+        }
+        Err(SupervisorError::CancelledBeforeLaunch) => {
+            reset_task_to_pending(&mut state.tasks[completion.index]);
+            state.cancellation_requested = true;
+            None
+        }
+        Err(source) => {
+            mark_task_indeterminate(
+                &mut state.tasks[completion.index],
+                truncate(&source.to_string(), MAX_SUMMARY_MESSAGE_BYTES),
+            );
+            mark_blocked(plan, state);
+            state.status = RunStatus::Indeterminate;
+            Some(source)
+        }
+    }
+}
+
+struct ShutdownContext<'a> {
+    coordinator: &'a supervise::CoordinatorSignals,
+    active: &'a mut HashMap<usize, thread::JoinHandle<()>>,
+    completed_receiver: &'a mpsc::Receiver<TaskCompletion>,
+    plan: &'a Plan,
+    state: &'a mut RunState,
+    store: &'a mut StateStore,
+}
+
+fn shutdown_and_drain(
+    original_error: RunError,
+    context: ShutdownContext<'_>,
+    unlaunched_index: Option<usize>,
+) -> RunError {
+    let ShutdownContext {
+        coordinator,
+        active,
+        completed_receiver,
+        plan,
+        state,
+        store,
+    } = context;
+    if let Some(index) = unlaunched_index {
+        reset_task_to_pending(&mut state.tasks[index]);
+    }
+    coordinator.request_cancellation();
+    state.cancellation_requested = true;
+    let mut cleanup_source = None;
+    let mut pending = HashMap::<usize, TaskCompletion>::new();
+    let mut uncertain_tasks = HashSet::new();
+    let mut channel_closed = false;
+
+    while !active.is_empty() {
+        while !channel_closed {
+            match completed_receiver.try_recv() {
+                Ok(completion) => queue_shutdown_completion(
+                    completion,
+                    active,
+                    &mut pending,
+                    &mut cleanup_source,
+                    &mut uncertain_tasks,
+                    state,
+                ),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    channel_closed = true;
+                    record_shutdown_failure(
+                        &mut cleanup_source,
+                        &mut uncertain_tasks,
+                        state,
+                        None,
+                        SupervisorError::Transport(io::Error::other(
+                            "task completion channel closed during shutdown",
+                        )),
+                    );
+                }
+            }
+        }
+
+        let index = active
+            .keys()
+            .find(|index| pending.contains_key(index))
+            .copied()
+            .or_else(|| {
+                active
+                    .iter()
+                    .find(|(_, worker)| worker.is_finished())
+                    .map(|(index, _)| *index)
+            });
+        let Some(index) = index else {
+            if channel_closed {
+                break;
+            }
+            match completed_receiver.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(completion) => queue_shutdown_completion(
+                    completion,
+                    active,
+                    &mut pending,
+                    &mut cleanup_source,
+                    &mut uncertain_tasks,
+                    state,
+                ),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    channel_closed = true;
+                    record_shutdown_failure(
+                        &mut cleanup_source,
+                        &mut uncertain_tasks,
+                        state,
+                        None,
+                        SupervisorError::Transport(io::Error::other(
+                            "task completion channel closed during shutdown",
+                        )),
+                    );
+                }
+            }
+            continue;
+        };
+
+        let Some(worker) = active.remove(&index) else {
+            record_shutdown_failure(
+                &mut cleanup_source,
+                &mut uncertain_tasks,
+                state,
+                Some(index),
+                SupervisorError::Transport(io::Error::other(
+                    "active worker disappeared during shutdown",
+                )),
+            );
+            break;
+        };
+        let mut completion = pending.remove(&index);
+        let worker_panicked = worker.join().is_err();
+        loop {
+            match completed_receiver.try_recv() {
+                Ok(candidate) if candidate.index == index => {
+                    if completion.is_none() {
+                        completion = Some(candidate);
+                    } else {
+                        record_shutdown_failure(
+                            &mut cleanup_source,
+                            &mut uncertain_tasks,
+                            state,
+                            Some(index),
+                            SupervisorError::Transport(io::Error::other(
+                                "duplicate task completion during shutdown",
+                            )),
+                        );
+                    }
+                }
+                Ok(candidate) => queue_shutdown_completion(
+                    candidate,
+                    active,
+                    &mut pending,
+                    &mut cleanup_source,
+                    &mut uncertain_tasks,
+                    state,
+                ),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    channel_closed = true;
+                    if !worker_panicked && completion.is_none() {
+                        record_shutdown_failure(
+                            &mut cleanup_source,
+                            &mut uncertain_tasks,
+                            state,
+                            None,
+                            SupervisorError::Transport(io::Error::other(
+                                "task completion channel closed during shutdown",
+                            )),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        match completion {
+            Some(completion) if !uncertain_tasks.contains(&index) => {
+                if let Some(source) = apply_completion(plan, state, completion, true) {
+                    record_shutdown_failure(
+                        &mut cleanup_source,
+                        &mut uncertain_tasks,
+                        state,
+                        Some(index),
+                        source,
+                    );
+                }
+                if worker_panicked {
+                    record_shutdown_failure(
+                        &mut cleanup_source,
+                        &mut uncertain_tasks,
+                        state,
+                        Some(index),
+                        SupervisorError::Transport(io::Error::other(
+                            "supervisor worker panicked while shutting down",
+                        )),
+                    );
+                }
+            }
+            Some(_) => {}
+            None => {
+                let source = SupervisorError::Transport(io::Error::other(if worker_panicked {
+                    "supervisor worker panicked while shutting down"
+                } else {
+                    "task worker finished without a completion"
+                }));
+                record_shutdown_failure(
+                    &mut cleanup_source,
+                    &mut uncertain_tasks,
+                    state,
+                    Some(index),
+                    source,
+                );
+            }
+        }
+    }
+
+    let remaining = active.drain().collect::<Vec<_>>();
+    for (index, worker) in remaining {
+        let worker_panicked = worker.join().is_err();
+        if worker_panicked || state.tasks[index].status == TaskStatus::Running {
+            let source = SupervisorError::Transport(io::Error::other(if worker_panicked {
+                "supervisor worker panicked while shutting down"
+            } else {
+                "task worker finished without a completion"
+            }));
+            record_shutdown_failure(
+                &mut cleanup_source,
+                &mut uncertain_tasks,
+                state,
+                Some(index),
+                source,
+            );
+        }
+    }
+
+    if cleanup_source.is_some() {
+        for task in &mut state.tasks {
+            if task.status == TaskStatus::Running {
+                mark_task_indeterminate(
+                    task,
+                    "coordinator shutdown could not establish task completion".into(),
+                );
+            }
+        }
+    }
+    for index in uncertain_tasks {
+        if let Some(task) = state.tasks.get_mut(index)
+            && task.status != TaskStatus::Indeterminate
+        {
+            mark_task_indeterminate(
+                task,
+                "coordinator shutdown could not establish task completion".into(),
+            );
+        }
+    }
+    mark_blocked(plan, state);
+    state.status = derive_status(&state.tasks, true);
+    let persist_error = persist_at(store, state, "shutdown").err();
+    match (original_error, persist_error) {
+        (RunError::Supervisor { source, .. }, None) => supervisor_error(state, source),
+        (error, None) => error,
+        (error, Some(persist_error)) => RunError::State(format!(
+            "{error}; could not persist shutdown state: {persist_error}"
+        )),
+    }
 }
 
 pub fn run(
@@ -315,7 +726,7 @@ pub fn run(
         store = StateStore::open(&requested_state_path, false)?;
         let now = now();
         state = RunState {
-            schema_version: SCHEMA_VERSION,
+            schema_version: RUN_STATE_SCHEMA_VERSION,
             state_path: path_string(store.path())?,
             run_id: Uuid::new_v4().to_string(),
             created_at: now.clone(),
@@ -343,15 +754,11 @@ pub fn run(
 
     mark_blocked(&plan, &mut state);
     state.status = derive_status(&state.tasks, state.cancellation_requested);
-    persist(&mut store, &mut state)?;
-    let coordinator = Arc::new(supervise::CoordinatorSignals::install().map_err(|source| {
-        RunError::Supervisor {
-            run_id: state.run_id.clone(),
-            state_path: state.state_path.clone(),
-            state: Box::new(state.clone()),
-            source,
-        }
-    })?);
+    persist_at(&mut store, &mut state, "initial")?;
+    let coordinator = Arc::new(
+        supervise::CoordinatorSignals::install()
+            .map_err(|source| supervisor_error(&state, source))?,
+    );
     let (completed_sender, completed_receiver) = mpsc::channel::<TaskCompletion>();
     let mut active = HashMap::<usize, thread::JoinHandle<()>>::new();
     let mut boundary_error = None;
@@ -360,7 +767,20 @@ pub fn run(
         if coordinator.cancellation_requested() && !state.cancellation_requested {
             state.cancellation_requested = true;
             state.status = derive_status(&state.tasks, true);
-            persist(&mut store, &mut state)?;
+            if let Err(error) = persist_at(&mut store, &mut state, "cancellation") {
+                return Err(shutdown_and_drain(
+                    error,
+                    ShutdownContext {
+                        coordinator: coordinator.as_ref(),
+                        active: &mut active,
+                        completed_receiver: &completed_receiver,
+                        plan: &plan,
+                        state: &mut state,
+                        store: &mut store,
+                    },
+                    None,
+                ));
+            }
         }
 
         while !state.cancellation_requested && active.len() < args.jobs {
@@ -368,7 +788,20 @@ pub fn run(
             if coordinator.cancellation_requested() {
                 state.cancellation_requested = true;
                 state.status = derive_status(&state.tasks, true);
-                persist(&mut store, &mut state)?;
+                if let Err(error) = persist_at(&mut store, &mut state, "cancellation") {
+                    return Err(shutdown_and_drain(
+                        error,
+                        ShutdownContext {
+                            coordinator: coordinator.as_ref(),
+                            active: &mut active,
+                            completed_receiver: &completed_receiver,
+                            plan: &plan,
+                            state: &mut state,
+                            store: &mut store,
+                        },
+                        None,
+                    ));
+                }
                 break;
             }
             let Some(index) = next_ready(&plan, &state.tasks) else {
@@ -377,23 +810,76 @@ pub fn run(
 
             let task = &plan.tasks[index];
             let (attempt_run_id, supervisor_state_path) = &attempts[index];
+            let supervisor_state_path_string = match path_string(supervisor_state_path) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Err(shutdown_and_drain(
+                        error,
+                        ShutdownContext {
+                            coordinator: coordinator.as_ref(),
+                            active: &mut active,
+                            completed_receiver: &completed_receiver,
+                            plan: &plan,
+                            state: &mut state,
+                            store: &mut store,
+                        },
+                        None,
+                    ));
+                }
+            };
             state.tasks[index].status = TaskStatus::Running;
             state.tasks[index].reason = None;
             state.tasks[index].summary = None;
             state.tasks[index].attempt_run_id = Some(attempt_run_id.clone());
-            state.tasks[index].supervisor_state_path = Some(path_string(supervisor_state_path)?);
+            state.tasks[index].supervisor_state_path = Some(supervisor_state_path_string);
             state.status = RunStatus::Running;
-            persist(&mut store, &mut state)?;
+            if let Err(error) = persist_at(&mut store, &mut state, "running") {
+                return Err(shutdown_and_drain(
+                    error,
+                    ShutdownContext {
+                        coordinator: coordinator.as_ref(),
+                        active: &mut active,
+                        completed_receiver: &completed_receiver,
+                        plan: &plan,
+                        state: &mut state,
+                        store: &mut store,
+                    },
+                    Some(index),
+                ));
+            }
 
-            test_pause("before_supervisor_launch")?;
+            if let Err(error) = test_pause("before_supervisor_launch") {
+                return Err(shutdown_and_drain(
+                    error,
+                    ShutdownContext {
+                        coordinator: coordinator.as_ref(),
+                        active: &mut active,
+                        completed_receiver: &completed_receiver,
+                        plan: &plan,
+                        state: &mut state,
+                        store: &mut store,
+                    },
+                    Some(index),
+                ));
+            }
             if coordinator.cancellation_requested() {
-                state.tasks[index].status = TaskStatus::Pending;
-                state.tasks[index].reason = None;
-                state.tasks[index].attempt_run_id = None;
-                state.tasks[index].supervisor_state_path = None;
+                reset_task_to_pending(&mut state.tasks[index]);
                 state.cancellation_requested = true;
                 state.status = derive_status(&state.tasks, true);
-                persist(&mut store, &mut state)?;
+                if let Err(error) = persist_at(&mut store, &mut state, "cancellation") {
+                    return Err(shutdown_and_drain(
+                        error,
+                        ShutdownContext {
+                            coordinator: coordinator.as_ref(),
+                            active: &mut active,
+                            completed_receiver: &completed_receiver,
+                            plan: &plan,
+                            state: &mut state,
+                            store: &mut store,
+                        },
+                        None,
+                    ));
+                }
                 break;
             }
 
@@ -428,16 +914,24 @@ pub fn run(
                 Ok(worker) => worker,
                 Err(source) => {
                     let source = SupervisorError::Transport(source);
-                    state.tasks[index].status = TaskStatus::Indeterminate;
-                    state.tasks[index].reason =
-                        Some(truncate(&source.to_string(), MAX_SUMMARY_MESSAGE_BYTES));
+                    mark_task_indeterminate(
+                        &mut state.tasks[index],
+                        truncate(&source.to_string(), MAX_SUMMARY_MESSAGE_BYTES),
+                    );
                     mark_blocked(&plan, &mut state);
                     state.status = RunStatus::Indeterminate;
-                    if boundary_error.is_none() {
-                        boundary_error = Some(source);
-                    }
-                    persist(&mut store, &mut state)?;
-                    continue;
+                    return Err(shutdown_and_drain(
+                        supervisor_error(&state, source),
+                        ShutdownContext {
+                            coordinator: coordinator.as_ref(),
+                            active: &mut active,
+                            completed_receiver: &completed_receiver,
+                            plan: &plan,
+                            state: &mut state,
+                            store: &mut store,
+                        },
+                        None,
+                    ));
                 }
             };
             active.insert(index, worker);
@@ -456,88 +950,107 @@ pub fn run(
             Err(_) => {
                 let source =
                     SupervisorError::Transport(io::Error::other("task completion channel closed"));
-                let reason = truncate(&source.to_string(), MAX_SUMMARY_MESSAGE_BYTES);
-                for &index in active.keys() {
-                    state.tasks[index].status = TaskStatus::Indeterminate;
-                    state.tasks[index].reason = Some(reason.clone());
-                }
-                active.drain().for_each(|(_, worker)| {
-                    let _ = worker.join();
-                });
-                mark_blocked(&plan, &mut state);
-                state.status = RunStatus::Indeterminate;
-                boundary_error = Some(source);
-                persist(&mut store, &mut state)?;
-                break;
+                return Err(shutdown_and_drain(
+                    supervisor_error(&state, source),
+                    ShutdownContext {
+                        coordinator: coordinator.as_ref(),
+                        active: &mut active,
+                        completed_receiver: &completed_receiver,
+                        plan: &plan,
+                        state: &mut state,
+                        store: &mut store,
+                    },
+                    None,
+                ));
             }
         };
-        if let Some(worker) = active.remove(&completion.index) {
-            let _ = worker.join();
+        let Some(worker) = active.remove(&completion.index) else {
+            let source = SupervisorError::Transport(io::Error::other(
+                "task completion did not match an active worker",
+            ));
+            return Err(shutdown_and_drain(
+                supervisor_error(&state, source),
+                ShutdownContext {
+                    coordinator: coordinator.as_ref(),
+                    active: &mut active,
+                    completed_receiver: &completed_receiver,
+                    plan: &plan,
+                    state: &mut state,
+                    store: &mut store,
+                },
+                None,
+            ));
+        };
+        if worker.join().is_err() {
+            let source = SupervisorError::Transport(io::Error::other(
+                "supervisor worker panicked while joining",
+            ));
+            mark_task_indeterminate(
+                &mut state.tasks[completion.index],
+                truncate(&source.to_string(), MAX_SUMMARY_MESSAGE_BYTES),
+            );
+            mark_blocked(&plan, &mut state);
+            state.status = RunStatus::Indeterminate;
+            return Err(shutdown_and_drain(
+                supervisor_error(&state, source),
+                ShutdownContext {
+                    coordinator: coordinator.as_ref(),
+                    active: &mut active,
+                    completed_receiver: &completed_receiver,
+                    plan: &plan,
+                    state: &mut state,
+                    store: &mut store,
+                },
+                None,
+            ));
         }
 
-        let execution = match completion.result {
-            Ok(result) => result.execution,
-            Err(SupervisorError::CancelledBeforeLaunch) => {
-                state.tasks[completion.index].status = TaskStatus::Pending;
-                state.tasks[completion.index].reason = None;
-                state.tasks[completion.index].summary = None;
-                state.tasks[completion.index].attempt_run_id = None;
-                state.tasks[completion.index].supervisor_state_path = None;
-                state.cancellation_requested = true;
-                state.status = derive_status(&state.tasks, true);
-                persist(&mut store, &mut state)?;
-                continue;
-            }
-            Err(source) => {
-                state.tasks[completion.index].status = TaskStatus::Indeterminate;
-                state.tasks[completion.index].reason =
-                    Some(truncate(&source.to_string(), MAX_SUMMARY_MESSAGE_BYTES));
-                mark_blocked(&plan, &mut state);
-                state.status = RunStatus::Indeterminate;
-                if boundary_error.is_none() {
-                    boundary_error = Some(source);
-                }
-                persist(&mut store, &mut state)?;
-                continue;
-            }
-        };
-
-        test_pause("after_supervisor_result")?;
         let coordinator_cancelled = coordinator.cancellation_requested();
-        let execution_cancelled = execution.lifecycle == Lifecycle::Cancelled
-            || matches!(
-                execution.termination_reason,
-                TerminationReason::CancelledTerminated | TerminationReason::CancelledKilled
-            )
-            || execution.cancellation.requested;
-        state.tasks[completion.index].summary = Some(summarize(&execution));
-        if execution.task_succeeded() {
-            state.tasks[completion.index].status = TaskStatus::Succeeded;
-            state.tasks[completion.index].reason = None;
-        } else if execution_cancelled {
-            state.tasks[completion.index].status = TaskStatus::Cancelled;
-            state.tasks[completion.index].reason = result_reason(&execution);
-        } else {
-            state.tasks[completion.index].status = TaskStatus::Failed;
-            state.tasks[completion.index].reason = result_reason(&execution);
+        if let Some(source) = apply_completion(&plan, &mut state, completion, coordinator_cancelled)
+            && boundary_error.is_none()
+        {
+            boundary_error = Some(source);
         }
-        mark_blocked(&plan, &mut state);
-        if coordinator_cancelled || execution_cancelled {
-            state.cancellation_requested = true;
+        if let Err(error) = test_pause("after_supervisor_result") {
+            return Err(shutdown_and_drain(
+                error,
+                ShutdownContext {
+                    coordinator: coordinator.as_ref(),
+                    active: &mut active,
+                    completed_receiver: &completed_receiver,
+                    plan: &plan,
+                    state: &mut state,
+                    store: &mut store,
+                },
+                None,
+            ));
         }
         state.status = derive_status(&state.tasks, state.cancellation_requested);
-        persist(&mut store, &mut state)?;
+        let persistence_point = if state.cancellation_requested {
+            "cancellation"
+        } else {
+            "completion"
+        };
+        if let Err(error) = persist_at(&mut store, &mut state, persistence_point) {
+            return Err(shutdown_and_drain(
+                error,
+                ShutdownContext {
+                    coordinator: coordinator.as_ref(),
+                    active: &mut active,
+                    completed_receiver: &completed_receiver,
+                    plan: &plan,
+                    state: &mut state,
+                    store: &mut store,
+                },
+                None,
+            ));
+        }
     }
 
     state.status = derive_status(&state.tasks, state.cancellation_requested);
-    persist(&mut store, &mut state)?;
+    persist_at(&mut store, &mut state, "final")?;
     if let Some(source) = boundary_error {
-        return Err(RunError::Supervisor {
-            run_id: state.run_id.clone(),
-            state_path: state.state_path.clone(),
-            state: Box::new(state),
-            source,
-        });
+        return Err(supervisor_error(&state, source));
     }
     Ok(render(store.path(), state))
 }
@@ -648,9 +1161,9 @@ fn test_pause(_point: &str) -> Result<(), RunError> {
 }
 
 fn validate_plan(plan: &Plan, invocation_directory: &Path) -> Result<(), RunError> {
-    if plan.schema_version != SCHEMA_VERSION {
+    if plan.schema_version != PLAN_SCHEMA_VERSION {
         return Err(RunError::Plan(format!(
-            "schema_version must be {SCHEMA_VERSION}"
+            "schema_version must be {PLAN_SCHEMA_VERSION}"
         )));
     }
     if !(1..=MAX_TASKS).contains(&plan.tasks.len()) {
@@ -1204,9 +1717,7 @@ impl StateStore {
         let bytes = read_bounded_file(file, MAX_STATE_BYTES).map_err(|error| {
             RunError::State(format!("could not read {}: {error}", self.path.display()))
         })?;
-        serde_json::from_slice(&bytes).map_err(|error| {
-            RunError::State(format!("could not decode {}: {error}", self.path.display()))
-        })
+        decode_run_state(&bytes, &self.path)
     }
 
     fn write_initial(&mut self, state: &RunState) -> Result<(), RunError> {
@@ -1482,9 +1993,29 @@ fn acquire_lock(state_path: &Path) -> Result<StateLock, RunError> {
     }
 }
 
-fn persist(store: &mut StateStore, state: &mut RunState) -> Result<(), RunError> {
+fn persist_at(store: &mut StateStore, state: &mut RunState, point: &str) -> Result<(), RunError> {
     state.updated_at = now();
+    test_fail_persist(point)?;
     store.write_update(state)
+}
+
+#[cfg(debug_assertions)]
+fn test_fail_persist(point: &str) -> Result<(), RunError> {
+    static FAILURE_INJECTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if env::var_os("RELAY_TEST_RUN_FAIL_PERSIST_AT").as_deref() == Some(OsStr::new(point))
+        && !FAILURE_INJECTED.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(RunError::State(format!(
+            "injected aggregate persistence failure at {point}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn test_fail_persist(_point: &str) -> Result<(), RunError> {
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1530,8 +2061,7 @@ fn write_state(path: &Path, state: &RunState) -> Result<(), RunError> {
 fn read_state(path: &Path) -> Result<RunState, RunError> {
     let bytes = read_bounded(path, MAX_STATE_BYTES)
         .map_err(|error| RunError::State(format!("could not read {}: {error}", path.display())))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| RunError::State(format!("could not decode {}: {error}", path.display())))
+    decode_run_state(&bytes, path)
 }
 
 fn read_bounded_file(file: File, maximum: u64) -> io::Result<Vec<u8>> {
@@ -1555,12 +2085,70 @@ fn read_bounded_file(file: File, maximum: u64) -> io::Result<Vec<u8>> {
 fn read_bounded(path: &Path, maximum: u64) -> io::Result<Vec<u8>> {
     read_bounded_file(File::open(path)?, maximum)
 }
+fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
+    let wire: RunStateWire = serde_json::from_slice(bytes).map_err(|error| {
+        RunError::State(format!("could not decode {}: {error}", path.display()))
+    })?;
+    let RunStateWire {
+        schema_version,
+        run_id,
+        state_path,
+        created_at,
+        updated_at,
+        status,
+        cancellation_requested,
+        jobs,
+        plan,
+        tasks,
+    } = wire;
+    let jobs = match schema_version {
+        LEGACY_RUN_STATE_SCHEMA_VERSION => match jobs {
+            JobsField::Missing => 1,
+            JobsField::Value(_) | JobsField::Null => {
+                return Err(RunError::State(
+                    "schema_version 1 aggregate state cannot contain jobs".into(),
+                ));
+            }
+        },
+        RUN_STATE_SCHEMA_VERSION => match jobs {
+            JobsField::Value(jobs) if jobs > 0 => jobs,
+            JobsField::Value(_) => {
+                return Err(RunError::State("jobs must be a positive integer".into()));
+            }
+            JobsField::Null | JobsField::Missing => {
+                return Err(RunError::State(
+                    "schema_version 2 aggregate state requires jobs".into(),
+                ));
+            }
+        },
+        schema_version => {
+            return Err(RunError::State(format!(
+                "unsupported aggregate state schema_version {schema_version}"
+            )));
+        }
+    };
+    Ok(RunState {
+        schema_version: RUN_STATE_SCHEMA_VERSION,
+        run_id,
+        state_path,
+        created_at,
+        updated_at,
+        status,
+        cancellation_requested,
+        jobs,
+        plan,
+        tasks,
+    })
+}
 
 fn validate_resume_state(state: &RunState, plan: &Plan, state_path: &Path) -> Result<(), RunError> {
-    if state.schema_version != SCHEMA_VERSION {
+    if state.schema_version != RUN_STATE_SCHEMA_VERSION {
         return Err(RunError::State(format!(
-            "schema_version must be {SCHEMA_VERSION}"
+            "schema_version must be {RUN_STATE_SCHEMA_VERSION}"
         )));
+    }
+    if state.jobs == 0 {
+        return Err(RunError::State("jobs must be a positive integer".into()));
     }
     if state.state_path != path_string(state_path)? {
         return Err(RunError::State(format!(

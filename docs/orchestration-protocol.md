@@ -26,7 +26,7 @@ output schema version, and on-disk state schema version are independent:
 - `protocol_version: 1` identifies this orchestration contract.
 - `relay_version` identifies the Relay binary that reported it.
 - `output_schema_version: 1` identifies Relay's success and error envelopes.
-- `state.schema_version: 1` identifies the Rust-owned `.relay` state schema.
+- aggregate run-state schema_version: 2 identifies the Rust-owned DAG state schema; the immutable protocol manifest remains v1.
 
 `relay protocol` is project-independent. Global options may precede or follow
 the subcommand, and even `--scope repository` does not trigger repository
@@ -180,12 +180,14 @@ working-directory, and argument strings.
 
 ### Aggregate and attempt state ownership
 
-Aggregate run-state v1 is also a closed Rust schema. By default Rust atomically
+Aggregate run-state v2 is a closed Rust schema. By default Rust atomically
 persists it at `<project>/.relay/runs/<run-uuid>.json`; `--state-path` selects
-an absolute custom path, which remains Rust-owned. A custom path containing a
-`.relay` component is accepted only beneath the current project's
-`.relay/runs` directory. Symlinked state-path components are rejected, an
-adjacent advisory lock prevents two coordinators from owning the same run, and
+an absolute custom path, which remains Rust-owned. Valid aggregate v1 records
+omit `jobs`, imply sequential `jobs: 1`, and are migrated to v2 on safe resume.
+A v1 record with running or indeterminate task work remains non-resumable. A
+custom path containing a `.relay` component is accepted only beneath the current
+project's `.relay/runs` directory. Symlinked state-path components are rejected;
+an adjacent advisory lock prevents two coordinators from owning the same run, and
 resume reads are bounded to 4 MiB.
 
 The aggregate contains schema and run identity, creation/update timestamps,
@@ -244,7 +246,10 @@ Catchable `SIGINT` or `SIGTERM` is latched globally and forwarded through a
 race-safe registry to every active Go supervisor. Registration during startup
 rechecks the latch, and once cancellation is latched no new DAG task is
 scheduled. Clean cancellation results are persisted per task; pending work
-remains resumable after a clean run exit.
+remains resumable after a clean run exit. Coordinator state failures stop new
+launches, latch and forward cancellation, drain and join every active worker,
+classify safe completions, preserve uncertain attempts as indeterminate, and
+make a best-effort final aggregate persist before returning the original error.
 
 Resume always requires the caller to provide the plan again. Rust compares its
 sanitized form with the persisted plan, validates task identity and aggregate

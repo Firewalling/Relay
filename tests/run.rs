@@ -476,6 +476,53 @@ fn wait_for_file_size(path: &Path, minimum: u64) {
     }
 }
 
+fn read_pid(pid_path: &Path) -> i32 {
+    fs::read_to_string(pid_path)
+        .expect("read supervisor PID")
+        .trim()
+        .parse()
+        .expect("valid supervisor PID")
+}
+
+fn wait_for_process_exit(pid_path: &Path) {
+    wait_for_path(pid_path);
+    let pid = read_pid(pid_path);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            panic!("could not inspect supervisor PID {pid}: {error}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "supervisor PID {pid} remained alive"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn supervisor_pid_path(state: &Value, id: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "{}.pid",
+        record(state, id)["supervisor_state_path"]
+            .as_str()
+            .expect("supervisor state path")
+    ))
+}
+
+fn downgrade_to_v1(path: &Path) {
+    let mut state = read_state(path);
+    state["schema_version"] = json!(1);
+    state
+        .as_object_mut()
+        .expect("aggregate state object")
+        .remove("jobs");
+    fs::write(path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+}
+
 #[test]
 fn real_go_supervisor_runs_two_task_dependency_dag_when_configured() {
     let Some(supervisor) = std::env::var_os("RELAY_SUPERVISOR_E2E_BIN") else {
@@ -1220,25 +1267,80 @@ fn signal_during_parallel_startup_cancels_all_without_new_launches() {
 #[cfg(debug_assertions)]
 #[test]
 fn cancellation_before_supervisor_spawn_does_not_launch_new_work() {
+    const ITERATIONS: usize = 100;
     let harness = Harness::new();
     harness.configure(&[("only", "hold")]);
-    let marker = harness.directory.path().join("before-spawn.marker");
-    let release = harness.directory.path().join("before-spawn.release");
-    let plan = harness.plan("before-spawn", json!([task("only", &[])]));
-    let state_path = harness.state("before-spawn");
+
+    for iteration in 0..ITERATIONS {
+        let marker = harness
+            .directory
+            .path()
+            .join(format!("before-spawn-{iteration}.marker"));
+        let release = harness
+            .directory
+            .path()
+            .join(format!("before-spawn-{iteration}.release"));
+        let name = format!("before-spawn-{iteration}");
+        let plan = harness.plan(&name, json!([task("only", &[])]));
+        let state_path = harness.state(&name);
+        let child = harness
+            .command()
+            .env(
+                "RELAY_TEST_SUPERVISOR_PAUSE",
+                "after_spawn_cancellation_check",
+            )
+            .env("RELAY_TEST_SUPERVISOR_MARKER", &marker)
+            .env("RELAY_TEST_SUPERVISOR_RELEASE", &release)
+            .args([
+                "--json",
+                "run",
+                "--jobs",
+                "1",
+                "--supervisor",
+                harness.supervisor.to_str().unwrap(),
+                "--state-path",
+                state_path.to_str().unwrap(),
+                plan.to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for_path(&marker);
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        fs::write(&release, b"release").unwrap();
+        run_document(&child.wait_with_output().unwrap());
+
+        let state = read_state(&state_path);
+        assert_eq!(state["status"], "cancelled");
+        assert_eq!(record(&state, "only")["status"], "pending");
+        assert!(record(&state, "only")["attempt_run_id"].is_null());
+        assert!(record(&state, "only")["supervisor_state_path"].is_null());
+    }
+    assert!(harness.requests().is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn persistence_failure_during_cancellation_drains_two_active_workers() {
+    let harness = Harness::new();
+    harness.configure(&[("first", "barrier"), ("second", "barrier")]);
+    let barrier = harness.directory.path().join("persist-cancel-barrier");
+    let plan = harness.plan(
+        "persist-cancel",
+        json!([task("first", &[]), task("second", &[]), task("later", &[]),]),
+    );
+    let state_path = harness.state("persist-cancel");
     let child = harness
         .command()
-        .env(
-            "RELAY_TEST_SUPERVISOR_PAUSE",
-            "before_spawn_after_reservation",
-        )
-        .env("RELAY_TEST_SUPERVISOR_MARKER", &marker)
-        .env("RELAY_TEST_SUPERVISOR_RELEASE", &release)
+        .env("RELAY_FAKE_BARRIER_DIR", &barrier)
+        .env("RELAY_TEST_RUN_FAIL_PERSIST_AT", "cancellation")
         .args([
             "--json",
             "run",
             "--jobs",
-            "1",
+            "2",
             "--supervisor",
             harness.supervisor.to_str().unwrap(),
             "--state-path",
@@ -1250,17 +1352,77 @@ fn cancellation_before_supervisor_spawn_does_not_launch_new_work() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    wait_for_path(&marker);
-    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
-    fs::write(&release, b"release").unwrap();
-    run_document(&child.wait_with_output().unwrap());
+    harness.wait_for_requests(2);
+    wait_for_path(&barrier.join("started-first"));
+    wait_for_path(&barrier.join("started-second"));
+    let running = read_state(&state_path);
+    let first_pid = supervisor_pid_path(&running, "first");
+    let second_pid = supervisor_pid_path(&running, "second");
 
+    let error = error_document(&terminate(child));
+    assert_eq!(error["error"]["code"], "run_state_invalid");
     let state = read_state(&state_path);
+    assert_eq!(state["schema_version"], 2);
+    assert_eq!(state["jobs"], 2);
     assert_eq!(state["status"], "cancelled");
-    assert_eq!(record(&state, "only")["status"], "pending");
-    assert!(record(&state, "only")["attempt_run_id"].is_null());
-    assert!(record(&state, "only")["supervisor_state_path"].is_null());
-    assert!(harness.requests().is_empty());
+    assert_eq!(state["cancellation_requested"], true);
+    assert_eq!(record(&state, "first")["status"], "cancelled");
+    assert_eq!(record(&state, "second")["status"], "cancelled");
+    assert_eq!(record(&state, "later")["status"], "pending");
+    assert_eq!(harness.requests().len(), 2);
+    wait_for_process_exit(&first_pid);
+    wait_for_process_exit(&second_pid);
+}
+
+#[test]
+fn persistence_failure_after_one_completion_drains_remaining_worker() {
+    let harness = Harness::new();
+    harness.configure(&[("first", "success"), ("second", "hold")]);
+    let marker = harness.directory.path().join("persist-completion.marker");
+    let release = harness.directory.path().join("persist-completion.release");
+    let plan = harness.plan(
+        "persist-completion",
+        json!([task("first", &[]), task("second", &[]), task("later", &[]),]),
+    );
+    let state_path = harness.state("persist-completion");
+    let child = harness
+        .command()
+        .env("RELAY_TEST_RUN_FAIL_PERSIST_AT", "completion")
+        .env("RELAY_TEST_RUN_PAUSE", "after_supervisor_result")
+        .env("RELAY_TEST_RUN_MARKER", &marker)
+        .env("RELAY_TEST_RUN_RELEASE", &release)
+        .args([
+            "--json",
+            "run",
+            "--jobs",
+            "2",
+            "--supervisor",
+            harness.supervisor.to_str().unwrap(),
+            "--state-path",
+            state_path.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    harness.wait_for_requests(2);
+    wait_for_path(&marker);
+    let running = read_state(&state_path);
+    let second_pid = supervisor_pid_path(&running, "second");
+    fs::write(&release, b"release").unwrap();
+
+    let error = error_document(&child.wait_with_output().unwrap());
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+    let state = read_state(&state_path);
+    assert_eq!(state["schema_version"], 2);
+    assert_eq!(state["jobs"], 2);
+    assert_eq!(record(&state, "first")["status"], "succeeded");
+    assert_eq!(record(&state, "second")["status"], "cancelled");
+    assert_eq!(record(&state, "later")["status"], "pending");
+    assert_eq!(harness.requests().len(), 2);
+    wait_for_process_exit(&second_pid);
 }
 
 #[test]
@@ -1322,6 +1484,111 @@ fn resume_refuses_multiple_uncertain_active_attempts() {
         wait_for_path(&pid_path);
         let pid: i32 = fs::read_to_string(pid_path).unwrap().parse().unwrap();
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    }
+}
+
+#[test]
+fn migrates_clean_v1_state_and_resumes_pending_work() {
+    let harness = Harness::new();
+    harness.configure(&[("waiting", "cancelled")]);
+    let plan = harness.plan(
+        "legacy-pending",
+        json!([task("waiting", &[]), task("later", &[])]),
+    );
+    let state_path = harness.state("legacy-pending");
+    run_document(&harness.run_json(&plan, &state_path));
+    downgrade_to_v1(&state_path);
+    let legacy = read_state(&state_path);
+    assert_eq!(legacy["schema_version"], 1);
+    assert!(legacy["jobs"].is_null());
+
+    harness.configure(&[]);
+    run_document(&harness.resume_json(&plan, &state_path));
+
+    let migrated = read_state(&state_path);
+    assert_eq!(migrated["schema_version"], 2);
+    assert_eq!(migrated["jobs"], 1);
+    assert_eq!(record(&migrated, "waiting")["status"], "cancelled");
+    assert_eq!(record(&migrated, "later")["status"], "succeeded");
+    assert_eq!(request_names(&harness.requests()), ["waiting", "later"]);
+}
+
+#[test]
+fn unsafe_v1_running_or_indeterminate_state_stays_non_resumable() {
+    let harness = Harness::new();
+    harness.configure(&[("running", "hold")]);
+    let running_plan = harness.plan("legacy-running", json!([task("running", &[])]));
+    let running_path = harness.state("legacy-running");
+    let mut child = harness.spawn_json(&running_plan, &running_path);
+    harness.wait_for_requests(1);
+    let running = read_state(&running_path);
+    let running_pid = supervisor_pid_path(&running, "running");
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+    downgrade_to_v1(&running_path);
+    let before_running_resume = harness.requests().len();
+    let running_error = error_document(&harness.resume_json(&running_plan, &running_path));
+    assert_eq!(running_error["error"]["code"], "run_state_invalid");
+    assert_eq!(harness.requests().len(), before_running_resume);
+    assert_eq!(
+        unsafe { libc::kill(read_pid(&running_pid), libc::SIGTERM) },
+        0
+    );
+    wait_for_process_exit(&running_pid);
+
+    harness.configure(&[("uncertain", "malformed")]);
+    let uncertain_plan = harness.plan("legacy-indeterminate", json!([task("uncertain", &[])]));
+    let uncertain_path = harness.state("legacy-indeterminate");
+    error_document(&harness.run_json(&uncertain_plan, &uncertain_path));
+    assert_eq!(read_state(&uncertain_path)["status"], "indeterminate");
+    downgrade_to_v1(&uncertain_path);
+    let before_uncertain_resume = harness.requests().len();
+    let uncertain_error = error_document(&harness.resume_json(&uncertain_plan, &uncertain_path));
+    assert_eq!(uncertain_error["error"]["code"], "run_state_invalid");
+    assert_eq!(harness.requests().len(), before_uncertain_resume);
+}
+
+#[test]
+fn rejects_unknown_and_malformed_aggregate_state_versions() {
+    let harness = Harness::new();
+    let plan = harness.plan("state-schema-errors", json!([task("only", &[])]));
+    let state_path = harness.state("state-schema-errors");
+    run_document(&harness.run_json(&plan, &state_path));
+    let original = read_state(&state_path);
+    let before = harness.requests().len();
+
+    let mut unknown_version = original.clone();
+    unknown_version["schema_version"] = json!(99);
+    let mut missing_jobs = original.clone();
+    missing_jobs
+        .as_object_mut()
+        .expect("aggregate state object")
+        .remove("jobs");
+    let mut unknown_field = original.clone();
+    unknown_field["unexpected"] = json!(true);
+    let mut legacy_null = original.clone();
+    legacy_null["schema_version"] = json!(1);
+    legacy_null["jobs"] = Value::Null;
+    let mut legacy_zero = legacy_null.clone();
+    legacy_zero["jobs"] = json!(0);
+    let mut legacy_jobs = original.clone();
+    legacy_jobs["schema_version"] = json!(1);
+    legacy_jobs["jobs"] = json!(1);
+    let mut v2_zero = original.clone();
+    v2_zero["jobs"] = json!(0);
+    for invalid in [
+        unknown_version,
+        missing_jobs,
+        unknown_field,
+        legacy_null,
+        legacy_zero,
+        legacy_jobs,
+        v2_zero,
+    ] {
+        fs::write(&state_path, serde_json::to_vec_pretty(&invalid).unwrap()).unwrap();
+        let error = error_document(&harness.resume_json(&plan, &state_path));
+        assert_eq!(error["error"]["code"], "run_state_invalid");
+        assert_eq!(harness.requests().len(), before);
     }
 }
 
@@ -1470,7 +1737,8 @@ fn successful_state_has_unique_attempt_identities_and_sanitizes_secrets() {
 
     let state: Value = serde_json::from_str(&persisted).unwrap();
     assert_eq!(document["data"]["run"], state);
-    assert_eq!(state["schema_version"], 1);
+    assert_eq!(state["schema_version"], 2);
+    assert_eq!(state["jobs"], 1);
     assert_eq!(state["status"], "completed");
     let first = record(&state, "first");
     let second = record(&state, "second");
