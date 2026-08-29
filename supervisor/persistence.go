@@ -24,6 +24,15 @@ func NewStateStore() *StateStore {
 }
 
 func (store *StateStore) Save(path string, result protocol.ExecutionResult) error {
+	identity, err := captureProcessIdentity(os.Getpid())
+	var attemptIdentity *protocol.AttemptIdentity
+	if err == nil {
+		attemptIdentity = &protocol.AttemptIdentity{Supervisor: identity}
+	}
+	return store.SaveWithIdentity(path, result, attemptIdentity)
+}
+
+func (store *StateStore) SaveWithIdentity(path string, result protocol.ExecutionResult, identity *protocol.AttemptIdentity) error {
 	limit := store.recordLimit()
 	cleanPath, directory, directoryInfo, err := validateStatePath(path, true)
 	if err != nil {
@@ -37,6 +46,8 @@ func (store *StateStore) Save(path string, result protocol.ExecutionResult) erro
 	record := protocol.RunRecord{
 		RunStateVersion:   protocol.RunStateVersion,
 		SupervisorVersion: protocol.SupervisorVersion,
+		StatePath:         cleanPath,
+		ProcessIdentity:   identity,
 		Execution:         result,
 	}
 	payload, err := json.MarshalIndent(record, "", "  ")
@@ -129,16 +140,46 @@ func (store *StateStore) Load(path string) (protocol.RunRecord, error) {
 		}
 		return protocol.RunRecord{}, fmt.Errorf("decode trailing run state: %w", err)
 	}
-	if record.RunStateVersion != protocol.RunStateVersion {
+	if record.RunStateVersion != protocol.RunStateVersion && record.RunStateVersion != protocol.LegacyRunStateVersion {
 		return protocol.RunRecord{}, fmt.Errorf("unsupported run-state version %d", record.RunStateVersion)
 	}
-	if record.SupervisorVersion == "" || record.Execution.SupervisorVersion == "" {
-		return protocol.RunRecord{}, errors.New("run state supervisor_version must not be empty")
+	if record.RunStateVersion == protocol.LegacyRunStateVersion && (record.StatePath != "" || record.ProcessIdentity != nil) {
+		return protocol.RunRecord{}, errors.New("legacy run state contains version-2 fields")
+	}
+	if record.RunStateVersion == protocol.RunStateVersion && record.StatePath != cleanPath {
+		return protocol.RunRecord{}, errors.New("run state state_path does not match requested path")
+	}
+	if record.SupervisorVersion == "" || record.Execution.SupervisorVersion == "" || record.SupervisorVersion != record.Execution.SupervisorVersion {
+		return protocol.RunRecord{}, errors.New("run state supervisor_version is inconsistent")
 	}
 	if record.Execution.ProtocolVersion != protocol.ProtocolVersion {
 		return protocol.RunRecord{}, fmt.Errorf("unsupported execution protocol version %d", record.Execution.ProtocolVersion)
 	}
+	if record.ProcessIdentity != nil {
+		if err := validateAttemptIdentity(record.ProcessIdentity); err != nil {
+			return protocol.RunRecord{}, fmt.Errorf("invalid process identity: %w", err)
+		}
+	}
 	return record, nil
+}
+
+func validateAttemptIdentity(identity *protocol.AttemptIdentity) error {
+	if err := validateProcessIdentity(identity.Supervisor); err != nil {
+		return fmt.Errorf("supervisor: %w", err)
+	}
+	if identity.Child != nil {
+		if err := validateProcessIdentity(*identity.Child); err != nil {
+			return fmt.Errorf("child: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateProcessIdentity(identity protocol.ProcessIdentity) error {
+	if identity.PID <= 0 || identity.StartTimeTicks == 0 || identity.ProcessGroupID <= 0 || identity.SessionID <= 0 || identity.Executable == "" {
+		return errors.New("PID, start time, process group, session, and executable are required")
+	}
+	return nil
 }
 
 func (store *StateStore) recordLimit() int64 {

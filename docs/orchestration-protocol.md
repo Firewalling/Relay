@@ -192,8 +192,9 @@ Aggregate run-state v3 is a closed Rust schema. By default Rust atomically
 persists it at `<project>/.relay/runs/<run-uuid>.json`; `--state-path` selects
 an absolute custom path, which remains Rust-owned. Valid aggregate v1 records
 omit `jobs` and imply sequential `jobs: 1`; v2 records include `jobs` but
-no retry history. Clean v1/v2 records migrate to v3 on safe resume. Running or
-indeterminate records remain non-resumable.
+no retry history. Clean v1/v2 records migrate to v3 on safe resume. Running
+records are reconciled from strict Go evidence before scheduling; unresolved
+running and indeterminate records remain non-resumable.
 Custom paths containing a `.relay` component are accepted only beneath the
 current project's `.relay/runs` directory. Symlinked state-path components
 are rejected; an adjacent advisory lock prevents two coordinators from owning
@@ -222,21 +223,19 @@ Rust persists `running` plus a fresh attempt UUID and Go record path. A clean
 typed supervisor response is persisted in its attempt history; no captured
 stream text or environment values enter aggregate state.
 
-Each attempt's complete Go-owned record is under
+Each attempt's Go-owned record is under
 `${TMPDIR}/relay/supervisor/<attempt-uuid>.json`. Validation guarantees that
 path is outside Rust-owned `.relay`, but `TMPDIR` itself may point inside the
 selected project. Rust never overwrites earlier attempt records, and Go never
 reads or writes `.relay`.
 
-JSON task-outcome output contains `{ "state_path": ..., "run": ... }`, with
-`run` equal to the full persisted aggregate state. Human output reports the run
-ID and status plus each task's status, bounded reason, and Go record path when
-an attempt exists. Only `completed` exits zero. A clean `failed` or `cancelled`
-coordinator result exits nonzero but retains the ordinary `ok: true` success
-envelope on stdout, distinguishing a known task outcome from a Relay error. A
-supervisor boundary failure exits nonzero with an `ok: false`, `run_supervisor`
-error envelope on stderr whose `data` contains the same `state_path` and full
-persisted `run`, now marked `indeterminate`.
+JSON task-outcome output contains `{ "state_path": ..., "run": ...,
+"reconciliation": [...] }`; `run` equals full persisted aggregate state.
+Reconciliation entries identify task, attempt, classification, and bounded
+reason. Human output reports run ID/status, task statuses, reasons, paths, and
+reconciliation details. Only `completed` exits zero. Clean `failed` or
+`cancelled` outcomes retain `ok: true` on stdout; supervisor boundary errors
+remain `ok: false` on stderr with persisted state and reconciliation data.
 
 ### Scheduling, failure, cancellation, and resume
 
@@ -268,12 +267,13 @@ including a waiting retry, remains resumable after clean exit. Coordinator state
 failures stop launches, drain and join workers, preserve uncertain attempts as
 indeterminate, and best-effort persist before returning the original error.
 
-Resume requires the plan again. Rust compares its sanitized form, validates
-attempt history and aggregate consistency, and refuses any state containing
-running or indeterminate work. It never reruns terminal or blocked tasks; it
-continues safe pending work and validated pending retries only. A future retry
-deadline is polled without holding a job slot. There is no process reattachment
-or recovery claim for active or uncertain work.
+Resume requires plan again. Rust compares sanitized form and validates
+attempt history and aggregate consistency. It reconciles running attempts
+before scheduling: strict terminal Go records update existing attempts in place,
+with live completion and retry semantics. Verified active attempts refuse
+resume without duplicate launch. Missing, malformed, mismatched, stale, or
+unverifiable work becomes indeterminate; terminal and blocked tasks never rerun.
+A future retry deadline is polled without holding a job slot.
 
 ### Coordinator limits and non-guarantees
 
@@ -554,22 +554,80 @@ truncation flag.
 The versioned Go-owned record is:
 
 ```text
-run_state_version: 1
+run_state_version: 2
+state_path: <the requested Go record path>
 supervisor_version: 0.1.0
-execution: <the complete execution result>
+process_identity: <the supervisor and optional child identities>
+execution: <the current or complete execution result>
 ```
 
-It is written at accepted, starting, running, and final transitions with mode
-`0600`. Each replacement is encoded with a 140 MiB ceiling, written to a
-same-directory temporary file, synced, closed, atomically renamed, and followed
-by a directory sync. On Linux, persistence pins the validated parent directory
-by file descriptor, verifies its identity, and performs target open/rename
-relative to that handle so a path swap cannot redirect the operation. Failed
-replacement leaves the prior valid record untouched and removes the temporary
-file. Reload rejects unknown fields, multiple documents, oversized records,
-and unsupported versions. State files and parent directories may not be
-symbolic links, and neither the lexical nor resolved path may enter Rust-owned
-`.relay`.
+It is written at accepted, starting, running, and terminal transitions with
+mode 0600. Accepted and starting records contain supervisor identity; after
+child start, Go records child identity before publishing running state. Each
+replacement is encoded with a 140 MiB ceiling, written to a same-directory
+temporary file, synced, closed, atomically renamed, and followed by a directory
+sync. On Linux, persistence pins the validated parent directory by file
+descriptor, verifies its identity, and performs target open/rename relative to
+that handle so a path swap cannot redirect the operation. Failed replacement
+leaves prior valid record untouched and removes the temporary file. Reload
+rejects unknown fields, multiple documents, oversized records, and unsupported
+versions; version 1 remains readable for legacy terminal recovery. State files
+and parent directories may not be symbolic links, and neither lexical nor
+resolved path may enter Rust-owned .relay.
+
+### Crash reconciliation
+
+relay run --resume inspects persisted running attempts before it schedules
+anything. Rust reads exact supervisor state path recorded in aggregate, opens
+it without following a file symlink, and requires one bounded JSON record. A
+terminal result is promoted only when its wrapper and execution data bind to
+the attempt UUID, requested state path, program, sanitized argv, execution
+options, supervisor version, and protocol version. Rust then applies same
+completion transition used by live worker results, including summary, reason,
+dependency, cancellation, and retry handling.
+
+Each attempt is classified independently:
+
+- completed, failed, or cancelled: Go record is terminal and passes existing
+  strict Rust response validation. Aggregate running attempt is updated in
+  place; no new history entry is created.
+- still_running: version-2 active record is valid and both required process
+  identities still match. Resume refuses with message "attempt still active;
+  resume cannot continue this branch yet"; it never duplicates or adopts that
+  process.
+- indeterminate: record is absent, partial, malformed, stale, mismatched,
+  protocol-failed, terminal-invalid, or process identity cannot be proven. The
+  attempt becomes indeterminate and descendants remain blocked.
+- refused: attempt already persisted as indeterminate. No retry or new evidence
+  is inferred.
+
+Version 2 records add state_path and process_identity. On Linux each process
+identity contains PID, /proc/<pid>/stat start time ticks, process-group ID,
+session ID, and /proc/<pid>/exe identity. Rust checks supervisor identity for
+accepted/starting records and both supervisor plus child identities for a
+running record. Start time prevents PID reuse; group/session and executable
+checks prevent a merely matching numeric PID from proving the attempt. Rust
+reads stat identity again before acceptance to reduce proc TOCTOU risk. Legacy
+version-1 terminal records remain readable and can reconcile through strict
+terminal-result validation. Legacy active records lack durable process identity
+and remain indeterminate.
+
+Crash windows stay conservative. A terminal Go record durably written before
+coordinator aggregate completion persistence is recoverable. An active Go
+record is reportable as still running only while exact identity is provable.
+Crash before startup state, or after child launch before durable child identity,
+is indeterminate. After durable active identity but before terminal state, exact
+live identities produce still_running; if identity is gone or mismatched, the
+result is indeterminate. Missing state, vanished process, and failed reads are
+also indeterminate. Relay never rolls back a running attempt merely because
+process or state file is gone, and never retries it.
+Coordinator crash during
+cancellation is recoverable only from valid persisted cancelled Go result; that
+result is never retried.
+
+Aggregate run-state schema remains version 3. Go attempt records use version 2,
+with version 1 retained for terminal compatibility. Versions are separate from
+plan, output, and process-protocol versions.
 
 ### Platform support
 
@@ -602,8 +660,8 @@ Request on supervisor stdin:
 }
 ```
 
-After the direct child exits, `state_path` contains this complete record (fixed
-timestamps make the example reproducible):
+The following legacy v1 terminal record remains accepted for compatibility;
+current v2 records add state_path and process_identity as shown above.
 
 ```json
 {

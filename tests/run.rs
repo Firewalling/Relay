@@ -1311,9 +1311,16 @@ fn real_go_supervisor_runs_two_task_dependency_dag_when_configured() {
         assert!(supervisor_state.is_file());
 
         let go_record: Value =
-            serde_json::from_slice(&fs::read(supervisor_state).expect("read Go run record"))
+            serde_json::from_slice(&fs::read(&supervisor_state).expect("read Go run record"))
                 .expect("valid Go run record");
-        assert_eq!(go_record["run_state_version"], 1);
+        assert_eq!(go_record["run_state_version"], 2);
+        assert_eq!(go_record["state_path"], supervisor_state.to_str().unwrap());
+        assert!(
+            go_record["process_identity"]["supervisor"]["pid"]
+                .as_i64()
+                .unwrap()
+                > 0
+        );
         let execution = go_record["execution"].clone();
         assert_eq!(execution["run_id"], attempt);
         assert_eq!(execution["lifecycle"], "completed");
@@ -1844,6 +1851,7 @@ fn parallel_failure_and_timeout_block_descendants_but_preserve_unrelated_work() 
     initial_names.sort_unstable();
     assert_eq!(initial_names, ["failed", "timeout"]);
     assert_eq!(names[2], "other");
+    wait_for_path(&barrier);
     fs::write(barrier.join("release"), b"release").unwrap();
     run_document(&child.wait_with_output().unwrap());
 
@@ -3569,4 +3577,785 @@ fn valid_retry_history_transitions_resume_without_new_launches() {
     let resumed = read_state(&state_path);
     assert_eq!(resumed["status"], "completed");
     assert_eq!(attempts(&resumed, "flaky").len(), 2);
+}
+
+fn real_supervisor_path() -> Option<PathBuf> {
+    let supervisor = std::env::var_os("RELAY_SUPERVISOR_E2E_BIN")?;
+    let supervisor = PathBuf::from(supervisor);
+    assert!(supervisor.is_absolute() && supervisor.is_file());
+    Some(supervisor)
+}
+
+fn real_relay_command(supervisor: &Path, directory: &Path, temporary_root: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_relay"));
+    command
+        .current_dir(directory)
+        .env("TMPDIR", temporary_root)
+        .args(["--json", "run", "--supervisor"])
+        .arg(supervisor);
+    command
+}
+
+fn spawn_real_crash_run(
+    supervisor: &Path,
+    directory: &Path,
+    temporary_root: &Path,
+    plan: &Path,
+    state: &Path,
+    marker: &Path,
+    jobs: usize,
+) -> Child {
+    let jobs = jobs.to_string();
+    let release = marker.with_extension("release");
+    real_relay_command(supervisor, directory, temporary_root)
+        .env("RELAY_TEST_RUN_PAUSE", "after_supervisor_result")
+        .env("RELAY_TEST_RUN_MARKER", marker)
+        .env("RELAY_TEST_RUN_RELEASE", release)
+        .args([
+            "--jobs",
+            jobs.as_str(),
+            "--state-path",
+            state.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn real-Go crash run")
+}
+
+fn resume_real_run(
+    supervisor: &Path,
+    directory: &Path,
+    temporary_root: &Path,
+    plan: &Path,
+    state: &Path,
+    jobs: usize,
+) -> Output {
+    let jobs = jobs.to_string();
+    real_relay_command(supervisor, directory, temporary_root)
+        .args([
+            "--jobs",
+            jobs.as_str(),
+            "--resume",
+            state.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .output()
+        .expect("resume real-Go run")
+}
+
+fn wait_for_go_running_state(path: &Path) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if path.is_file() {
+            let record = read_state(path);
+            if record["execution"]["lifecycle"] == "running"
+                && record["process_identity"]["child"]["pid"].is_number()
+            {
+                return record;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for Go running state"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn kill_real_attempt(state: &Value, id: &str) {
+    let path = PathBuf::from(
+        record(state, id)["supervisor_state_path"]
+            .as_str()
+            .expect("real supervisor state path"),
+    );
+    let Ok(payload) = fs::read(&path) else {
+        return;
+    };
+    let Ok(go_record) = serde_json::from_slice::<Value>(&payload) else {
+        return;
+    };
+    if let Some(pid) = go_record["process_identity"]["child"]["pid"].as_i64()
+        && pid > 0
+    {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    if let Some(pid) = go_record["process_identity"]["supervisor"]["pid"].as_i64()
+        && pid > 0
+    {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+}
+
+fn kill_coordinator(mut child: Child) {
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().expect("wait for killed coordinator");
+}
+
+#[test]
+fn real_go_reconciles_completed_attempt_without_rerun() {
+    let Some(supervisor) = real_supervisor_path() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create completed recovery directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).unwrap();
+    let script = directory.path().join("count.py");
+    let counter = directory.path().join("count");
+    let descendant = directory.path().join("descendant-ran");
+    fs::write(
+        &script,
+        "import pathlib,sys\np=pathlib.Path(sys.argv[1])\nn=int(p.read_text()) if p.exists() else 0\np.write_text(str(n+1))\n",
+    )
+    .unwrap();
+    let plan = directory.path().join("plan.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "tasks": [
+                {
+                    "id": "only",
+                    "program": "/usr/bin/python3",
+                    "arguments": [script.to_str().unwrap(), counter.to_str().unwrap()],
+                    "timeout_ms": 5_000
+                },
+                {
+                    "id": "later",
+                    "depends_on": ["only"],
+                    "program": "/usr/bin/touch",
+                    "arguments": [descendant.to_str().unwrap()],
+                    "timeout_ms": 5_000
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = directory.path().join("aggregate.json");
+    let marker = directory.path().join("pause.marker");
+    let child = spawn_real_crash_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &plan,
+        &state,
+        &marker,
+        1,
+    );
+    wait_for_path(&marker);
+    let interrupted = read_state(&state);
+    assert_eq!(record(&interrupted, "only")["status"], "running");
+    let go_state = PathBuf::from(
+        record(&interrupted, "only")["supervisor_state_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let mut go_record = read_state(&go_state);
+    assert_eq!(go_record["run_state_version"], 2);
+    assert_eq!(go_record["execution"]["lifecycle"], "completed");
+    go_record["run_state_version"] = json!(1);
+    go_record.as_object_mut().unwrap().remove("state_path");
+    go_record
+        .as_object_mut()
+        .unwrap()
+        .remove("process_identity");
+    fs::write(&go_state, serde_json::to_vec(&go_record).unwrap()).unwrap();
+    kill_coordinator(child);
+
+    let resumed = resume_real_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &plan,
+        &state,
+        1,
+    );
+    let document = run_document(&resumed);
+    let final_state = read_state(&state);
+    assert_eq!(final_state["status"], "completed");
+    assert_eq!(record(&final_state, "only")["status"], "succeeded");
+    assert_eq!(attempts(&final_state, "only").len(), 1);
+    assert_eq!(record(&final_state, "later")["status"], "succeeded");
+    assert_eq!(attempts(&final_state, "later").len(), 1);
+    assert!(descendant.is_file());
+    assert_eq!(fs::read_to_string(&counter).unwrap(), "1");
+    assert_eq!(
+        document["data"]["reconciliation"][0]["classification"],
+        "completed"
+    );
+}
+
+#[test]
+fn real_go_reconciles_known_failure_and_retries_once() {
+    let Some(supervisor) = real_supervisor_path() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create failure recovery directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).unwrap();
+    let script = directory.path().join("fail-once.py");
+    let counter = directory.path().join("count");
+    fs::write(
+        &script,
+        "import pathlib,sys\np=pathlib.Path(sys.argv[1])\nn=int(p.read_text()) if p.exists() else 0\np.write_text(str(n+1))\nsys.exit(17 if n == 0 else 0)\n",
+    )
+    .unwrap();
+    let plan = directory.path().join("plan.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&json!({
+            "schema_version": 2,
+            "tasks": [{
+                "id": "flaky",
+                "program": "/usr/bin/python3",
+                "arguments": [script.to_str().unwrap(), counter.to_str().unwrap()],
+                "timeout_ms": 5_000,
+                "retry": {"max_attempts": 2, "delay_ms": 0}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = directory.path().join("aggregate.json");
+    let marker = directory.path().join("pause.marker");
+    let child = spawn_real_crash_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &plan,
+        &state,
+        &marker,
+        1,
+    );
+    wait_for_path(&marker);
+    let interrupted = read_state(&state);
+    let first_id = attempts(&interrupted, "flaky")[0]["run_id"].clone();
+    let go_state = PathBuf::from(
+        record(&interrupted, "flaky")["supervisor_state_path"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(
+        read_state(&go_state)["execution"]["termination_reason"],
+        "exit_nonzero"
+    );
+    kill_coordinator(child);
+
+    let resumed = resume_real_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &plan,
+        &state,
+        1,
+    );
+    let document = run_document(&resumed);
+    let final_state = read_state(&state);
+    let history = attempts(&final_state, "flaky");
+    assert_eq!(final_state["status"], "completed");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["run_id"], first_id);
+    assert_eq!(history[0]["status"], "failed");
+    assert_eq!(history[1]["status"], "succeeded");
+    assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
+    assert_eq!(
+        document["data"]["reconciliation"][0]["classification"],
+        "failed"
+    );
+
+    let repeated = resume_real_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &plan,
+        &state,
+        1,
+    );
+    let repeated_document = run_document(&repeated);
+    assert!(
+        repeated_document["data"]["reconciliation"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(attempts(&read_state(&state), "flaky").len(), 2);
+    assert_eq!(fs::read_to_string(&counter).unwrap(), "2");
+}
+
+#[test]
+fn real_go_verified_active_attempt_blocks_duplicate_resume() {
+    let Some(supervisor) = real_supervisor_path() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create active recovery directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).unwrap();
+    let plan = directory.path().join("plan.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "tasks": [{
+                "id": "sleep",
+                "program": "/usr/bin/sleep",
+                "arguments": ["30"],
+                "timeout_ms": 60_000
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = directory.path().join("aggregate.json");
+    let marker = directory.path().join("unused.marker");
+    let release = directory.path().join("unused.release");
+    let child = real_relay_command(&supervisor, directory.path(), &temporary_root)
+        .args([
+            "--jobs",
+            "1",
+            "--state-path",
+            state.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn real active run");
+    let running = wait_for_running_task(&state, "sleep");
+    let go_state = PathBuf::from(
+        record(&running, "sleep")["supervisor_state_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let go_record = wait_for_go_running_state(&go_state);
+    assert!(
+        go_record["process_identity"]["supervisor"]["pid"]
+            .as_i64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        go_record["process_identity"]["child"]["pid"]
+            .as_i64()
+            .unwrap()
+            > 0
+    );
+    assert!(!marker.exists() && !release.exists());
+    kill_coordinator(child);
+
+    let resumed = resume_real_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &plan,
+        &state,
+        1,
+    );
+    let error = error_document(&resumed);
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+    assert_eq!(
+        error["data"]["reconciliation"][0]["classification"],
+        "still_running"
+    );
+    assert_eq!(read_state(&state)["tasks"][0]["status"], "running");
+    assert_eq!(attempts(&read_state(&state), "sleep").len(), 1);
+    kill_real_attempt(&read_state(&state), "sleep");
+}
+
+#[test]
+fn real_go_rejects_mismatching_process_identity_with_same_pid() {
+    let Some(supervisor) = real_supervisor_path() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create identity mismatch directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).unwrap();
+    let plan = directory.path().join("plan.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "tasks": [{
+                "id": "sleep",
+                "program": "/usr/bin/sleep",
+                "arguments": ["30"],
+                "timeout_ms": 60_000
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = directory.path().join("aggregate.json");
+    let child = real_relay_command(&supervisor, directory.path(), &temporary_root)
+        .args([
+            "--jobs",
+            "1",
+            "--state-path",
+            state.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn real PID mismatch run");
+    let interrupted = wait_for_running_task(&state, "sleep");
+    let go_state = PathBuf::from(
+        record(&interrupted, "sleep")["supervisor_state_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let mut go_record = wait_for_go_running_state(&go_state);
+    let child_start = go_record["process_identity"]["child"]["start_time_ticks"]
+        .as_u64()
+        .unwrap();
+    go_record["process_identity"]["child"]["start_time_ticks"] = json!(child_start + 1);
+    fs::write(&go_state, serde_json::to_vec(&go_record).unwrap()).unwrap();
+    kill_coordinator(child);
+
+    let resumed = resume_real_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &plan,
+        &state,
+        1,
+    );
+    let error = error_document(&resumed);
+    assert_eq!(
+        error["data"]["reconciliation"][0]["classification"],
+        "indeterminate"
+    );
+    let final_state = read_state(&state);
+    assert_eq!(record(&final_state, "sleep")["status"], "indeterminate");
+    assert_eq!(attempts(&final_state, "sleep").len(), 1);
+    kill_real_attempt(&interrupted, "sleep");
+}
+
+#[test]
+fn real_go_untrusted_or_missing_records_never_become_rerunnable() {
+    let Some(supervisor) = real_supervisor_path() else {
+        return;
+    };
+    for case in [
+        "missing",
+        "partial",
+        "malformed",
+        "missing_identity",
+        "legacy_active",
+        "mismatched_uuid",
+        "mismatched_state_path",
+        "mismatched_program",
+        "mismatched_argv",
+        "stale_prior_state",
+        "mismatched_protocol",
+        "mismatched_supervisor_version",
+    ] {
+        let directory = tempfile::tempdir().expect("create untrusted record directory");
+        let temporary_root = directory.path().join("tmp");
+        fs::create_dir(&temporary_root).unwrap();
+        let plan = directory.path().join("plan.json");
+        fs::write(
+            &plan,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "tasks": [{
+                    "id": "sleep",
+                    "program": "/usr/bin/sleep",
+                    "arguments": ["30"],
+                    "timeout_ms": 60_000
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = directory.path().join("aggregate.json");
+        let child = real_relay_command(&supervisor, directory.path(), &temporary_root)
+            .args([
+                "--jobs",
+                "1",
+                "--state-path",
+                state.to_str().unwrap(),
+                plan.to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn untrusted record run");
+        let interrupted = wait_for_running_task(&state, "sleep");
+        let go_state = PathBuf::from(
+            record(&interrupted, "sleep")["supervisor_state_path"]
+                .as_str()
+                .unwrap(),
+        );
+        let go_record = wait_for_go_running_state(&go_state);
+        kill_coordinator(child);
+        kill_real_attempt(&interrupted, "sleep");
+
+        match case {
+            "missing" => fs::remove_file(&go_state).unwrap(),
+            "partial" => fs::write(&go_state, b"{\"run_state_version\":2").unwrap(),
+            "malformed" => fs::write(&go_state, b"not-json").unwrap(),
+            "missing_identity" => {
+                let mut value = go_record.clone();
+                value.as_object_mut().unwrap().remove("process_identity");
+                fs::write(&go_state, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "legacy_active" => {
+                let mut value = go_record.clone();
+                value["run_state_version"] = json!(1);
+                value.as_object_mut().unwrap().remove("state_path");
+                value.as_object_mut().unwrap().remove("process_identity");
+                fs::write(&go_state, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "mismatched_uuid" => {
+                let mut value = go_record.clone();
+                value["execution"]["run_id"] = json!("stale-prior-attempt");
+                fs::write(&go_state, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "mismatched_state_path" => {
+                let mut value = go_record.clone();
+                value["state_path"] = json!(directory.path().join("other.json"));
+                fs::write(&go_state, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "mismatched_program" => {
+                let mut value = go_record.clone();
+                value["execution"]["program"] = json!("/bin/false");
+                fs::write(&go_state, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "mismatched_argv" => {
+                let mut value = go_record.clone();
+                value["execution"]["arguments"] = json!(["unexpected"]);
+                fs::write(&go_state, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "stale_prior_state" => {
+                let mut value = go_record;
+                value["execution"]["run_id"] = json!("old-attempt");
+                fs::write(&go_state, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "mismatched_protocol" => {
+                let mut value = go_record.clone();
+                value["execution"]["protocol_version"] = json!(2);
+                fs::write(&go_state, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "mismatched_supervisor_version" => {
+                let mut value = go_record;
+                value["supervisor_version"] = json!("other-supervisor");
+                fs::write(&go_state, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let resumed = resume_real_run(
+            &supervisor,
+            directory.path(),
+            &temporary_root,
+            &plan,
+            &state,
+            1,
+        );
+        let error = error_document(&resumed);
+        assert_eq!(
+            error["data"]["reconciliation"][0]["classification"], "indeterminate",
+            "case {case}"
+        );
+        let final_state = read_state(&state);
+        assert_eq!(
+            record(&final_state, "sleep")["status"],
+            "indeterminate",
+            "case {case}"
+        );
+        assert_eq!(attempts(&final_state, "sleep").len(), 1, "case {case}");
+    }
+}
+
+#[test]
+fn real_go_reconciles_persisted_cancellation_without_retry() {
+    let Some(supervisor) = real_supervisor_path() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create cancellation recovery directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).unwrap();
+    let plan = directory.path().join("plan.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&json!({
+            "schema_version": 2,
+            "tasks": [{
+                "id": "sleep",
+                "program": "/usr/bin/sleep",
+                "arguments": ["30"],
+                "timeout_ms": 60_000,
+                "retry": {"max_attempts": 3, "delay_ms": 0}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = directory.path().join("aggregate.json");
+    let marker = directory.path().join("pause.marker");
+    let child = spawn_real_crash_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &plan,
+        &state,
+        &marker,
+        1,
+    );
+    let running = wait_for_running_task(&state, "sleep");
+    let go_state = PathBuf::from(
+        record(&running, "sleep")["supervisor_state_path"]
+            .as_str()
+            .unwrap(),
+    );
+    wait_for_go_running_state(&go_state);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    wait_for_path(&marker);
+    let go_record = read_state(&go_state);
+    assert_eq!(go_record["execution"]["lifecycle"], "cancelled");
+    kill_coordinator(child);
+
+    let resumed = resume_real_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &plan,
+        &state,
+        1,
+    );
+    let document = run_document(&resumed);
+    let final_state = read_state(&state);
+    assert_eq!(final_state["status"], "cancelled");
+    assert_eq!(record(&final_state, "sleep")["status"], "cancelled");
+    assert_eq!(attempts(&final_state, "sleep").len(), 1);
+    assert_eq!(
+        document["data"]["reconciliation"][0]["classification"],
+        "cancelled"
+    );
+}
+
+#[test]
+fn real_go_reconciles_parallel_attempts_independently() {
+    let Some(supervisor) = real_supervisor_path() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create parallel recovery directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).unwrap();
+    let completed_marker = directory.path().join("completed");
+    let plan = directory.path().join("plan.json");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "tasks": [
+                {
+                    "id": "completed",
+                    "program": "/usr/bin/touch",
+                    "arguments": [completed_marker.to_str().unwrap()],
+                    "timeout_ms": 5_000
+                },
+                {
+                    "id": "active",
+                    "program": "/usr/bin/sleep",
+                    "arguments": ["30"],
+                    "timeout_ms": 60_000
+                },
+                {
+                    "id": "uncertain",
+                    "program": "/usr/bin/sleep",
+                    "arguments": ["30"],
+                    "timeout_ms": 60_000
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = directory.path().join("aggregate.json");
+    let marker = directory.path().join("pause.marker");
+    let child = spawn_real_crash_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &plan,
+        &state,
+        &marker,
+        3,
+    );
+    wait_for_path(&marker);
+    let interrupted = read_state(&state);
+    let active_go_state = PathBuf::from(
+        record(&interrupted, "active")["supervisor_state_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let uncertain_go_state = PathBuf::from(
+        record(&interrupted, "uncertain")["supervisor_state_path"]
+            .as_str()
+            .unwrap(),
+    );
+    wait_for_go_running_state(&active_go_state);
+    wait_for_go_running_state(&uncertain_go_state);
+    assert_eq!(
+        read_state(&PathBuf::from(
+            record(&interrupted, "completed")["supervisor_state_path"]
+                .as_str()
+                .unwrap()
+        ))["execution"]["lifecycle"],
+        "completed"
+    );
+    kill_real_attempt(&interrupted, "uncertain");
+    kill_coordinator(child);
+
+    let resumed = resume_real_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &plan,
+        &state,
+        3,
+    );
+    let error = error_document(&resumed);
+    let reports = error["data"]["reconciliation"].as_array().unwrap();
+    assert_eq!(
+        reports
+            .iter()
+            .find(|report| report["task_id"] == "completed")
+            .unwrap()["classification"],
+        "completed"
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .find(|report| report["task_id"] == "active")
+            .unwrap()["classification"],
+        "still_running"
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .find(|report| report["task_id"] == "uncertain")
+            .unwrap()["classification"],
+        "indeterminate"
+    );
+    let final_state = read_state(&state);
+    assert_eq!(record(&final_state, "completed")["status"], "succeeded");
+    assert_eq!(record(&final_state, "active")["status"], "running");
+    assert_eq!(record(&final_state, "uncertain")["status"], "indeterminate");
+    assert_eq!(attempts(&final_state, "completed").len(), 1);
+    assert_eq!(attempts(&final_state, "active").len(), 1);
+    assert_eq!(attempts(&final_state, "uncertain").len(), 1);
+    assert!(completed_marker.is_file());
+    kill_real_attempt(&final_state, "active");
 }

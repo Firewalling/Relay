@@ -23,6 +23,17 @@ type runStateStore interface {
 	Save(string, protocol.ExecutionResult) error
 }
 
+type identifiedRunStateStore interface {
+	SaveWithIdentity(string, protocol.ExecutionResult, *protocol.AttemptIdentity) error
+}
+
+func (runner *Runner) saveState(path string, result protocol.ExecutionResult, identity *protocol.AttemptIdentity) error {
+	if store, ok := runner.Store.(identifiedRunStateStore); ok {
+		return store.SaveWithIdentity(path, result, identity)
+	}
+	return runner.Store.Save(path, result)
+}
+
 type Runner struct {
 	ParentEnvironment []string
 	Now               func() time.Time
@@ -78,6 +89,11 @@ func (runner *Runner) Execute(ctx context.Context, request protocol.ExecutionReq
 		return protocol.ExecutionResult{}, err
 	}
 
+	var attemptIdentity *protocol.AttemptIdentity
+	if supervisorIdentity, identityErr := captureProcessIdentity(os.Getpid()); identityErr == nil {
+		attemptIdentity = &protocol.AttemptIdentity{Supervisor: supervisorIdentity}
+	}
+
 	recorder := newObservationRecorder(request.LogLimitBytes)
 	acceptedAt := runner.Now()
 	result := protocol.ExecutionResult{
@@ -103,7 +119,7 @@ func (runner *Runner) Execute(ctx context.Context, request protocol.ExecutionReq
 		},
 		OutputObservations: recorder.snapshot(),
 	}
-	if err := runner.Store.Save(request.StatePath, result); err != nil {
+	if err := runner.saveState(request.StatePath, result, attemptIdentity); err != nil {
 		return protocol.ExecutionResult{}, fmt.Errorf("persist accepted run state: %w", err)
 	}
 
@@ -118,7 +134,7 @@ func (runner *Runner) Execute(ctx context.Context, request protocol.ExecutionReq
 		result.Cancellation = protocol.CancellationDetails{Requested: true, Source: cancellationSource(ctx)}
 		result.LifecycleHistory = append(result.LifecycleHistory, recorder.lifecycle(protocol.LifecycleCancelled, completedAt))
 		result.OutputObservations = recorder.snapshot()
-		if err := runner.Store.Save(request.StatePath, result); err != nil {
+		if err := runner.saveState(request.StatePath, result, attemptIdentity); err != nil {
 			return protocol.ExecutionResult{}, fmt.Errorf("persist cancelled run state: %w", err)
 		}
 		return result, nil
@@ -149,7 +165,7 @@ func (runner *Runner) Execute(ctx context.Context, request protocol.ExecutionReq
 	result.Lifecycle = protocol.LifecycleStarting
 	result.LifecycleHistory = append(result.LifecycleHistory, recorder.lifecycle(protocol.LifecycleStarting, startedAt))
 	result.OutputObservations = recorder.snapshot()
-	if err := runner.Store.Save(request.StatePath, result); err != nil {
+	if err := runner.saveState(request.StatePath, result, attemptIdentity); err != nil {
 		_ = stdoutReader.Close()
 		_ = stdoutWriter.Close()
 		_ = stderrReader.Close()
@@ -170,11 +186,24 @@ func (runner *Runner) Execute(ctx context.Context, request protocol.ExecutionReq
 		result.Failure = startFailure(err)
 		result.LifecycleHistory = append(result.LifecycleHistory, recorder.lifecycle(protocol.LifecycleFailedToStart, completedAt))
 		result.OutputObservations = recorder.snapshot()
-		if saveErr := runner.Store.Save(request.StatePath, result); saveErr != nil {
+		if saveErr := runner.saveState(request.StatePath, result, attemptIdentity); saveErr != nil {
 			return protocol.ExecutionResult{}, fmt.Errorf("persist failed-to-start run state: %w", saveErr)
 		}
 		return result, nil
 	}
+
+	if attemptIdentity != nil {
+		if childIdentity, identityErr := captureProcessIdentity(command.Process.Pid); identityErr == nil {
+			identity := *attemptIdentity
+			identity.Child = &childIdentity
+			attemptIdentity = &identity
+		}
+	}
+	runningAt := runner.Now()
+	result.Lifecycle = protocol.LifecycleRunning
+	result.LifecycleHistory = append(result.LifecycleHistory, recorder.lifecycle(protocol.LifecycleRunning, runningAt))
+	result.OutputObservations = recorder.snapshot()
+
 	_ = stdoutWriter.Close()
 	_ = stderrWriter.Close()
 	drainDone := make(chan error, 2)
@@ -212,11 +241,7 @@ func (runner *Runner) Execute(ctx context.Context, request protocol.ExecutionReq
 		completionDone <- runner.waitForCompletion(monitorContext, command, waitDone, request, timeout)
 	}()
 
-	runningAt := runner.Now()
-	result.Lifecycle = protocol.LifecycleRunning
-	result.LifecycleHistory = append(result.LifecycleHistory, recorder.lifecycle(protocol.LifecycleRunning, runningAt))
-	result.OutputObservations = recorder.snapshot()
-	if err := runner.Store.Save(request.StatePath, result); err != nil {
+	if err := runner.saveState(request.StatePath, result, attemptIdentity); err != nil {
 		stopMonitor()
 		outcome := <-completionDone
 		drainErr := runner.awaitDrains(drainDone, &drainGroup, stdoutReader, stderrReader)
@@ -254,15 +279,15 @@ func (runner *Runner) Execute(ctx context.Context, request protocol.ExecutionReq
 		result.Cancellation.Source = cancellationSource(ctx)
 	}
 	if outcome.infrastructureFailure != nil {
-		return runner.failProtocol(request.StatePath, result, recorder, "termination_error", outcome.infrastructureFailure)
+		return runner.failProtocol(request.StatePath, result, recorder, "termination_error", outcome.infrastructureFailure, attemptIdentity)
 	}
 	if !outcome.directChildReaped {
-		return runner.failProtocol(request.StatePath, result, recorder, "termination_error", errors.New("direct child was not reaped"))
+		return runner.failProtocol(request.StatePath, result, recorder, "termination_error", errors.New("direct child was not reaped"), attemptIdentity)
 	}
 	if outcome.waitErr != nil {
 		var exitError *exec.ExitError
 		if !errors.As(outcome.waitErr, &exitError) {
-			return runner.failProtocol(request.StatePath, result, recorder, "wait_error", outcome.waitErr)
+			return runner.failProtocol(request.StatePath, result, recorder, "wait_error", outcome.waitErr, attemptIdentity)
 		}
 	}
 	completedAt := runner.Now()
@@ -271,7 +296,7 @@ func (runner *Runner) Execute(ctx context.Context, request protocol.ExecutionReq
 	applyTerminationResult(&result, outcome.trigger, outcome.escalationAttempted)
 	result.LifecycleHistory = append(result.LifecycleHistory, recorder.lifecycle(result.Lifecycle, completedAt))
 	result.OutputObservations = recorder.snapshot()
-	if err := runner.Store.Save(request.StatePath, result); err != nil {
+	if err := runner.saveState(request.StatePath, result, attemptIdentity); err != nil {
 		return protocol.ExecutionResult{}, fmt.Errorf("persist completed run state: %w", err)
 	}
 	return result, nil
@@ -507,7 +532,7 @@ func (runner *Runner) awaitDrains(done <-chan error, group *sync.WaitGroup, read
 	return drainErr
 }
 
-func (runner *Runner) failProtocol(path string, result protocol.ExecutionResult, recorder *observationRecorder, code string, failure error) (protocol.ExecutionResult, error) {
+func (runner *Runner) failProtocol(path string, result protocol.ExecutionResult, recorder *observationRecorder, code string, failure error, identity *protocol.AttemptIdentity) (protocol.ExecutionResult, error) {
 	completedAt := runner.Now()
 	if result.StartedAt == "" {
 		result.StartedAt = result.AcceptedAt
@@ -518,7 +543,7 @@ func (runner *Runner) failProtocol(path string, result protocol.ExecutionResult,
 	result.Failure = &protocol.ExecutionFailure{Code: code, Message: failure.Error()}
 	result.LifecycleHistory = append(result.LifecycleHistory, recorder.lifecycle(protocol.LifecycleProtocolFailure, completedAt))
 	result.OutputObservations = recorder.snapshot()
-	if saveErr := runner.Store.Save(path, result); saveErr != nil {
+	if saveErr := runner.saveState(path, result, identity); saveErr != nil {
 		return protocol.ExecutionResult{}, fmt.Errorf("%s: %v; persist protocol-failure state: %w", code, failure, saveErr)
 	}
 	return protocol.ExecutionResult{}, fmt.Errorf("%s: %w", code, failure)
