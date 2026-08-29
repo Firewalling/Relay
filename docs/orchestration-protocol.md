@@ -420,8 +420,9 @@ cleanup. After startup proof, Rust forwards pending or new `SIGINT`/`SIGTERM`
 only to the active supervisor PID while waiting. It observes supervisor exit
 without reaping, disarms forwarding while that PID still cannot be reused, and
 only then reaps the process. Go alone performs child-group cleanup, with the
-limitations below. The launcher is project-independent and neither discovers
-nor writes `.relay` or Go run records.
+limitations below. The launcher is project-independent and neither discovers nor
+reads `.relay`. It does not reconcile existing Go records; the Go supervisor
+writes the requested record at `state_path` for each attempt.
 
 ### Execution request
 
