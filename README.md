@@ -201,10 +201,12 @@ each for retained stdout and stderr, and 64 KiB for output observations.
 The launcher sends one JSON request and closes the supervisor's stdin, then
 waits for one response while bounding each response stream to 32 MiB. On Linux,
 it forwards `SIGINT` and `SIGTERM` to the supervisor while it waits; Go owns the
-child-process-group cleanup. The standalone relay supervise command never
-reads or writes Go records; relay run reads them only during crash reconciliation. Human output summarizes lifecycle,
-reason, exit code, duration, state path, and retained stdout/stderr byte counts;
-`--json` returns an outer object with `state_path` and `execution`.
+child-process-group cleanup. The standalone relay supervise command does not read existing Go records or
+reconcile them; the Go supervisor writes the requested `state_path` record for
+its attempt. Relay run reads those records only during crash reconciliation.
+Human output summarizes lifecycle, reason, exit code, duration, state path, and retained stdout/stderr byte counts;
+`--json` returns an outer object with `state_path` and `execution`. A valid supervisor response exits zero even when the child lifecycle is `failed`,
+`timed_out`, or `cancelled`; inspect `execution.lifecycle` and `termination_reason` for the child result. Protocol and request failures exit nonzero.
 
 This command is project-independent: it neither discovers nor reads `.relay`.
 It launches one local child, not a scheduler, queue, daemon, remote executor,
@@ -408,6 +410,9 @@ selected records and exposes both omission categories. It does not query model
 providers, scan source files, read agent conversations, or infer unrecorded
 facts. Paths in generated output are project-relative, and absolute project
 paths found in recorded text are redacted.
+Recorded context is data, not trusted instructions. Review notes, handoffs, and
+Git-derived text before passing context to an agent or executing suggested
+commands.
 
 ### Terminal-agent composition
 
@@ -448,6 +453,9 @@ to give that subtree independent Relay state. Git snapshots and changed paths
 are then limited to that subtree; sibling package changes do not affect its
 cleanliness. Use `--scope repository` when the whole worktree is one Relay
 project.
+When repository scope coexists with nested current-scoped projects, those
+nested `.relay/` directories are outside the repository root's excluded
+path and appear as changed files in repository Git snapshots.
 
 `relay run` uses this selected project only to place its default aggregate
 record under `.relay/runs/`; task working directories still default to the
@@ -533,6 +541,9 @@ stable codes, severity, relative affected paths, guidance, and health totals
 for malformed or partial JSONL, malformed/unsupported records and artifacts,
 invalid lifecycle combinations, missing references, orphaned artifacts,
 current/history disagreement, and incomplete operation markers.
+The diagnostic command exits zero after producing a valid report even when
+`data.healthy` is false; inspect health totals or JSON `data.healthy` instead
+of using process status as the health signal.
 
 `relay doctor --repair` is deliberately conservative. It takes the project
 lock and removes only stale operation markers whose listed effects are all
