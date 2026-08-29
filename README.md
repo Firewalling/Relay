@@ -130,6 +130,9 @@ global scope rules; explicit new-run paths must be absolute. Aggregate run-state
 v3 contains run status, timestamps, ordered task records, retry deadlines, and
 bounded `attempts` history. Each history entry retains attempt number, fresh
 UUID, Go state path, terminal status, reason, and bounded execution summary.
+Aggregate state uses compact JSON. Retained failure codes are capped at 64 bytes
+and messages at 256 bytes; attempt reasons keep only termination classifications
+so maximum 64-task, ten-attempt retry history stays below 4 MiB.
 The plan copy is sanitized: argument values named by
 `redact_argument_indexes` become `<redacted>`. Review other plan fields and
 captured process output for secrets.

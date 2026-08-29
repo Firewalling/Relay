@@ -3416,3 +3416,157 @@ fn human_output_exit_status_tracks_completed_failed_cancelled_and_indeterminate_
         "indeterminate"
     );
 }
+#[test]
+fn corrupted_retry_history_refuses_resume_without_launching() {
+    for (label, status) in [
+        ("succeeded", "succeeded"),
+        ("cancelled", "cancelled"),
+        ("indeterminate", "indeterminate"),
+        ("running", "running"),
+    ] {
+        let harness = Harness::new();
+        harness.configure_sequences(&[("flaky", &["nonzero", "nonzero", "success"])]);
+        let plan = harness.plan_v2(
+            &format!("corrupt-{label}"),
+            json!([retry_task("flaky", &[], 3, 0)]),
+        );
+        let state_path = harness.state(&format!("corrupt-{label}"));
+        run_document(&harness.run_json(&plan, &state_path));
+
+        let mut state = read_state(&state_path);
+        state["tasks"][0]["attempts"][0]["status"] = json!(status);
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let before_resume = harness.requests().len();
+
+        assert_eq!(
+            error_document(&harness.resume_json(&plan, &state_path))["error"]["code"],
+            "run_state_invalid"
+        );
+        assert_eq!(harness.requests().len(), before_resume);
+    }
+}
+
+#[test]
+fn non_retryable_failed_history_refuses_resume_without_launching() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("flaky", &["nonzero", "success"])]);
+    let plan = harness.plan_v2(
+        "corrupt-non-retryable-history",
+        json!([retry_task("flaky", &[], 2, 0)]),
+    );
+    let state_path = harness.state("corrupt-non-retryable-history");
+    run_document(&harness.run_json(&plan, &state_path));
+
+    let mut state = read_state(&state_path);
+    state["tasks"][0]["attempts"][0]["summary"]["cancellation_requested"] = json!(true);
+    fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let before_resume = harness.requests().len();
+
+    assert_eq!(
+        error_document(&harness.resume_json(&plan, &state_path))["error"]["code"],
+        "run_state_invalid"
+    );
+    assert_eq!(harness.requests().len(), before_resume);
+
+    let harness = Harness::new();
+    harness.configure_sequences(&[("flaky", &["nonzero", "success"])]);
+    let plan = harness.plan_v2(
+        "corrupt-pending-non-retryable",
+        json!([retry_task("flaky", &[], 2, 60_000)]),
+    );
+    let state_path = harness.state("corrupt-pending-non-retryable");
+    let mut child = harness.spawn_json(&plan, &state_path);
+    harness.wait_for_requests(1);
+    wait_for_retry_pending(&state_path, "flaky");
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+
+    let mut state = read_state(&state_path);
+    state["tasks"][0]["attempts"][0]["summary"]["cancellation_requested"] = json!(true);
+    fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let before_resume = harness.requests().len();
+
+    assert_eq!(
+        error_document(&harness.resume_json(&plan, &state_path))["error"]["code"],
+        "run_state_invalid"
+    );
+    assert_eq!(harness.requests().len(), before_resume);
+}
+
+#[test]
+fn retryable_failure_without_deadline_refuses_resume() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("flaky", &["nonzero", "success"])]);
+    let plan = harness.plan_v2(
+        "corrupt-missing-retry-deadline",
+        json!([retry_task("flaky", &[], 2, 60_000)]),
+    );
+    let state_path = harness.state("corrupt-missing-retry-deadline");
+    let mut child = harness.spawn_json(&plan, &state_path);
+    harness.wait_for_requests(1);
+    wait_for_retry_pending(&state_path, "flaky");
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+
+    let mut state = read_state(&state_path);
+    let latest = state["tasks"][0]["attempts"][0].clone();
+    let task = &mut state["tasks"][0];
+    task["status"] = json!("failed");
+    task["attempt_run_id"] = latest["run_id"].clone();
+    task["supervisor_state_path"] = latest["supervisor_state_path"].clone();
+    task["reason"] = latest["reason"].clone();
+    task["summary"] = latest["summary"].clone();
+    task["retry_ready_at"] = Value::Null;
+    fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let before_resume = harness.requests().len();
+
+    assert_eq!(
+        error_document(&harness.resume_json(&plan, &state_path))["error"]["code"],
+        "run_state_invalid"
+    );
+    assert_eq!(harness.requests().len(), before_resume);
+}
+
+#[test]
+fn valid_retry_history_transitions_resume_without_new_launches() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("flaky", &["nonzero", "nonzero", "success"])]);
+    let plan = harness.plan_v2(
+        "valid-retry-history",
+        json!([retry_task("flaky", &[], 3, 0)]),
+    );
+    let state_path = harness.state("valid-retry-history");
+    run_document(&harness.run_json(&plan, &state_path));
+    let state = read_state(&state_path);
+    assert_eq!(
+        attempts(&state, "flaky")
+            .iter()
+            .map(|attempt| attempt["status"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["failed", "failed", "succeeded"]
+    );
+    let before_resume = harness.requests().len();
+    run_document(&harness.resume_json(&plan, &state_path));
+    assert_eq!(harness.requests().len(), before_resume);
+
+    let harness = Harness::new();
+    harness.configure_sequences(&[("flaky", &["nonzero", "success"])]);
+    let plan = harness.plan_v2(
+        "valid-pending-retry",
+        json!([retry_task("flaky", &[], 2, 60_000)]),
+    );
+    let state_path = harness.state("valid-pending-retry");
+    let mut child = harness.spawn_json(&plan, &state_path);
+    harness.wait_for_requests(1);
+    wait_for_retry_pending(&state_path, "flaky");
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+    let state = read_state(&state_path);
+    assert_eq!(record(&state, "flaky")["status"], "pending");
+    assert_eq!(attempts(&state, "flaky")[0]["status"], "failed");
+
+    run_document(&harness.resume_json(&plan, &state_path));
+    let resumed = read_state(&state_path);
+    assert_eq!(resumed["status"], "completed");
+    assert_eq!(attempts(&resumed, "flaky").len(), 2);
+}

@@ -44,7 +44,8 @@ const MAX_OUTPUT_BYTES: i64 = 8 * 1024 * 1024;
 const MAX_LOG_BYTES: i64 = 4 * 1024 * 1024;
 const MAX_REDACTIONS: usize = 32;
 const MAX_REDACTED_BYTES: usize = 64 * 1024;
-const MAX_SUMMARY_MESSAGE_BYTES: usize = 4096;
+const MAX_FAILURE_CODE_BYTES: usize = 64;
+const MAX_SUMMARY_MESSAGE_BYTES: usize = 256;
 const MAX_RETRY_ATTEMPTS: u32 = 10;
 const MAX_RETRY_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
 const RETRY_POLL_INTERVAL_MS: u64 = 10;
@@ -307,7 +308,7 @@ impl TaskStatus {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionSummary {
     pub lifecycle: Lifecycle,
@@ -522,11 +523,10 @@ fn execution_was_cancelled(execution: &ExecutionResult) -> bool {
         || execution.cancellation.requested
 }
 
-fn execution_is_retryable_failure(execution: &ExecutionResult) -> bool {
-    !execution.task_succeeded()
-        && !execution_was_cancelled(execution)
+fn execution_summary_is_retryable_failure(summary: &ExecutionSummary) -> bool {
+    !summary.cancellation_requested
         && matches!(
-            (execution.lifecycle, execution.termination_reason),
+            (summary.lifecycle, summary.termination_reason),
             (
                 Lifecycle::Completed,
                 TerminationReason::ExitNonzero | TerminationReason::DescendantsTerminated
@@ -537,6 +537,12 @@ fn execution_is_retryable_failure(execution: &ExecutionResult) -> bool {
                     TerminationReason::TimeoutKilled | TerminationReason::DescendantsKilled
                 )
         )
+}
+
+fn execution_is_retryable_failure(execution: &ExecutionResult, summary: &ExecutionSummary) -> bool {
+    !execution.task_succeeded()
+        && !execution_was_cancelled(execution)
+        && execution_summary_is_retryable_failure(summary)
 }
 
 fn retry_ready_at(delay_ms: u64) -> String {
@@ -652,6 +658,8 @@ fn apply_completion(
             } else {
                 None
             };
+            let retryable_failure =
+                retry_delay_ms.filter(|_| execution_is_retryable_failure(&execution, &summary));
             let task = &mut state.tasks[completion.index];
             task.retry_ready_at = None;
             task.summary = Some(summary);
@@ -661,9 +669,7 @@ fn apply_completion(
             } else if execution_cancelled {
                 task.status = TaskStatus::Cancelled;
                 task.reason = reason;
-            } else if let Some(delay_ms) =
-                retry_delay_ms.filter(|_| execution_is_retryable_failure(&execution))
-            {
+            } else if let Some(delay_ms) = retryable_failure {
                 task.status = TaskStatus::Pending;
                 task.reason = None;
                 task.attempt_run_id = None;
@@ -1921,6 +1927,18 @@ fn openat(
     }
 }
 
+fn encode_state(state: &RunState) -> Result<Vec<u8>, RunError> {
+    let mut bytes = serde_json::to_vec(state)
+        .map_err(|error| RunError::State(format!("could not encode state: {error}")))?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(RunError::State(format!(
+            "encoded state exceeds {MAX_STATE_BYTES} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
 #[cfg(target_os = "linux")]
 struct StateStore {
     path: PathBuf,
@@ -2104,14 +2122,7 @@ impl StateStore {
         } else {
             self.open_owned_state()?;
         }
-        let mut bytes = serde_json::to_vec_pretty(state)
-            .map_err(|error| RunError::State(format!("could not encode state: {error}")))?;
-        bytes.push(b'\n');
-        if bytes.len() as u64 > MAX_STATE_BYTES {
-            return Err(RunError::State(format!(
-                "encoded state exceeds {MAX_STATE_BYTES} bytes"
-            )));
-        }
+        let bytes = encode_state(state)?;
         let temporary_name =
             CString::new(format!(".relay-orchestration-{}.tmp", Uuid::new_v4())).unwrap();
         let result = (|| {
@@ -2293,9 +2304,7 @@ impl StateStore {
             .map_err(|error| {
                 RunError::State(format!("could not create {}: {error}", self.path.display()))
             })?;
-        let mut bytes = serde_json::to_vec_pretty(state)
-            .map_err(|error| RunError::State(format!("could not encode state: {error}")))?;
-        bytes.push(b'\n');
+        let bytes = encode_state(state)?;
         file.write_all(&bytes)
             .and_then(|_| file.sync_all())
             .map_err(|error| {
@@ -2387,9 +2396,7 @@ fn test_fail_persist(_point: &str) -> Result<(), RunError> {
 
 #[cfg(not(target_os = "linux"))]
 fn write_state(path: &Path, state: &RunState) -> Result<(), RunError> {
-    let mut bytes = serde_json::to_vec_pretty(state)
-        .map_err(|error| RunError::State(format!("could not encode state: {error}")))?;
-    bytes.push(b'\n');
+    let bytes = encode_state(state)?;
     let parent = path
         .parent()
         .ok_or_else(|| RunError::State("state path has no parent".into()))?;
@@ -2676,6 +2683,10 @@ fn validate_resume_state(state: &RunState, plan: &Plan, state_path: &Path) -> Re
                     let retryable = plan_task.retry.as_ref().is_some_and(|policy| {
                         task.attempts.last().is_some_and(|attempt| {
                             attempt.status == AttemptStatus::Failed
+                                && attempt
+                                    .summary
+                                    .as_ref()
+                                    .is_some_and(execution_summary_is_retryable_failure)
                                 && task.attempts.len() < policy.max_attempts as usize
                         })
                     });
@@ -2743,6 +2754,23 @@ fn validate_resume_state(state: &RunState, plan: &Plan, state_path: &Path) -> Re
                         task.status.as_str()
                     )));
                 }
+                if task.status == TaskStatus::Failed
+                    && plan_task.retry.as_ref().is_some_and(|policy| {
+                        task.attempts.last().is_some_and(|attempt| {
+                            attempt.status == AttemptStatus::Failed
+                                && attempt
+                                    .summary
+                                    .as_ref()
+                                    .is_some_and(execution_summary_is_retryable_failure)
+                                && task.attempts.len() < policy.max_attempts as usize
+                        })
+                    })
+                {
+                    return Err(RunError::State(format!(
+                        "failed task {:?} has retryable work without retry deadline",
+                        task.id
+                    )));
+                }
                 let reason_is_valid = if task.status == TaskStatus::Succeeded {
                     task.reason.is_none()
                 } else {
@@ -2763,6 +2791,18 @@ fn validate_resume_state(state: &RunState, plan: &Plan, state_path: &Path) -> Re
                 if task.attempts.last().map(|attempt| attempt.status) != Some(expected) {
                     return Err(RunError::State(format!(
                         "terminal task {:?} does not match its latest attempt",
+                        task.id
+                    )));
+                }
+                let Some(latest) = task.attempts.last() else {
+                    return Err(RunError::State(format!(
+                        "terminal task {:?} has no latest attempt",
+                        task.id
+                    )));
+                };
+                if task.reason != latest.reason || task.summary != latest.summary {
+                    return Err(RunError::State(format!(
+                        "terminal task {:?} does not match its latest attempt details",
                         task.id
                     )));
                 }
@@ -2817,7 +2857,25 @@ fn validate_attempt_history<'a>(
             task.id
         )));
     }
+    if plan_task.retry.is_none() && task.attempts.len() > 1 {
+        return Err(RunError::State(format!(
+            "task {:?} has retry history without retry policy",
+            task.id
+        )));
+    }
     for (index, attempt) in task.attempts.iter().enumerate() {
+        if index + 1 < task.attempts.len()
+            && (attempt.status != AttemptStatus::Failed
+                || !attempt
+                    .summary
+                    .as_ref()
+                    .is_some_and(execution_summary_is_retryable_failure))
+        {
+            return Err(RunError::State(format!(
+                "task {:?} has a non-retryable non-final attempt",
+                task.id
+            )));
+        }
         let expected = u32::try_from(index + 1).map_err(|_| {
             RunError::State(format!("task {:?} attempt number overflowed", task.id))
         })?;
@@ -3208,7 +3266,10 @@ fn summarize(result: &ExecutionResult) -> ExecutionSummary {
         lifecycle: result.lifecycle,
         termination_reason: result.termination_reason,
         exit_code: result.exit_code,
-        failure_code: result.failure.as_ref().map(|failure| failure.code.clone()),
+        failure_code: result
+            .failure
+            .as_ref()
+            .map(|failure| truncate(&failure.code, MAX_FAILURE_CODE_BYTES)),
         failure_message: result
             .failure
             .as_ref()
@@ -3228,11 +3289,7 @@ fn summarize(result: &ExecutionResult) -> ExecutionSummary {
 }
 
 fn result_reason(result: &ExecutionResult) -> Option<String> {
-    result
-        .failure
-        .as_ref()
-        .map(|failure| truncate(&failure.message, MAX_SUMMARY_MESSAGE_BYTES))
-        .or_else(|| Some(termination_reason_name(result.termination_reason).into()))
+    Some(termination_reason_name(result.termination_reason).into())
 }
 
 fn termination_reason_name(reason: TerminationReason) -> &'static str {
@@ -3298,4 +3355,149 @@ fn path_string(path: &Path) -> Result<String, RunError> {
 
 fn now() -> String {
     Utc::now().to_rfc3339()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn maximum_summary() -> ExecutionSummary {
+        ExecutionSummary {
+            lifecycle: Lifecycle::FailedToStart,
+            termination_reason: TerminationReason::StartError,
+            exit_code: None,
+            failure_code: Some("\0".repeat(MAX_FAILURE_CODE_BYTES)),
+            failure_message: Some("\0".repeat(MAX_SUMMARY_MESSAGE_BYTES)),
+            accepted_at: "2026-01-01T00:00:00+00:00".into(),
+            started_at: "2026-01-01T00:00:00+00:00".into(),
+            completed_at: "2026-01-01T00:00:00+00:00".into(),
+            duration_ms: 1,
+            stdout_bytes_observed: 0,
+            stdout_bytes_retained: 0,
+            stdout_truncated: false,
+            stderr_bytes_observed: 0,
+            stderr_bytes_retained: 0,
+            stderr_truncated: false,
+            cancellation_requested: false,
+        }
+    }
+
+    fn maximum_state() -> RunState {
+        let plan = Plan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            tasks: (0..MAX_TASKS)
+                .map(|index| PlanTask {
+                    id: format!("task-{index}"),
+                    depends_on: Vec::new(),
+                    program: "/bin/true".into(),
+                    arguments: if index == 0 {
+                        vec![String::new(); 343_000]
+                    } else {
+                        Vec::new()
+                    },
+                    working_directory: None,
+                    timeout_ms: 1_000,
+                    termination_grace_ms: default_grace_ms(),
+                    stdout_limit_bytes: default_output_limit(),
+                    stderr_limit_bytes: default_output_limit(),
+                    log_limit_bytes: default_log_limit(),
+                    redact_argument_indexes: Vec::new(),
+                    retry: Some(RetryPolicy {
+                        max_attempts: MAX_RETRY_ATTEMPTS,
+                        delay_ms: 0,
+                    }),
+                })
+                .collect(),
+        };
+        let tasks = (0..MAX_TASKS)
+            .map(|index| {
+                let attempts: Vec<_> = (1..=MAX_RETRY_ATTEMPTS)
+                    .map(|attempt| {
+                        let run_id = Uuid::from_u128(
+                            0x0000_0000_0000_4000_8000_0000_0000_0000u128
+                                + ((index as u128) * u128::from(MAX_RETRY_ATTEMPTS)
+                                    + u128::from(attempt)),
+                        )
+                        .to_string();
+                        let supervisor_state_path = format!("/tmp/{run_id}.json");
+                        AttemptRecord {
+                            attempt,
+                            run_id,
+                            supervisor_state_path,
+                            status: AttemptStatus::Failed,
+                            reason: Some("start_error".into()),
+                            summary: Some(maximum_summary()),
+                        }
+                    })
+                    .collect();
+                let latest = attempts.last().expect("maximum history is non-empty");
+                TaskRecord {
+                    id: format!("task-{index}"),
+                    status: TaskStatus::Failed,
+                    reason: latest.reason.clone(),
+                    attempt_run_id: Some(latest.run_id.clone()),
+                    supervisor_state_path: Some(latest.supervisor_state_path.clone()),
+                    summary: latest.summary.clone(),
+                    attempts,
+                    retry_ready_at: None,
+                }
+            })
+            .collect();
+        RunState {
+            schema_version: RUN_STATE_SCHEMA_VERSION,
+            run_id: "00000000-0000-4000-8000-000000000001".into(),
+            state_path: "/tmp/relay-state.json".into(),
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+            status: RunStatus::Failed,
+            cancellation_requested: false,
+            jobs: 1,
+            plan,
+            tasks,
+        }
+    }
+
+    #[test]
+    fn maximum_retry_history_fits_aggregate_state_limit() {
+        let state = maximum_state();
+        let plan_bytes = serde_json::to_vec(&state.plan).unwrap();
+        println!("maximum retry plan: {} bytes", plan_bytes.len());
+        assert!(plan_bytes.len() < MAX_PLAN_BYTES as usize);
+        assert!(plan_bytes.len() >= MAX_PLAN_BYTES as usize - 16_384);
+        validate_plan(&state.plan, Path::new("/tmp")).unwrap();
+        validate_resume_state(&state, &state.plan, Path::new(&state.state_path)).unwrap();
+        let encoded = encode_state(&state).unwrap();
+        println!("maximum retry aggregate: {} bytes", encoded.len());
+        assert!(encoded.len() < MAX_STATE_BYTES as usize);
+    }
+
+    #[test]
+    fn maximum_failure_diagnostics_are_bounded_once_per_attempt() {
+        let state = maximum_state();
+        for task in &state.tasks {
+            for attempt in &task.attempts {
+                assert_eq!(attempt.reason.as_deref(), Some("start_error"));
+                assert_eq!(
+                    attempt
+                        .summary
+                        .as_ref()
+                        .and_then(|summary| summary.failure_code.as_deref())
+                        .unwrap()
+                        .len(),
+                    MAX_FAILURE_CODE_BYTES
+                );
+                assert_eq!(
+                    attempt
+                        .summary
+                        .as_ref()
+                        .and_then(|summary| summary.failure_message.as_deref())
+                        .unwrap()
+                        .len(),
+                    MAX_SUMMARY_MESSAGE_BYTES
+                );
+            }
+        }
+        let encoded = encode_state(&state).unwrap();
+        println!("maximum diagnostic aggregate: {} bytes", encoded.len());
+        assert!(encoded.len() < MAX_STATE_BYTES as usize);
+    }
 }

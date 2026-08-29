@@ -197,7 +197,11 @@ indeterminate records remain non-resumable.
 Custom paths containing a `.relay` component are accepted only beneath the
 current project's `.relay/runs` directory. Symlinked state-path components
 are rejected; an adjacent advisory lock prevents two coordinators from owning
-the same run, and resume reads are bounded to 4 MiB.
+the same run, and resume reads are bounded to 4 MiB. Aggregate state uses
+compact JSON; retained failure codes are capped at 64 bytes and messages at
+256 bytes. Attempt reasons retain only termination classifications, avoiding
+large diagnostic duplication; the maximum valid 64-task, ten-attempt history
+is covered by a size-bound regression test below 4 MiB.
 
 Run status is one of `running`, `completed`, `failed`, `cancelled`, or
 `indeterminate`; task status is one of `pending`, `running`, `succeeded`,
