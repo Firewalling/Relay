@@ -50,6 +50,38 @@ const MAX_RETRY_ATTEMPTS: u32 = 10;
 const MAX_RETRY_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
 const RETRY_POLL_INTERVAL_MS: u64 = 10;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationClassification {
+    Completed,
+    Failed,
+    Cancelled,
+    StillRunning,
+    Indeterminate,
+    Refused,
+}
+
+impl ReconciliationClassification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::StillRunning => "still_running",
+            Self::Indeterminate => "indeterminate",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ReconciliationReport {
+    pub task_id: String,
+    pub attempt_run_id: String,
+    pub classification: ReconciliationClassification,
+    pub reason: String,
+}
+
 #[derive(Debug, Error)]
 pub enum RunError {
     #[error("invalid orchestration plan: {0}")]
@@ -58,6 +90,12 @@ pub enum RunError {
     State(String),
     #[error("orchestration state is busy: {0}")]
     Busy(String),
+    #[error("resume reconciliation refused: {message}")]
+    Reconciliation {
+        message: String,
+        state: Box<RunState>,
+        reports: Vec<ReconciliationReport>,
+    },
     #[error("supervisor failed for run {run_id}; aggregate state {state_path}: {source}")]
     Supervisor {
         run_id: String,
@@ -74,14 +112,22 @@ impl RunError {
             Self::Plan(_) => "run_plan_invalid",
             Self::State(_) => "run_state_invalid",
             Self::Busy(_) => "run_busy",
+            Self::Reconciliation { .. } => "run_state_invalid",
             Self::Supervisor { .. } => "run_supervisor",
         }
     }
 
     pub fn state(&self) -> Option<&RunState> {
         match self {
-            Self::Supervisor { state, .. } => Some(state),
+            Self::Reconciliation { state, .. } | Self::Supervisor { state, .. } => Some(state),
             _ => None,
+        }
+    }
+
+    pub fn reconciliation(&self) -> &[ReconciliationReport] {
+        match self {
+            Self::Reconciliation { reports, .. } => reports,
+            _ => &[],
         }
     }
 }
@@ -951,6 +997,154 @@ fn shutdown_and_drain(
     }
 }
 
+fn reconcile_running_attempts(
+    args: &RunArgs,
+    plan: &Plan,
+    state: &mut RunState,
+    store: &mut StateStore,
+    invocation_directory: &Path,
+    coordinator_cancelled: bool,
+) -> Result<Vec<ReconciliationReport>, RunError> {
+    let indexes: Vec<usize> = state
+        .tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, task)| {
+            matches!(task.status, TaskStatus::Running | TaskStatus::Indeterminate).then_some(index)
+        })
+        .collect();
+    if indexes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut reports = Vec::with_capacity(indexes.len());
+    let mut terminal = Vec::new();
+    let mut uncertain = Vec::new();
+    let mut blocked = false;
+    for index in indexes {
+        let task = &state.tasks[index];
+        let attempt = task
+            .attempts
+            .last()
+            .expect("validated unsafe task has an attempt");
+        let attempt_run_id = attempt.run_id.clone();
+        let attempt_state_path = PathBuf::from(&attempt.supervisor_state_path);
+        if task.status == TaskStatus::Indeterminate {
+            blocked = true;
+            reports.push(ReconciliationReport {
+                task_id: task.id.clone(),
+                attempt_run_id,
+                classification: ReconciliationClassification::Refused,
+                reason: "attempt is already indeterminate; no automatic retry is allowed".into(),
+            });
+            continue;
+        }
+        let supervise_args = task_supervise_args(
+            &args.supervisor,
+            &plan.tasks[index],
+            attempt_run_id.clone(),
+            attempt_state_path.clone(),
+        );
+        match supervise::inspect_attempt(&supervise_args, invocation_directory) {
+            supervise::AttemptInspection::Completed(execution) => {
+                let execution = *execution;
+                let classification = if execution.task_succeeded() {
+                    ReconciliationClassification::Completed
+                } else if execution_was_cancelled(&execution) {
+                    ReconciliationClassification::Cancelled
+                } else {
+                    ReconciliationClassification::Failed
+                };
+                let reason = format!(
+                    "trusted supervisor result: {}",
+                    termination_reason_name(execution.termination_reason)
+                );
+                terminal.push((
+                    index,
+                    attempt_run_id,
+                    attempt_state_path,
+                    execution,
+                    classification,
+                    reason,
+                ));
+            }
+            supervise::AttemptInspection::StillRunning => {
+                blocked = true;
+                reports.push(ReconciliationReport {
+                    task_id: task.id.clone(),
+                    attempt_run_id,
+                    classification: ReconciliationClassification::StillRunning,
+                    reason: "attempt still active; resume cannot continue this branch yet".into(),
+                });
+            }
+            supervise::AttemptInspection::Indeterminate(reason) => {
+                blocked = true;
+                uncertain.push((index, truncate(&reason, MAX_SUMMARY_MESSAGE_BYTES)));
+                reports.push(ReconciliationReport {
+                    task_id: task.id.clone(),
+                    attempt_run_id,
+                    classification: ReconciliationClassification::Indeterminate,
+                    reason: truncate(&reason, MAX_SUMMARY_MESSAGE_BYTES),
+                });
+            }
+        }
+    }
+
+    for (index, attempt_run_id, attempt_state_path, execution, classification, reason) in terminal {
+        let state_path = path_string(&attempt_state_path)?;
+        let completion = TaskCompletion {
+            index,
+            result: Ok(supervise::SupervisedExecution {
+                state_path,
+                execution,
+            }),
+        };
+        if let Some(source) = apply_completion(plan, state, completion, coordinator_cancelled) {
+            blocked = true;
+            let reason = truncate(&source.to_string(), MAX_SUMMARY_MESSAGE_BYTES);
+            mark_task_indeterminate(&mut state.tasks[index], reason.clone());
+            reports.push(ReconciliationReport {
+                task_id: state.tasks[index].id.clone(),
+                attempt_run_id,
+                classification: ReconciliationClassification::Indeterminate,
+                reason,
+            });
+        } else {
+            reports.push(ReconciliationReport {
+                task_id: state.tasks[index].id.clone(),
+                attempt_run_id,
+                classification,
+                reason,
+            });
+        }
+    }
+    for (index, reason) in uncertain {
+        mark_task_indeterminate(&mut state.tasks[index], reason);
+    }
+    if coordinator_cancelled {
+        state.cancellation_requested = true;
+    }
+    mark_blocked(plan, state);
+    state.status = derive_status(&state.tasks, state.cancellation_requested);
+    persist_at(store, state, "reconciliation")?;
+    if blocked {
+        let message = if reports
+            .iter()
+            .any(|report| report.classification == ReconciliationClassification::StillRunning)
+        {
+            "attempt still active; resume cannot continue this branch yet"
+        } else {
+            "unresolved attempt evidence remains indeterminate; resume is blocked"
+        };
+        return Err(RunError::Reconciliation {
+            message: message.into(),
+            state: Box::new(state.clone()),
+            reports,
+        });
+    }
+    Ok(reports)
+}
+
 pub fn run(
     args: RunArgs,
     invocation_directory: &Path,
@@ -989,7 +1183,7 @@ pub fn run(
             "resume is unavailable for plans containing redacted_argument_indexes".into(),
         ));
     }
-    let requested_state_path = match args.resume.or(args.state_path) {
+    let requested_state_path = match args.resume.clone().or(args.state_path.clone()) {
         Some(path) => path,
         None => project_root
             .join(".relay")
@@ -1010,6 +1204,7 @@ pub fn run(
 
     let mut store;
     let mut state;
+    let mut reconciliation = Vec::new();
     if resuming {
         store = StateStore::open(&requested_state_path, true)?;
         state = store.read()?;
@@ -1018,8 +1213,17 @@ pub fn run(
         preflight_tasks(&args.supervisor, &plan, &attempts, invocation_directory)?;
         let sanitized_plan = sanitize_plan(&plan);
         validate_resume_state(&state, &sanitized_plan, store.path())?;
+        let coordinator_cancelled = state.cancellation_requested;
         state.cancellation_requested = false;
         state.jobs = args.jobs;
+        reconciliation = reconcile_running_attempts(
+            &args,
+            &plan,
+            &mut state,
+            &mut store,
+            invocation_directory,
+            coordinator_cancelled,
+        )?;
     } else {
         resolve_working_directories(&mut plan, invocation_directory, None)?;
         validate_plan(&plan, invocation_directory)?;
@@ -1401,7 +1605,7 @@ pub fn run(
     if let Some(source) = boundary_error {
         return Err(supervisor_error(&state, source));
     }
-    Ok(render(store.path(), state))
+    Ok(render(store.path(), state, reconciliation))
 }
 
 fn resolve_working_directories(
@@ -2642,15 +2846,7 @@ fn validate_resume_state(state: &RunState, plan: &Plan, state_path: &Path) -> Re
             "persisted run status is inconsistent with its tasks".into(),
         ));
     }
-    if state
-        .tasks
-        .iter()
-        .any(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Indeterminate))
-    {
-        return Err(RunError::State(
-            "resume is unsafe with running or indeterminate task records".into(),
-        ));
-    }
+
     validate_resume_dependencies(plan, &state.tasks)?;
 
     let mut attempt_ids = HashSet::new();
@@ -3092,7 +3288,16 @@ fn validate_resume_dependencies(plan: &Plan, records: &[TaskRecord]) -> Result<(
                 }
             }
             TaskStatus::Running | TaskStatus::Indeterminate => {
-                unreachable!("unsafe task statuses are rejected before dependency validation")
+                if let Some(dependency) = task
+                    .depends_on
+                    .iter()
+                    .find(|dependency| statuses[dependency.as_str()] != TaskStatus::Succeeded)
+                {
+                    return Err(RunError::State(format!(
+                        "executed task {:?} has dependency {dependency:?} that did not succeed",
+                        task.id
+                    )));
+                }
             }
         }
     }
@@ -3318,7 +3523,7 @@ fn truncate(value: &str, maximum: usize) -> String {
     value[..end].to_owned()
 }
 
-fn render(path: &Path, state: RunState) -> RunResult {
+fn render(path: &Path, state: RunState, reconciliation: Vec<ReconciliationReport>) -> RunResult {
     let mut human = format!(
         "Run {}: {}\nState: {}\nTasks:",
         state.run_id,
@@ -3334,6 +3539,17 @@ fn render(path: &Path, state: RunState) -> RunResult {
             human.push_str(&format!(" [{}]", supervisor_path));
         }
     }
+    if !reconciliation.is_empty() {
+        human.push_str("\nReconciliation:");
+        for report in &reconciliation {
+            human.push_str(&format!(
+                "\n  {}: {} ({})",
+                report.task_id,
+                report.classification.as_str(),
+                report.reason
+            ));
+        }
+    }
     let status = state.status;
     RunResult {
         status,
@@ -3342,6 +3558,7 @@ fn render(path: &Path, state: RunState) -> RunResult {
             data: json!({
                 "state_path": path.to_string_lossy(),
                 "run": state,
+                "reconciliation": reconciliation,
             }),
         },
     }

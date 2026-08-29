@@ -11,11 +11,12 @@ import (
 )
 
 const (
-	ProtocolVersion     uint32 = 1
-	OutputSchemaVersion uint32 = 1
-	RunStateVersion     uint32 = 1
-	SupervisorVersion          = "0.1.0"
-	SupervisorCommand          = "supervise"
+	ProtocolVersion       uint32 = 1
+	OutputSchemaVersion   uint32 = 1
+	RunStateVersion       uint32 = 2
+	LegacyRunStateVersion uint32 = 1
+	SupervisorVersion            = "0.1.0"
+	SupervisorCommand            = "supervise"
 )
 
 //go:embed manifest-v1.json

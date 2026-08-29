@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -139,6 +140,66 @@ func TestStateStoreRejectsEncodedAndLoadedRecordsOverItsLimit(t *testing.T) {
 	}
 	if _, err := store.Load(path); err == nil || !strings.Contains(err.Error(), "run state exceeds 64 bytes") {
 		t.Fatalf("Load error = %v, want encoded-size rejection", err)
+	}
+}
+func TestStateStoreLoadsLegacyV1Record(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.json")
+	record := protocol.RunRecord{
+		RunStateVersion:   protocol.LegacyRunStateVersion,
+		SupervisorVersion: protocol.SupervisorVersion,
+		Execution:         fixedPersistedResult(),
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal legacy record: %v", err)
+	}
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatalf("write legacy record: %v", err)
+	}
+	loaded, err := NewStateStore().Load(path)
+	if err != nil {
+		t.Fatalf("Load legacy record: %v", err)
+	}
+	if loaded.RunStateVersion != protocol.LegacyRunStateVersion || loaded.StatePath != "" || loaded.ProcessIdentity != nil {
+		t.Fatalf("legacy record was not preserved: %#v", loaded)
+	}
+}
+
+func TestStateStoreRejectsMismatchedV2PathAndIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := NewStateStore().Save(path, fixedPersistedResult()); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	var value map[string]any
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if err := json.Unmarshal(payload, &value); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	value["state_path"] = filepath.Join(filepath.Dir(path), "other.json")
+	mutated, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	if err := os.WriteFile(path, mutated, 0o600); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+	if _, err := NewStateStore().Load(path); err == nil || !strings.Contains(err.Error(), "state_path") {
+		t.Fatalf("Load mismatch error = %v", err)
+	}
+	value["state_path"] = path
+	value["process_identity"].(map[string]any)["supervisor"].(map[string]any)["pid"] = 0
+	mutated, err = json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal invalid identity: %v", err)
+	}
+	if err := os.WriteFile(path, mutated, 0o600); err != nil {
+		t.Fatalf("write invalid identity: %v", err)
+	}
+	if _, err := NewStateStore().Load(path); err == nil || !strings.Contains(err.Error(), "invalid process identity") {
+		t.Fatalf("Load identity error = %v", err)
 	}
 }
 

@@ -325,9 +325,24 @@ type ExecutionResult struct {
 }
 
 type RunRecord struct {
-	RunStateVersion   uint32          `json:"run_state_version"`
-	SupervisorVersion string          `json:"supervisor_version"`
-	Execution         ExecutionResult `json:"execution"`
+	RunStateVersion   uint32           `json:"run_state_version"`
+	SupervisorVersion string           `json:"supervisor_version"`
+	StatePath         string           `json:"state_path,omitempty"`
+	ProcessIdentity   *AttemptIdentity `json:"process_identity,omitempty"`
+	Execution         ExecutionResult  `json:"execution"`
+}
+
+type ProcessIdentity struct {
+	PID            int    `json:"pid"`
+	StartTimeTicks uint64 `json:"start_time_ticks"`
+	ProcessGroupID int    `json:"process_group_id"`
+	SessionID      int    `json:"session_id"`
+	Executable     string `json:"executable"`
+}
+
+type AttemptIdentity struct {
+	Supervisor ProcessIdentity  `json:"supervisor"`
+	Child      *ProcessIdentity `json:"child,omitempty"`
 }
 
 type SuccessEnvelope[T any] struct {

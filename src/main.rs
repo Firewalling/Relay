@@ -151,6 +151,7 @@ struct RunErrorEnvelope<'a> {
 struct RunErrorData<'a> {
     state_path: &'a str,
     run: &'a orchestrate::RunState,
+    reconciliation: &'a [orchestrate::ReconciliationReport],
 }
 
 fn emit_run_error(json_output: bool, command: &str, error: &orchestrate::RunError) {
@@ -180,6 +181,7 @@ fn emit_run_error(json_output: bool, command: &str, error: &orchestrate::RunErro
             data: RunErrorData {
                 state_path: &state.state_path,
                 run: state,
+                reconciliation: error.reconciliation(),
             },
         })
         .expect("serializing a Relay run error envelope cannot fail")

@@ -121,8 +121,8 @@ retries supervisor transport/protocol errors, indeterminate outcomes, or
 cancellation. A retry waits as pending, consumes no job slot, and keeps
 descendants unready; unrelated ready work continues. Exhausted failures block
 descendants. Aggregate run-state schema v3 stores retry history; valid v1/v2
-records migrate to v3 on safe resume, while running or indeterminate attempts
-remain non-resumable.
+records migrate to v3 on safe resume. Reconciliation may safely promote a
+strictly validated terminal Go result without creating another attempt.
 
 Rust atomically owns aggregate record. Its default path is
 `<project>/.relay/runs/<run-uuid>.json`, where `<project>` is selected by
@@ -140,6 +140,10 @@ captured process output for secrets.
 Each attempt has a fresh UUID and separate Go-owned record under
 `${TMPDIR}/relay/supervisor/<attempt-uuid>.json`; validation guarantees that
 path is outside Rust-owned `.relay`, but `TMPDIR` may point inside project.
+Go attempt records use schema v2 with exact state_path and durable process
+identity. Linux identity binds PID to proc start time, process group, session,
+and executable. Legacy v1 terminal records remain readable; legacy active
+records cannot prove process identity and remain indeterminate.
 Rust records every attempt path and never overwrites earlier history. Pending
 retry state clears current-attempt fields and stores `retry_ready_at`; resume
 can continue it after validating its failed history. Resume validates persisted
@@ -170,10 +174,12 @@ safe pending work. A pending task with `retry_ready_at` resumes its explicitly
 configured next attempt after its prior typed failure; a future deadline is
 waited without occupying a job slot.
 
-Resume is refused for any `running` or `indeterminate` attempt, malformed
-history, changed plan/task identities, or inconsistent state. Failed attempts
-are never retried unless they have a validated pending retry state; no process
-reattachment or idempotency inference exists.
+Resume reconciles persisted `running` attempts before scheduling. A strictly
+validated terminal Go result updates that existing attempt in place; its
+summary, reason, dependency transition, and retry policy match live completion.
+A verified active attempt blocks resume with no duplicate launch. Missing,
+malformed, mismatched, stale, or unverifiable work becomes `indeterminate`.
+JSON output includes structured reconciliation classifications and reasons.
 
 ## Supervise one process
 
@@ -195,8 +201,8 @@ each for retained stdout and stderr, and 64 KiB for output observations.
 The launcher sends one JSON request and closes the supervisor's stdin, then
 waits for one response while bounding each response stream to 32 MiB. On Linux,
 it forwards `SIGINT` and `SIGTERM` to the supervisor while it waits; Go owns the
-child-process-group cleanup. Rust never
-reads or writes the Go-owned run record. Human output summarizes lifecycle,
+child-process-group cleanup. The standalone relay supervise command never
+reads or writes Go records; relay run reads them only during crash reconciliation. Human output summarizes lifecycle,
 reason, exit code, duration, state path, and retained stdout/stderr byte counts;
 `--json` returns an outer object with `state_path` and `execution`.
 
@@ -275,7 +281,8 @@ Relay supports these commands:
   below.
 - `run [--jobs <N>] [--supervisor <ABSOLUTE_PATH>] [--state-path <ABSOLUTE_PATH>] <PLAN>`
   executes a new bounded-parallel plan; replace `--state-path` with
-  `--resume <ABSOLUTE_STATE_PATH>` to continue only safe pending work.
+  `--resume <ABSOLUTE_STATE_PATH>` to reconcile running attempts and continue
+  only proven terminal results or safe pending work.
 - `supervise [OPTIONS] -- <ABSOLUTE_PROGRAM> [ARG...]` launches one local
   process through the external Go supervisor.
 - `doctor [--repair]` diagnoses storage consistency.
@@ -542,7 +549,8 @@ owns exactly one local child per invocation/attempt. Retries are explicit per
 task only: there is no global retry engine, backoff, jitter, predicate, or
 idempotency detection. There is no queue service, daemon, network or remote
 execution, model/provider runtime, transcript import, shell evaluation, Lua
-runtime, sandbox, or crash-safe reattachment to running or indeterminate work.
+runtime, sandbox, or process adoption/reattachment for running or indeterminate
+work. Crash reconciliation can consume only proven terminal Go results.
 Process-group cleanup cannot guarantee orphan freedom when a child escapes through `setsid`, self-regrouping,
 or an equivalent boundary. Relay also has no TUI, hosted synchronization,
 automatic source inspection, semantic search, encryption, or automatic

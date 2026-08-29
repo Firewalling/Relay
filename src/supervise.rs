@@ -1,7 +1,7 @@
 use crate::{app::RunOutput, cli::SuperviseArgs};
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     env,
     ffi::OsStr,
@@ -16,13 +16,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 #[cfg(unix)]
-use std::os::unix::{fs::MetadataExt, process::CommandExt};
+use std::os::unix::{ffi::OsStrExt, fs::MetadataExt, process::CommandExt};
 
 const OUTPUT_SCHEMA_VERSION: u32 = 1;
 const EXECUTION_PROTOCOL_VERSION: u32 = 1;
 const MAX_SUPERVISOR_REQUEST_BYTES: usize = 1 << 20;
 const MAX_SUPERVISOR_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_LEGACY_STATE_PROOF_BYTES: u64 = 140 << 20;
+const ATTEMPT_STATE_VERSION: u32 = 2;
+const LEGACY_ATTEMPT_STATE_VERSION: u32 = 1;
 const MAX_TIMEOUT_MS: i64 = 24 * 60 * 60 * 1000;
 const MAX_GRACE_MS: i64 = 60_000;
 const MAX_OUTPUT_BYTES: i64 = 8 * 1024 * 1024;
@@ -328,6 +330,519 @@ struct RemoteError {
 pub struct SupervisedExecution {
     pub state_path: String,
     pub execution: ExecutionResult,
+}
+
+#[derive(Debug)]
+pub enum AttemptInspection {
+    Completed(Box<ExecutionResult>),
+    StillRunning,
+    Indeterminate(String),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedAttemptRecord {
+    run_state_version: u32,
+    supervisor_version: String,
+    #[serde(default)]
+    state_path: Option<String>,
+    #[serde(default)]
+    process_identity: Option<PersistedAttemptIdentity>,
+    execution: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedAttemptIdentity {
+    supervisor: PersistedProcessIdentity,
+    #[serde(default)]
+    child: Option<PersistedProcessIdentity>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedProcessIdentity {
+    pid: i32,
+    start_time_ticks: u64,
+    process_group_id: i32,
+    session_id: i32,
+    executable: String,
+}
+
+pub fn inspect_attempt(args: &SuperviseArgs, invocation_directory: &Path) -> AttemptInspection {
+    let request = match build_request(args, invocation_directory) {
+        Ok(request) => request,
+        Err(error) => return AttemptInspection::Indeterminate(error.to_string()),
+    };
+    let path = Path::new(&request.state_path);
+    if let Err(error) = validate_attempt_state_path(path) {
+        return AttemptInspection::Indeterminate(error);
+    }
+    let bytes = match read_attempt_state(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return AttemptInspection::Indeterminate("supervisor attempt state is missing".into());
+        }
+        Err(error) => {
+            return AttemptInspection::Indeterminate(format!(
+                "could not read supervisor attempt state: {error}"
+            ));
+        }
+    };
+    let record: PersistedAttemptRecord = match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(error) => {
+            return AttemptInspection::Indeterminate(format!(
+                "supervisor attempt state is malformed: {error}"
+            ));
+        }
+    };
+    inspect_persisted_attempt(record, &request)
+}
+
+fn inspect_persisted_attempt(
+    record: PersistedAttemptRecord,
+    request: &Request,
+) -> AttemptInspection {
+    if !matches!(
+        record.run_state_version,
+        LEGACY_ATTEMPT_STATE_VERSION | ATTEMPT_STATE_VERSION
+    ) {
+        return AttemptInspection::Indeterminate(format!(
+            "unsupported supervisor attempt state version {}",
+            record.run_state_version
+        ));
+    }
+    if record.run_state_version == ATTEMPT_STATE_VERSION
+        && record.state_path.as_deref() != Some(request.state_path.as_str())
+    {
+        return AttemptInspection::Indeterminate(
+            "supervisor state_path did not match requested path".into(),
+        );
+    }
+    if record.run_state_version == LEGACY_ATTEMPT_STATE_VERSION
+        && (record.state_path.is_some() || record.process_identity.is_some())
+    {
+        return AttemptInspection::Indeterminate(
+            "legacy supervisor state contains version-2 fields".into(),
+        );
+    }
+    let Some(record_run_id) = record.execution.get("run_id").and_then(Value::as_str) else {
+        return AttemptInspection::Indeterminate(
+            "supervisor attempt state has no execution run_id".into(),
+        );
+    };
+    if record_run_id != request.run_id {
+        return AttemptInspection::Indeterminate(
+            "supervisor execution run_id did not match attempt".into(),
+        );
+    }
+    let Some(execution_version) = record
+        .execution
+        .get("supervisor_version")
+        .and_then(Value::as_str)
+    else {
+        return AttemptInspection::Indeterminate("supervisor execution has no version".into());
+    };
+    if record.supervisor_version.is_empty() || record.supervisor_version != execution_version {
+        return AttemptInspection::Indeterminate(
+            "supervisor state versions are inconsistent".into(),
+        );
+    }
+    let Some(lifecycle) = record
+        .execution
+        .get("lifecycle")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return AttemptInspection::Indeterminate("supervisor execution has no lifecycle".into());
+    };
+    if matches!(lifecycle.as_str(), "accepted" | "starting" | "running") {
+        return inspect_active_attempt(record, request, lifecycle.as_str());
+    }
+    if !matches!(
+        lifecycle.as_str(),
+        "completed" | "failed_to_start" | "timed_out" | "cancelled" | "killed"
+    ) {
+        return AttemptInspection::Indeterminate("supervisor execution is not terminal".into());
+    }
+    let execution: ExecutionResult = match serde_json::from_value(record.execution) {
+        Ok(execution) => execution,
+        Err(error) => {
+            return AttemptInspection::Indeterminate(format!(
+                "supervisor terminal result is malformed: {error}"
+            ));
+        }
+    };
+    if let Err(error) = execution.validate(request) {
+        return AttemptInspection::Indeterminate(format!(
+            "supervisor terminal result failed validation: {error}"
+        ));
+    }
+    if let Some(identity) = record.process_identity.as_ref()
+        && let Err(error) = validate_identity_shape(identity)
+    {
+        return AttemptInspection::Indeterminate(error);
+    }
+    AttemptInspection::Completed(Box::new(execution))
+}
+
+fn inspect_active_attempt(
+    record: PersistedAttemptRecord,
+    request: &Request,
+    lifecycle: &str,
+) -> AttemptInspection {
+    if record.run_state_version == LEGACY_ATTEMPT_STATE_VERSION {
+        return AttemptInspection::Indeterminate(
+            "legacy supervisor state cannot prove process identity".into(),
+        );
+    }
+    let Some(identity) = record.process_identity.as_ref() else {
+        return AttemptInspection::Indeterminate(
+            "active supervisor state has no process identity".into(),
+        );
+    };
+    if let Err(error) = validate_persisted_identity(identity, lifecycle) {
+        return AttemptInspection::Indeterminate(error);
+    }
+    let mut execution = record.execution;
+    if execution.get("termination_reason").and_then(Value::as_str) != Some("") {
+        return AttemptInspection::Indeterminate(
+            "active supervisor state has a terminal reason".into(),
+        );
+    }
+    execution["termination_reason"] = Value::String("exit_zero".into());
+    let execution: ExecutionResult = match serde_json::from_value(execution) {
+        Ok(execution) => execution,
+        Err(error) => {
+            return AttemptInspection::Indeterminate(format!(
+                "active supervisor state is malformed: {error}"
+            ));
+        }
+    };
+    if let Err(error) = validate_active_execution(&execution, request, lifecycle) {
+        return AttemptInspection::Indeterminate(error);
+    }
+    if !process_identity_matches(&identity.supervisor) {
+        return AttemptInspection::Indeterminate(
+            "supervisor process identity could not be verified".into(),
+        );
+    }
+    if lifecycle == "running"
+        && !process_identity_matches(identity.child.as_ref().expect("validated running child"))
+    {
+        return AttemptInspection::Indeterminate(
+            "child process identity could not be verified".into(),
+        );
+    }
+    AttemptInspection::StillRunning
+}
+
+fn validate_identity_shape(identity: &PersistedAttemptIdentity) -> Result<(), String> {
+    validate_process_identity(&identity.supervisor, "supervisor")?;
+    if let Some(child) = &identity.child {
+        validate_process_identity(child, "child")?;
+    }
+    Ok(())
+}
+
+fn validate_persisted_identity(
+    identity: &PersistedAttemptIdentity,
+    lifecycle: &str,
+) -> Result<(), String> {
+    validate_identity_shape(identity)?;
+    if lifecycle == "running" {
+        if identity.child.is_none() {
+            return Err("running supervisor state has no child identity".into());
+        }
+    } else if identity.child.is_some() {
+        return Err("pre-running supervisor state has child identity".into());
+    }
+    Ok(())
+}
+
+fn validate_process_identity(
+    identity: &PersistedProcessIdentity,
+    name: &str,
+) -> Result<(), String> {
+    if identity.pid <= 0
+        || identity.start_time_ticks == 0
+        || identity.process_group_id <= 0
+        || identity.session_id <= 0
+        || identity.executable.is_empty()
+    {
+        return Err(format!("{name} process identity is incomplete"));
+    }
+    if !Path::new(&identity.executable).is_absolute() {
+        return Err(format!("{name} process executable is not absolute"));
+    }
+    Ok(())
+}
+
+fn validate_active_execution(
+    execution: &ExecutionResult,
+    request: &Request,
+    lifecycle: &str,
+) -> Result<(), String> {
+    if execution.protocol_version != EXECUTION_PROTOCOL_VERSION
+        || execution.run_id != request.run_id
+        || execution.program != request.program
+        || execution.arguments.len() != request.arguments.len()
+        || execution
+            .arguments
+            .iter()
+            .zip(&request.arguments)
+            .any(|(returned, requested)| returned != requested)
+        || execution.timeout.configured_ms != request.timeout_ms
+        || execution.termination.grace_ms != request.termination_grace_ms
+        || execution.output_observations.limit_bytes != request.log_limit_bytes
+    {
+        return Err("active supervisor execution did not match request".into());
+    }
+    if execution.accepted_at.is_empty()
+        || (lifecycle == "accepted" && !execution.started_at.is_empty())
+        || (lifecycle != "accepted" && execution.started_at.is_empty())
+        || !execution.completed_at.is_empty()
+        || execution.duration_ms != 0
+        || execution.exit_code.is_some()
+        || execution.failure.is_some()
+        || execution.timeout.triggered
+        || execution.cancellation.requested
+        || execution.cancellation.source != "none"
+        || execution.termination.graceful_attempted
+        || execution.termination.escalated
+    {
+        return Err("active supervisor execution contains terminal data".into());
+    }
+    let accepted = parse_timestamp("accepted_at", &execution.accepted_at)
+        .map_err(|error| error.to_string())?;
+    let history = &execution.lifecycle_history;
+    let expected_len = match lifecycle {
+        "accepted" => 1,
+        "starting" => 2,
+        "running" => 3,
+        _ => return Err("invalid active lifecycle".into()),
+    };
+    if history.len() != expected_len
+        || history
+            .first()
+            .map(|event| (event.sequence, event.lifecycle, event.timestamp.as_str()))
+            != Some((1, Lifecycle::Accepted, execution.accepted_at.as_str()))
+        || history.last().map(|event| event.lifecycle.as_str()) != Some(lifecycle)
+    {
+        return Err("active supervisor lifecycle history is invalid".into());
+    }
+    if history
+        .windows(2)
+        .any(|events| events[0].sequence >= events[1].sequence)
+        || history.iter().any(|event| event.sequence == 0)
+    {
+        return Err("active supervisor lifecycle sequence is invalid".into());
+    }
+    let mut previous = None;
+    for event in history {
+        let timestamp = parse_timestamp("lifecycle event", &event.timestamp)
+            .map_err(|error| error.to_string())?;
+        if timestamp < accepted || previous.is_some_and(|prior| timestamp <= prior) {
+            return Err("active supervisor lifecycle timestamps are not chronological".into());
+        }
+        previous = Some(timestamp);
+    }
+    if lifecycle != "accepted" {
+        if history[1].timestamp != execution.started_at {
+            return Err("active supervisor starting timestamp does not match started_at".into());
+        }
+        if lifecycle == "running" {
+            let running = parse_timestamp("running lifecycle event", &history[2].timestamp)
+                .map_err(|error| error.to_string())?;
+            let started = parse_timestamp("started_at", &execution.started_at)
+                .map_err(|error| error.to_string())?;
+            if running <= started {
+                return Err("active supervisor running timestamp is not after starting".into());
+            }
+        }
+    }
+    if !execution.stdout.text.is_empty()
+        || execution.stdout.bytes_observed != 0
+        || execution.stdout.bytes_retained != 0
+        || execution.stdout.truncated
+        || execution.stdout.first_sequence.is_some()
+        || execution.stdout.last_sequence.is_some()
+        || !execution.stderr.text.is_empty()
+        || execution.stderr.bytes_observed != 0
+        || execution.stderr.bytes_retained != 0
+        || execution.stderr.truncated
+        || execution.stderr.first_sequence.is_some()
+        || execution.stderr.last_sequence.is_some()
+        || execution.output_observations.bytes_used != 0
+        || execution.output_observations.truncated
+        || !execution.output_observations.entries.is_empty()
+    {
+        return Err("active supervisor output state is nonempty".into());
+    }
+    Ok(())
+}
+
+fn read_attempt_state(path: &Path) -> io::Result<Vec<u8>> {
+    let file = open_attempt_state(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "supervisor state path is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_LEGACY_STATE_PROOF_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_LEGACY_STATE_PROOF_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "supervisor attempt state exceeds size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn open_attempt_state(path: &Path) -> io::Result<std::fs::File> {
+    let root = std::ffi::CString::new("/").expect("root path has no NUL");
+    let root_fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if root_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut directory = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "state path has no parent"))?;
+    for component in parent.components() {
+        let Component::Normal(component) = component else {
+            continue;
+        };
+        let name = std::ffi::CString::new(component.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "state path contains NUL"))?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        directory = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "state path has no file name")
+    })?;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "state path contains NUL"))?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_attempt_state(path: &Path) -> io::Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "supervisor state file is a symbolic link",
+        ));
+    }
+    std::fs::File::open(path)
+}
+
+fn validate_attempt_state_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err("supervisor attempt state path is not normalized and absolute".into());
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if let Ok(metadata) = std::fs::symlink_metadata(&current)
+            && metadata.file_type().is_symlink()
+        {
+            return Err("supervisor attempt state path contains a symbolic link".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity_matches(identity: &PersistedProcessIdentity) -> bool {
+    let path = format!("/proc/{}/stat", identity.pid);
+    let Ok(stat) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Some(close_paren) = stat.rfind(')') else {
+        return false;
+    };
+    let fields: Vec<&str> = stat[close_paren + 1..].split_whitespace().collect();
+    if fields.len() <= 19 {
+        return false;
+    }
+    let Ok(process_group_id) = fields[2].parse::<i32>() else {
+        return false;
+    };
+    let Ok(session_id) = fields[3].parse::<i32>() else {
+        return false;
+    };
+    let Ok(start_time_ticks) = fields[19].parse::<u64>() else {
+        return false;
+    };
+    let Ok(executable) = std::fs::read_link(format!("/proc/{}/exe", identity.pid)) else {
+        return false;
+    };
+    if process_group_id != identity.process_group_id
+        || session_id != identity.session_id
+        || start_time_ticks != identity.start_time_ticks
+        || executable.to_string_lossy() != identity.executable
+    {
+        return false;
+    }
+    let Ok(stat_again) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Some(close_again) = stat_again.rfind(')') else {
+        return false;
+    };
+    let fields_again: Vec<&str> = stat_again[close_again + 1..].split_whitespace().collect();
+    let Ok(executable_again) = std::fs::read_link(format!("/proc/{}/exe", identity.pid)) else {
+        return false;
+    };
+    fields_again.len() > 19
+        && fields_again[2] == fields[2]
+        && fields_again[3] == fields[3]
+        && fields_again[19] == fields[19]
+        && executable_again.to_string_lossy() == identity.executable
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_identity_matches(_identity: &PersistedProcessIdentity) -> bool {
+    false
 }
 
 pub fn run(args: SuperviseArgs, invocation_directory: &Path) -> Result<RunOutput, SupervisorError> {
