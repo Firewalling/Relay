@@ -3386,15 +3386,15 @@ mod tests {
             schema_version: PLAN_SCHEMA_VERSION,
             tasks: (0..MAX_TASKS)
                 .map(|index| PlanTask {
-                    id: format!("task-{index}"),
+                    id: format!("t{index:0>47}"),
                     depends_on: Vec::new(),
                     program: "/bin/true".into(),
                     arguments: if index == 0 {
-                        vec![String::new(); 343_000]
+                        vec![String::new(); 342_000]
                     } else {
                         Vec::new()
                     },
-                    working_directory: None,
+                    working_directory: Some("/tmp".into()),
                     timeout_ms: 1_000,
                     termination_grace_ms: default_grace_ms(),
                     stdout_limit_bytes: default_output_limit(),
@@ -3431,7 +3431,7 @@ mod tests {
                     .collect();
                 let latest = attempts.last().expect("maximum history is non-empty");
                 TaskRecord {
-                    id: format!("task-{index}"),
+                    id: format!("t{index:0>47}"),
                     status: TaskStatus::Failed,
                     reason: latest.reason.clone(),
                     attempt_run_id: Some(latest.run_id.clone()),
@@ -3463,11 +3463,29 @@ mod tests {
         println!("maximum retry plan: {} bytes", plan_bytes.len());
         assert!(plan_bytes.len() < MAX_PLAN_BYTES as usize);
         assert!(plan_bytes.len() >= MAX_PLAN_BYTES as usize - 16_384);
+        let mut state_without_plan = state.clone();
+        state_without_plan.plan = Plan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            tasks: Vec::new(),
+        };
+        let empty_plan_bytes = serde_json::to_vec(&state_without_plan.plan).unwrap().len();
+        let fixed_per_task_attempt_overhead =
+            encode_state(&state_without_plan).unwrap().len() - empty_plan_bytes;
+        let worst_case_bound = MAX_PLAN_BYTES as usize + fixed_per_task_attempt_overhead;
+        println!(
+            "fixed per-task/attempt overhead: {} bytes; bound: {} bytes",
+            fixed_per_task_attempt_overhead, worst_case_bound
+        );
+        assert!(worst_case_bound < MAX_STATE_BYTES as usize);
         validate_plan(&state.plan, Path::new("/tmp")).unwrap();
         validate_resume_state(&state, &state.plan, Path::new(&state.state_path)).unwrap();
         let encoded = encode_state(&state).unwrap();
         println!("maximum retry aggregate: {} bytes", encoded.len());
-        assert!(encoded.len() < MAX_STATE_BYTES as usize);
+        assert_eq!(
+            encoded.len(),
+            plan_bytes.len() + fixed_per_task_attempt_overhead
+        );
+        assert!(encoded.len() <= worst_case_bound);
     }
 
     #[test]

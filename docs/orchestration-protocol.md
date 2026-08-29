@@ -202,6 +202,9 @@ compact JSON; retained failure codes are capped at 64 bytes and messages at
 256 bytes. Attempt reasons retain only termination classifications, avoiding
 large diagnostic duplication; the maximum valid 64-task, ten-attempt history
 is covered by a size-bound regression test below 4 MiB.
+The bound is additive: 1,048,576-byte plan cap plus 1,805,320-byte fixed
+per-task/attempt overhead equals 2,853,896 bytes, below the 4,194,304-byte
+aggregate cap.
 
 Run status is one of `running`, `completed`, `failed`, `cancelled`, or
 `indeterminate`; task status is one of `pending`, `running`, `succeeded`,
