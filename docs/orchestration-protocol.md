@@ -26,7 +26,7 @@ output schema version, and on-disk state schema version are independent:
 - `protocol_version: 1` identifies this orchestration contract.
 - `relay_version` identifies the Relay binary that reported it.
 - `output_schema_version: 1` identifies Relay's success and error envelopes.
-- aggregate run-state schema_version: 2 identifies the Rust-owned DAG state schema; the immutable protocol manifest remains v1.
+- aggregate run-state schema_version: 3 identifies the Rust-owned DAG state schema with bounded retry history; immutable protocol manifest remains v1.
 
 `relay protocol` is project-independent. Global options may precede or follow
 the subcommand, and even `--scope repository` does not trigger repository
@@ -155,7 +155,7 @@ working directory unless that task supplies an absolute one. Every task is
 launched by direct argv: `program` and each `arguments` element remain separate
 OS arguments and are never parsed, interpolated, or evaluated by a shell.
 
-### Closed plan v1
+### Closed plan v1 and v2
 
 Plan JSON is a closed schema that rejects unknown fields:
 
@@ -163,6 +163,11 @@ Plan JSON is a closed schema that rejects unknown fields:
 {"schema_version": 1, "tasks": [{"id": "build", "program": "/usr/bin/make", "timeout_ms": 60000}]}
 ```
 
+Schema v1 has no retry field. Schema v2 adds this optional per-task object:
+
+`"retry": {"max_attempts": 3, "delay_ms": 1000}`
+
+The field is invalid in v1; both plan versions remain closed schemas.
 `tasks` contains 1–64 entries in stable input order. Each task has a unique ID
 matching `[A-Za-z0-9][A-Za-z0-9._-]{0,47}`, optional `depends_on`, an absolute
 `program`, default-empty `arguments`, an optional absolute
@@ -174,45 +179,54 @@ The optional execution controls are `termination_grace_ms` (default 2,000;
 maximum 60,000), `stdout_limit_bytes` and `stderr_limit_bytes` (default 1 MiB
 each; maximum 8 MiB each), `log_limit_bytes` (default 64 KiB; maximum 4 MiB),
 and `redact_argument_indexes` (at most 32 valid, unique indexes whose declared
-values total at most 64 KiB). All numeric limits have a minimum of one. The
-plan document is bounded to 1 MiB and NUL bytes are rejected in executable,
-working-directory, and argument strings.
+values total at most 64 KiB). All other numeric limits have a minimum of one.
+Schema v2 retry policy has `max_attempts` from
+1 through 10, including the initial attempt, and `delay_ms` from 0 through
+86,400,000. Missing `retry` means no retry. The plan document is bounded to
+1 MiB and NUL bytes are rejected in executable, working-directory, and argument
+strings.
 
 ### Aggregate and attempt state ownership
 
-Aggregate run-state v2 is a closed Rust schema. By default Rust atomically
+Aggregate run-state v3 is a closed Rust schema. By default Rust atomically
 persists it at `<project>/.relay/runs/<run-uuid>.json`; `--state-path` selects
 an absolute custom path, which remains Rust-owned. Valid aggregate v1 records
-omit `jobs`, imply sequential `jobs: 1`, and are migrated to v2 on safe resume.
-A v1 record with running or indeterminate task work remains non-resumable. A
-custom path containing a `.relay` component is accepted only beneath the current
-project's `.relay/runs` directory. Symlinked state-path components are rejected;
-an adjacent advisory lock prevents two coordinators from owning the same run, and
-resume reads are bounded to 4 MiB.
+omit `jobs` and imply sequential `jobs: 1`; v2 records include `jobs` but
+no retry history. Clean v1/v2 records migrate to v3 on safe resume. Running or
+indeterminate records remain non-resumable.
+Custom paths containing a `.relay` component are accepted only beneath the
+current project's `.relay/runs` directory. Symlinked state-path components
+are rejected; an adjacent advisory lock prevents two coordinators from owning
+the same run, and resume reads are bounded to 4 MiB. Aggregate state uses
+compact JSON; retained failure codes are capped at 64 bytes and messages at
+256 bytes. Attempt reasons retain only termination classifications, avoiding
+large diagnostic duplication; the maximum valid 64-task, ten-attempt history
+is covered by a size-bound regression test below 4 MiB.
+The bound is additive: 1,048,576-byte plan cap plus 1,805,320-byte fixed
+per-task/attempt overhead equals 2,853,896 bytes, below the 4,194,304-byte
+aggregate cap.
 
-The aggregate contains schema and run identity, creation/update timestamps,
-run status, the requested jobs limit, ordered task records, and a sanitized copy
-of the closed plan.
 Run status is one of `running`, `completed`, `failed`, `cancelled`, or
 `indeterminate`; task status is one of `pending`, `running`, `succeeded`,
-`failed`, `cancelled`, `blocked`, or `indeterminate`. Closed decoding and
-resume validation reject unknown status values and inconsistent aggregate/task
-state.
+`failed`, `cancelled`, `blocked`, or `indeterminate`.
+The aggregate contains schema and run identity, creation/update timestamps,
+run status, requested jobs limit, ordered task records, retry deadlines, and a
+sanitized copy of the closed plan. Each task's bounded `attempts` list retains
+sequential attempt number, fresh UUID, Go record path, terminal status, reason,
+and bounded execution summary. Closed decoding and resume validation reject
+unknown fields, malformed history, and inconsistent aggregate/task state.
+
 Arguments selected by `redact_argument_indexes` are stored as `<redacted>`;
-raw declared values are not copied into aggregate state. Before a task starts,
-Rust persists `running` plus a fresh attempt UUID and its Go record path. After
-a clean typed supervisor response, Rust persists only a bounded execution
-summary—lifecycle, reason/failure, exit code, timestamps/duration, stream byte
-counts and truncation flags, and cancellation state—not captured stream text or
-environment values.
+raw declared values are not copied into aggregate state. Before every launch,
+Rust persists `running` plus a fresh attempt UUID and Go record path. A clean
+typed supervisor response is persisted in its attempt history; no captured
+stream text or environment values enter aggregate state.
 
 Each attempt's complete Go-owned record is under
 `${TMPDIR}/relay/supervisor/<attempt-uuid>.json`. Validation guarantees that
 path is outside Rust-owned `.relay`, but `TMPDIR` itself may point inside the
-selected project. Callers handling sensitive captured output should choose a
-private, safe temporary directory. The aggregate stores the Go record path as
-a reference. Go never reads or writes `.relay`, and Rust does not use the
-attempt record to reconstruct or override aggregate state.
+selected project. Rust never overwrites earlier attempt records, and Go never
+reads or writes `.relay`.
 
 JSON task-outcome output contains `{ "state_path": ..., "run": ... }`, with
 `run` equal to the full persisted aggregate state. Human output reports the run
@@ -227,37 +241,39 @@ persisted `run`, now marked `indeterminate`.
 ### Scheduling, failure, cancellation, and resume
 
 The coordinator permits up to N active tasks from `--jobs` (default `1`). It
-repeatedly fills available slots by selecting the first input-order `pending`
-task whose dependencies all succeeded. It persists each task as `running` with
-a fresh attempt UUID and Go record path before launch, then waits for any
-completion. `--jobs 1` preserves sequential behavior. Independent ready tasks
-may overlap when N is greater than one; selection remains deterministic even
-when completion order varies.
+repeatedly fills available slots by selecting the first input-order ready task
+whose dependencies succeeded and whose retry deadline has elapsed. It persists
+each launch as `running` with a fresh attempt UUID and Go record path before
+launch, then waits for completion. `--jobs 1` preserves sequential behavior;
+selection stays deterministic when completion order varies.
 
-A task succeeds only for the typed combination `completed`, `exit_zero`, and
-exit code zero. Nonzero exit, start failure, timeout, and non-cancellation
-forced cleanup are task failures; a clean cancellation outcome is `cancelled`.
-Failed, cancelled, and indeterminate dependencies block descendants
-transitively, while unrelated ready tasks continue. An indeterminate attempt
-does not become rerunnable work; the coordinator continues only safe unrelated
-branches and returns an indeterminate application error.
+A task succeeds only for typed `completed`, `exit_zero`, and exit code zero.
+Schema-v2 retry policy reruns only known non-cancellation failures: nonzero
+exit, start failure, timeout, and definite non-cancellation forced cleanup.
+Transport/protocol errors, indeterminate outcomes, `CancelledBeforeLaunch`,
+and cancellation outcomes never retry. Retry history is bounded by ten total
+attempts per task, including initial execution; Relay does not infer idempotency.
+
+A waiting retry remains `pending` with `retry_ready_at`; it consumes no job
+slot, leaves descendants unready, and lets unrelated ready work continue. An
+exhausted failure blocks descendants transitively. A boundary error after an
+attempt was persisted as running makes that attempt and run indeterminate; it
+does not become rerunnable work.
 
 Catchable `SIGINT` or `SIGTERM` is latched globally and forwarded through a
 race-safe registry to every active Go supervisor. Registration during startup
-rechecks the latch, and once cancellation is latched no new DAG task is
-scheduled. Clean cancellation results are persisted per task; pending work
-remains resumable after a clean run exit. Coordinator state failures stop new
-launches, latch and forward cancellation, drain and join every active worker,
-classify safe completions, preserve uncertain attempts as indeterminate, and
-make a best-effort final aggregate persist before returning the original error.
+rechecks the latch, and once cancellation is latched no new DAG attempt is
+scheduled. Clean cancellation results are persisted per attempt; pending work,
+including a waiting retry, remains resumable after clean exit. Coordinator state
+failures stop launches, drain and join workers, preserve uncertain attempts as
+indeterminate, and best-effort persist before returning the original error.
 
-Resume always requires the caller to provide the plan again. Rust compares its
-sanitized form with the persisted plan, validates task identity and aggregate
-consistency, and refuses any state containing `running` or `indeterminate`
-work. It never reruns `succeeded`, `failed`, `cancelled`, `blocked`, `running`,
-or `indeterminate` tasks; it can continue only still-`pending` independent
-work after a prior clean terminal response. There are no retries and no
-recovery claim for work whose outcome is active or uncertain.
+Resume requires the plan again. Rust compares its sanitized form, validates
+attempt history and aggregate consistency, and refuses any state containing
+running or indeterminate work. It never reruns terminal or blocked tasks; it
+continues safe pending work and validated pending retries only. A future retry
+deadline is polled without holding a job slot. There is no process reattachment
+or recovery claim for active or uncertain work.
 
 ### Coordinator limits and non-guarantees
 
@@ -265,9 +281,10 @@ The coordinator and supervisor execution path is currently Linux-only. The
 jobs limit is bounded by the plan's 64-task maximum; `--jobs 1` is deliberate
 sequential behavior, not hidden parallelism. There is no daemon, queue,
 network or remote execution, authentication, provider, workflow inference, Lua
-runtime, sandbox, retry engine, or transcript scraping. Go's Linux process-group cleanup covers the direct child and descendants that
-remain in that group, subject to the supervisor limitations below. Neither the
-coordinator nor the supervisor guarantees containment or cleanup of a process
+runtime, sandbox, global retry engine, exponential backoff, jitter, or
+transcript scraping. Go's Linux process-group cleanup covers the direct child
+and descendants that remain in that group, subject to supervisor limitations.
+Neither the coordinator nor the supervisor guarantees containment or cleanup of a process
 that detaches into another session/group, nor recovery after supervisor
 `SIGKILL`, kernel failure, or machine loss; use an external cgroup or service
 boundary when those guarantees are required.
@@ -704,7 +721,7 @@ The Go component supervises exactly one local process and persists one separate
 local attempt record outside `.relay`. The built-in Rust coordinator supplies a
 dependency graph and bounded parallel scheduling, but neither it nor `relay
 supervise` makes the manifest's externally advertised `orchestrator.implemented`
-value true. There is no queue, retry engine, daemon, remote execution,
+value true. There is no queue, global retry engine, daemon, remote execution,
 authentication, deployment layer, Lua parser, Lua runtime, or Lua sandbox. Execution is currently limited to Linux. Self-detaching descendants
 and uncatchable process or machine termination require an external OS
 containment boundary.
