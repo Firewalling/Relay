@@ -224,3 +224,93 @@ fn error_code(error: &app::AppError) -> &'static str {
         app::AppError::InjectedFault(_) => "operation_interrupted",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use relay::{git, lock, storage};
+    use std::{io, path::PathBuf};
+
+    #[test]
+    fn json_is_only_requested_by_a_global_flag_before_a_trailing_separator() {
+        for args in [
+            vec!["relay", "--json", "status"],
+            vec!["relay", "status", "--json"],
+        ] {
+            assert!(requests_json(&args), "{args:?}");
+        }
+        for args in [
+            vec!["relay", "status"],
+            vec!["relay", "note", "progress", "--", "--json"],
+            Vec::new(),
+        ] {
+            assert!(!requests_json(&args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn every_application_error_maps_to_a_stable_machine_code() {
+        let path = PathBuf::from(".relay/session.json");
+        let cases = [
+            (
+                app::AppError::Lifecycle("no session".into()),
+                "lifecycle_error",
+            ),
+            (
+                app::AppError::UnsupportedSchema {
+                    kind: "session state",
+                    found: 99,
+                    supported: 1,
+                },
+                "unsupported_schema",
+            ),
+            (
+                app::AppError::Storage(storage::StorageError::PartialJsonLine {
+                    path: path.clone(),
+                    line: 2,
+                }),
+                "storage_error",
+            ),
+            (
+                app::AppError::Git(git::GitError::Command {
+                    directory: path.clone(),
+                    message: "git failed".into(),
+                }),
+                "git_error",
+            ),
+            (
+                app::AppError::Lock(lock::LockError::Busy {
+                    owner: " (PID 1, command `start`)".into(),
+                }),
+                "project_busy",
+            ),
+            (
+                app::AppError::Io {
+                    path: path.clone(),
+                    source: io::Error::from(io::ErrorKind::NotFound),
+                },
+                "io_error",
+            ),
+            (
+                app::AppError::CorruptSession {
+                    path: path.clone(),
+                    message: "conflicting fields".into(),
+                },
+                "corrupt_state",
+            ),
+            (app::AppError::SymlinkState { path }, "unsafe_state_path"),
+            (
+                app::AppError::InjectedFault("session_record".into()),
+                "operation_interrupted",
+            ),
+        ];
+
+        for (error, expected) in &cases {
+            assert_eq!(error_code(error), *expected, "{error}");
+        }
+        let mut codes = cases.iter().map(|(_, code)| *code).collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), cases.len());
+    }
+}
