@@ -111,6 +111,26 @@ if mode == "barrier":
     while not cancelled and not os.path.exists(release):
         time.sleep(0.01)
     mode = "cancelled" if cancelled else "success"
+
+for variable in request.get("environment", []):
+    if variable.get("name") != "RELAY_OUTPUT_MANIFEST":
+        continue
+    for output_path in json.loads(variable["value"]).values():
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        payload = b"null\n" if mode == "null_output" else (b"x" * 4097 if mode == "oversized_output" else (b"{not-json\n" if mode == "malformed_output" else (b"{\"source\":\"fake\"}\n" if output_path.endswith(".json") else b"fake report\n")))
+        if mode == "symlink_output":
+            target = output_path + ".target"
+            with open(target, "wb") as output_file:
+                output_file.write(payload)
+            os.symlink(target, output_path)
+        elif mode == "hardlink_output":
+            target = output_path + ".target"
+            with open(target, "wb") as output_file:
+                output_file.write(payload)
+            os.link(target, output_path)
+        else:
+            with open(output_path, "wb") as output_file:
+                output_file.write(payload)
 lifecycle = "completed"
 reason = "exit_zero"
 exit_code = 0
@@ -248,6 +268,10 @@ impl Harness {
 
     fn plan_v2(&self, name: &str, tasks: Value) -> PathBuf {
         self.plan_with_schema(name, 2, tasks)
+    }
+
+    fn plan_v3(&self, name: &str, tasks: Value) -> PathBuf {
+        self.plan_with_schema(name, 3, tasks)
     }
 
     fn plan_with_schema(&self, name: &str, schema_version: u32, tasks: Value) -> PathBuf {
@@ -421,7 +445,487 @@ fn retry_task(id: &str, dependencies: &[&str], max_attempts: u32, delay_ms: u64)
     task["retry"] = json!({"max_attempts":max_attempts,"delay_ms":delay_ms});
     task
 }
+fn request_output_path(request: &Value, name: &str) -> PathBuf {
+    let manifest = request["environment"]
+        .as_array()
+        .expect("request environment")
+        .iter()
+        .find(|entry| entry["name"] == "RELAY_OUTPUT_MANIFEST")
+        .and_then(|entry| entry["value"].as_str())
+        .expect("output manifest environment");
+    let manifest: Value = serde_json::from_str(manifest).expect("valid output manifest");
+    manifest[name]
+        .as_str()
+        .map(PathBuf::from)
+        .expect("declared output environment")
+}
 
+#[test]
+fn output_declarations_are_strict_and_bounded() {
+    let harness = Harness::new();
+    let mut cases = Vec::new();
+
+    let mut duplicate = task("duplicate", &[]);
+    duplicate["outputs"] = json!([
+        {"name":"report","type":"file","path":"report.txt"},
+        {"name":"report","type":"file","path":"other.txt"}
+    ]);
+    cases.push(("duplicate", duplicate));
+
+    let mut unknown = task("unknown", &[]);
+    unknown["outputs"] = json!([{"name":"report","type":"file","path":"report.txt","extra":true}]);
+    cases.push(("unknown", unknown));
+
+    let mut bad_name = task("bad-name", &[]);
+    bad_name["outputs"] = json!([{"name":"Report","type":"file","path":"report.txt"}]);
+    cases.push(("bad-name", bad_name));
+
+    let mut traversal = task("traversal", &[]);
+    traversal["outputs"] = json!([{"name":"report","type":"file","path":"../report.txt"}]);
+    cases.push(("traversal", traversal));
+
+    let mut absolute = task("absolute", &[]);
+    absolute["outputs"] = json!([{"name":"report","type":"file","path":"/tmp/report.txt"}]);
+    cases.push(("absolute", absolute));
+
+    let mut wrong_type = task("wrong-type", &[]);
+    wrong_type["outputs"] = json!([{"name":"report","type":"text","path":"report.txt"}]);
+    cases.push(("wrong-type", wrong_type));
+
+    let mut null_outputs = task("null-outputs", &[]);
+    null_outputs["outputs"] = Value::Null;
+    cases.push(("null-outputs", null_outputs));
+
+    let mut too_many = task("too-many", &[]);
+    too_many["outputs"] = json!((0..5).map(|index| json!({"name":format!("out{index}"),"type":"file","path":format!("out{index}.txt")})).collect::<Vec<_>>());
+    cases.push(("too-many", too_many));
+
+    let mut unknown_input = task("unknown-input", &[]);
+    unknown_input["inputs"] = json!([{"from_task":"missing","output":"report","as":"--report"}]);
+    cases.push(("unknown-input", unknown_input));
+
+    let mut input_unknown_field = task("input-unknown-field", &[]);
+    input_unknown_field["inputs"] =
+        json!([{"from_task":"missing","output":"report","as":"--report","extra":true}]);
+    cases.push(("input-unknown-field", input_unknown_field));
+
+    let mut empty_argument = task("empty-argument", &[]);
+    empty_argument["inputs"] = json!([{"from_task":"missing","output":"report","as":""}]);
+    cases.push(("empty-argument", empty_argument));
+
+    let mut long_path = task("long-path", &[]);
+    long_path["outputs"] = json!([{"name":"report","type":"file","path":"x".repeat(513)}]);
+    cases.push(("long-path", long_path));
+
+    for (name, invalid_task) in cases {
+        let plan = harness.plan_v3(name, json!([invalid_task]));
+        let error = error_document(&harness.run_json(&plan, &harness.state(name)));
+        assert_eq!(error["error"]["code"], "run_plan_invalid", "case {name}");
+    }
+
+    let mut producer = task("missing-output-producer", &[]);
+    producer["outputs"] = json!([{"name":"report","type":"file","path":"report.txt"}]);
+    let mut missing_output = task("missing-output-consumer", &["missing-output-producer"]);
+    missing_output["inputs"] =
+        json!([{"from_task":"missing-output-producer","output":"missing","as":"--missing"}]);
+    let plan = harness.plan_v3("missing-output-ref", json!([producer, missing_output]));
+    let error = error_document(&harness.run_json(&plan, &harness.state("missing-output-ref")));
+    assert_eq!(error["error"]["code"], "run_plan_invalid");
+
+    let mut producer = task("nondirect-producer", &[]);
+    producer["outputs"] = json!([{"name":"report","type":"file","path":"report.txt"}]);
+    let mut nondirect_consumer = task("nondirect-consumer", &[]);
+    nondirect_consumer["inputs"] =
+        json!([{"from_task":"nondirect-producer","output":"report","as":"--report"}]);
+    let plan = harness.plan_v3("nondirect-ref", json!([producer, nondirect_consumer]));
+    let error = error_document(&harness.run_json(&plan, &harness.state("nondirect-ref")));
+    assert_eq!(error["error"]["code"], "run_plan_invalid");
+
+    assert!(harness.requests().is_empty());
+}
+
+#[test]
+fn schema_v2_rejects_even_empty_output_and_input_fields() {
+    let harness = Harness::new();
+    let mut output_task = task("v2-output-field", &[]);
+    output_task["outputs"] = json!([]);
+    let output_plan = harness.plan_v2("v2-output-field", json!([output_task]));
+    let output_error =
+        error_document(&harness.run_json(&output_plan, &harness.state("v2-output-field")));
+    assert_eq!(output_error["error"]["code"], "run_plan_invalid");
+
+    let mut input_task = task("v2-input-field", &[]);
+    input_task["inputs"] = json!([]);
+    let input_plan = harness.plan_v2("v2-input-field", json!([input_task]));
+    let input_error =
+        error_document(&harness.run_json(&input_plan, &harness.state("v2-input-field")));
+    assert_eq!(input_error["error"]["code"], "run_plan_invalid");
+    assert!(harness.requests().is_empty());
+}
+#[test]
+fn successful_outputs_are_provenanced_consumed_and_resume_safe() {
+    let harness = Harness::new();
+    let mut producer = task("produce", &[]);
+    producer["outputs"] = json!([
+        {"name":"summary","type":"json","path":"summary.json"},
+        {"name":"report","type":"file","path":"report.txt"}
+    ]);
+    let mut consumer = task("consume", &["produce"]);
+    consumer["inputs"] = json!([
+        {"from_task":"produce","output":"summary","as":"--summary"},
+        {"from_task":"produce","output":"report","as":"--report"}
+    ]);
+    let plan = harness.plan_v3("outputs-success", json!([producer, consumer]));
+    let state_path = harness.state("outputs-success");
+    let document = run_document(&harness.run_json(&plan, &state_path));
+    let state = read_state(&state_path);
+    let producer_state = record(&state, "produce");
+    let outputs = producer_state["outputs"]
+        .as_array()
+        .expect("task outputs")
+        .to_owned();
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0]["type"], "json");
+    assert_eq!(outputs[0]["value"]["source"], "fake");
+    assert_eq!(outputs[0]["producer_task"], "produce");
+    assert_eq!(outputs[0]["run_id"], state["run_id"]);
+    assert_eq!(outputs[0]["attempt"], 1);
+    assert_eq!(
+        outputs[0]["attempt_run_id"],
+        attempts(&state, "produce")[0]["run_id"]
+    );
+    assert!(outputs[0]["sha256"].as_str().unwrap().len() == 64);
+    assert!(Path::new(outputs[1]["path"].as_str().unwrap()).is_file());
+    assert_eq!(document["data"]["run"], state);
+
+    let requests = harness.requests();
+    assert_eq!(requests.len(), 2);
+    let consumer_arguments = requests[1]["arguments"].as_array().expect("consumer argv");
+    assert!(consumer_arguments.iter().any(|value| value == "--summary"));
+    assert!(
+        consumer_arguments
+            .iter()
+            .any(|value| value == "{\"source\":\"fake\"}")
+    );
+    assert!(consumer_arguments.iter().any(|value| value == "--report"));
+    assert!(
+        consumer_arguments
+            .iter()
+            .any(|value| value == outputs[1]["path"].as_str().unwrap())
+    );
+
+    let before_resume = requests.len();
+    let resumed = run_document(&harness.resume_json(&plan, &state_path));
+    assert_eq!(harness.requests().len(), before_resume);
+    assert_eq!(
+        resumed["data"]["run"]["tasks"][0]["outputs"],
+        json!(outputs)
+    );
+}
+
+#[test]
+fn failed_attempt_outputs_never_cross_retry_boundary() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("produce", &["nonzero", "success"])]);
+    let mut producer = task("produce", &[]);
+    producer["outputs"] = json!([{"name":"summary","type":"json","path":"summary.json"}]);
+    producer["retry"] = json!({"max_attempts":2,"delay_ms":0});
+    let plan = harness.plan_v3("outputs-retry", json!([producer]));
+    let state_path = harness.state("outputs-retry");
+    run_document(&harness.run_json(&plan, &state_path));
+    let state = read_state(&state_path);
+    let history = attempts(&state, "produce");
+    assert_eq!(history.len(), 2);
+    assert!(history[0]["outputs"].is_null());
+    assert_eq!(history[1]["outputs"].as_array().unwrap().len(), 1);
+    assert_eq!(record(&state, "produce")["outputs"][0]["attempt"], 2);
+    let requests = harness.requests();
+    let first_path = request_output_path(&requests[0], "summary");
+    let final_path = request_output_path(&requests[1], "summary");
+    assert_ne!(first_path, final_path);
+    assert!(first_path.is_file());
+    assert_eq!(
+        record(&state, "produce")["outputs"][0]["path"],
+        final_path.to_str().unwrap()
+    );
+}
+
+#[test]
+fn malformed_success_output_becomes_indeterminate_and_unconsumable() {
+    let harness = Harness::new();
+    harness.configure(&[("produce", "malformed_output")]);
+    let mut producer = task("produce", &[]);
+    producer["outputs"] = json!([{"name":"summary","type":"json","path":"summary.json"}]);
+    let mut consumer = task("consume", &["produce"]);
+    consumer["inputs"] = json!([{"from_task":"produce","output":"summary","as":"--summary"}]);
+    let plan = harness.plan_v3("outputs-malformed", json!([producer, consumer]));
+    let state_path = harness.state("outputs-malformed");
+    let document = run_document(&harness.run_json(&plan, &state_path));
+    let state = read_state(&state_path);
+    assert_eq!(document["data"]["run"]["status"], "indeterminate");
+    assert_eq!(record(&state, "produce")["status"], "indeterminate");
+    assert!(record(&state, "produce")["outputs"].is_null());
+    let before = harness.requests().len();
+    assert_eq!(before, 1);
+    let error = error_document(&harness.resume_json(&plan, &state_path));
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+    assert_eq!(harness.requests().len(), before);
+}
+#[test]
+fn symlink_and_hardlink_outputs_are_not_trusted() {
+    let harness = Harness::new();
+    for (name, mode) in [
+        ("symlink", "symlink_output"),
+        ("hardlink", "hardlink_output"),
+    ] {
+        harness.configure(&[(name, mode)]);
+        let mut producer = task(name, &[]);
+        producer["outputs"] = json!([{"name":"report","type":"file","path":"report.txt"}]);
+        let plan = harness.plan_v3(name, json!([producer]));
+        let state_path = harness.state(name);
+        let document = run_document(&harness.run_json(&plan, &state_path));
+        let state = read_state(&state_path);
+        assert_eq!(document["data"]["run"]["status"], "indeterminate");
+        assert_eq!(record(&state, name)["status"], "indeterminate");
+        assert!(record(&state, name)["outputs"].is_null());
+    }
+}
+#[test]
+fn real_go_supervisor_proves_outputs_and_resume_without_rerun() {
+    let Some(supervisor) = real_supervisor_path() else {
+        return;
+    };
+    let harness = Harness::new();
+    let counter = harness.directory.path().join("output-counter.log");
+    let producer_script = "import json,os,sys; paths=json.loads(os.environ['RELAY_OUTPUT_MANIFEST']); open(paths['api_key'],'w').write('{\"real\":true}'); open(paths['report'],'w').write('real report\\n'); open(sys.argv[1],'a').write('producer\\n')";
+    let consumer_script = "import os,sys; assert sys.argv[2] == '--summary'; assert sys.argv[3] == '{\"real\":true}'; assert sys.argv[4] == '--report'; assert os.path.isfile(sys.argv[5]); open(sys.argv[1],'a').write('consumer\\n')";
+    let mut producer = task("produce", &[]);
+    producer["program"] = json!("/usr/bin/python3");
+    producer["arguments"] = json!(["-c", producer_script, counter.to_str().unwrap()]);
+    producer["outputs"] = json!([
+        {"name":"api_key","type":"json","path":"summary.json"},
+        {"name":"report","type":"file","path":"report.txt"}
+    ]);
+    let mut consumer = task("consume", &["produce"]);
+    consumer["program"] = json!("/usr/bin/python3");
+    consumer["arguments"] = json!(["-c", consumer_script, counter.to_str().unwrap()]);
+    consumer["inputs"] = json!([
+        {"from_task":"produce","output":"api_key","as":"--summary"},
+        {"from_task":"produce","output":"report","as":"--report"}
+    ]);
+    let plan = harness.plan_v3("real-outputs", json!([producer, consumer]));
+    let state = harness.state("real-outputs");
+    run_document(
+        &real_relay_command(
+            &supervisor,
+            harness.directory.path(),
+            &harness.temporary_root,
+        )
+        .args([
+            "--jobs",
+            "1",
+            "--state-path",
+            state.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run real Go supervisor"),
+    );
+    let first_state = read_state(&state);
+    assert_eq!(first_state["status"], "completed");
+    assert_eq!(first_state["tasks"][0]["outputs"][0]["value"]["real"], true);
+    let before_resume = fs::read_to_string(&counter).unwrap();
+    assert_eq!(before_resume.lines().count(), 2);
+    run_document(
+        &real_relay_command(
+            &supervisor,
+            harness.directory.path(),
+            &harness.temporary_root,
+        )
+        .args([
+            "--jobs",
+            "1",
+            "--resume",
+            state.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .output()
+        .expect("resume real Go supervisor run"),
+    );
+    assert_eq!(fs::read_to_string(counter).unwrap().lines().count(), 2);
+}
+#[test]
+fn oversized_structured_output_is_refused_without_trusting_bytes() {
+    let harness = Harness::new();
+    harness.configure(&[("oversized", "oversized_output")]);
+    let mut producer = task("oversized", &[]);
+    producer["outputs"] = json!([{"name":"summary","type":"json","path":"summary.json"}]);
+    let plan = harness.plan_v3("oversized-output", json!([producer]));
+    let state_path = harness.state("oversized-output");
+    let document = run_document(&harness.run_json(&plan, &state_path));
+    let state = read_state(&state_path);
+    assert_eq!(document["data"]["run"]["status"], "indeterminate");
+    assert!(record(&state, "oversized")["outputs"].is_null());
+    let before = harness.requests().len();
+    let error = error_document(&harness.resume_json(&plan, &state_path));
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+    assert_eq!(harness.requests().len(), before);
+}
+
+#[test]
+fn tampered_output_metadata_is_rejected_on_resume() {
+    for (name, cross_project) in [("tampered-hash", false), ("tampered-path", true)] {
+        let harness = Harness::new();
+        let mut producer = task("produce", &[]);
+        producer["outputs"] = json!([{"name":"summary","type":"json","path":"summary.json"}]);
+        let plan = harness.plan_v3(name, json!([producer]));
+        let state_path = harness.state(name);
+        run_document(&harness.run_json(&plan, &state_path));
+        let mut state = read_state(&state_path);
+        if cross_project {
+            state["tasks"][0]["outputs"][0]["path"] = json!("/tmp/relay-outside.json");
+        } else {
+            state["tasks"][0]["outputs"][0]["sha256"] = json!("0".repeat(64));
+        }
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let before = harness.requests().len();
+        let error = error_document(&harness.resume_json(&plan, &state_path));
+        assert_eq!(error["error"]["code"], "run_state_invalid");
+        assert_eq!(harness.requests().len(), before);
+    }
+}
+#[test]
+fn real_go_crash_reconciliation_promotes_outputs_once() {
+    let Some(supervisor) = real_supervisor_path() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create crash output directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).unwrap();
+    let marker = directory.path().join("output-pause.marker");
+    let counter = directory.path().join("output-counter.log");
+    let plan = directory.path().join("output-crash-plan.json");
+    let state = directory.path().join("output-crash-state.json");
+    let producer_script = "import json,os,sys; paths=json.loads(os.environ['RELAY_OUTPUT_MANIFEST']); open(paths['summary'],'w').write('{\"real\":true}'); open(sys.argv[1],'a').write('producer\\n')";
+    fs::write(
+        &plan,
+        serde_json::to_vec(&json!({
+            "schema_version":3,
+            "tasks":[{
+                "id":"produce",
+                "program":"/usr/bin/python3",
+                "arguments":["-c",producer_script,counter.to_str().unwrap()],
+                "timeout_ms":5000,
+                "outputs":[{"name":"summary","type":"json","path":"summary.json"}]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut child = spawn_real_crash_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &plan,
+        &state,
+        &marker,
+        1,
+    );
+    wait_for_path(&marker);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+    let interrupted = read_state(&state);
+    assert_eq!(interrupted["tasks"][0]["status"], "running");
+    assert!(interrupted["tasks"][0]["outputs"].is_null());
+    run_document(
+        &real_relay_command(&supervisor, directory.path(), &temporary_root)
+            .args([
+                "--jobs",
+                "1",
+                "--resume",
+                state.to_str().unwrap(),
+                plan.to_str().unwrap(),
+            ])
+            .output()
+            .expect("resume crashed output run"),
+    );
+    let resumed = read_state(&state);
+    assert_eq!(resumed["status"], "completed");
+    assert_eq!(resumed["tasks"][0]["outputs"][0]["value"]["real"], true);
+    assert_eq!(fs::read_to_string(counter).unwrap().lines().count(), 1);
+}
+#[test]
+fn human_output_lists_declared_outputs_without_hash_noise() {
+    let harness = Harness::new();
+    let mut producer = task("produce", &[]);
+    producer["outputs"] = json!([{"name":"summary","type":"json","path":"summary.json"}]);
+    let plan = harness.plan_v3("human-outputs", json!([producer]));
+    let output = harness.run_human(&plan, &harness.state("human-outputs"));
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("outputs:"));
+    assert!(text.contains("summary -> json"));
+    assert!(!text.contains("sha256"));
+}
+
+#[test]
+fn failed_cancelled_and_timeout_attempts_have_no_trusted_outputs() {
+    let harness = Harness::new();
+    for (name, mode, status) in [
+        ("failed-output", "nonzero", "failed"),
+        ("cancelled-output", "cancelled", "cancelled"),
+        ("timeout-output", "timeout", "failed"),
+    ] {
+        harness.configure(&[(name, mode)]);
+        let mut producer = task(name, &[]);
+        producer["outputs"] = json!([{"name":"report","type":"file","path":"report.txt"}]);
+        let plan = harness.plan_v3(name, json!([producer]));
+        let state_path = harness.state(name);
+        let document = run_document(&harness.run_json(&plan, &state_path));
+        let state = read_state(&state_path);
+        assert_eq!(document["data"]["run"]["status"], status);
+        assert!(record(&state, name)["outputs"].is_null());
+    }
+}
+#[test]
+fn independent_tasks_publish_outputs_in_parallel() {
+    let harness = Harness::new();
+    let mut left = task("left", &[]);
+    left["outputs"] = json!([{"name":"summary","type":"json","path":"left.json"}]);
+    let mut right = task("right", &[]);
+    right["outputs"] = json!([{"name":"summary","type":"json","path":"right.json"}]);
+    let plan = harness.plan_v3("parallel-outputs", json!([left, right]));
+    let state_path = harness.state("parallel-outputs");
+    run_document(&harness.run_json_jobs(&plan, &state_path, 2));
+    let state = read_state(&state_path);
+    assert_eq!(record(&state, "left")["status"], "succeeded");
+    assert_eq!(record(&state, "right")["status"], "succeeded");
+    assert_eq!(
+        record(&state, "left")["outputs"][0]["value"]["source"],
+        "fake"
+    );
+    assert_eq!(
+        record(&state, "right")["outputs"][0]["value"]["source"],
+        "fake"
+    );
+    assert_eq!(harness.requests().len(), 2);
+}
+#[test]
+fn json_null_output_survives_persistence_and_resume() {
+    let harness = Harness::new();
+    harness.configure(&[("null-output", "null_output")]);
+    let mut producer = task("null-output", &[]);
+    producer["outputs"] = json!([{"name":"summary","type":"json","path":"summary.json"}]);
+    let plan = harness.plan_v3("null-output", json!([producer]));
+    let state_path = harness.state("null-output");
+    run_document(&harness.run_json(&plan, &state_path));
+    let state = read_state(&state_path);
+    assert!(record(&state, "null-output")["outputs"][0]["value"].is_null());
+    let before = harness.requests().len();
+    let resumed = run_document(&harness.resume_json(&plan, &state_path));
+    assert!(resumed["data"]["run"]["tasks"][0]["outputs"][0]["value"].is_null());
+    assert_eq!(harness.requests().len(), before);
+}
 fn run_document(output: &Output) -> Value {
     assert!(
         output.stderr.is_empty(),
@@ -574,6 +1078,11 @@ fn downgrade_to_v1(path: &Path) {
 
 fn downgrade_to_v2(path: &Path) {
     downgrade_to_version(path, 2);
+}
+fn downgrade_to_v3(path: &Path) {
+    let mut state = read_state(path);
+    state["schema_version"] = json!(3);
+    fs::write(path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
 }
 
 fn wait_for_retry_pending(path: &Path, id: &str) {
@@ -2044,7 +2553,7 @@ fn persistence_failure_during_cancellation_drains_two_active_workers() {
     let error = error_document(&terminate(child));
     assert_eq!(error["error"]["code"], "run_state_invalid");
     let state = read_state(&state_path);
-    assert_eq!(state["schema_version"], 3);
+    assert_eq!(state["schema_version"], 4);
     assert_eq!(state["jobs"], 2);
     assert_eq!(state["status"], "cancelled");
     assert_eq!(state["cancellation_requested"], true);
@@ -2098,7 +2607,7 @@ fn persistence_failure_after_one_completion_drains_remaining_worker() {
     let error = error_document(&child.wait_with_output().unwrap());
     assert_eq!(error["error"]["code"], "run_state_invalid");
     let state = read_state(&state_path);
-    assert_eq!(state["schema_version"], 3);
+    assert_eq!(state["schema_version"], 4);
     assert_eq!(state["jobs"], 2);
     assert_eq!(record(&state, "first")["status"], "succeeded");
     assert_eq!(record(&state, "second")["status"], "cancelled");
@@ -2188,13 +2697,34 @@ fn migrates_clean_v1_state_and_resumes_pending_work() {
     run_document(&harness.resume_json(&plan, &state_path));
 
     let migrated = read_state(&state_path);
-    assert_eq!(migrated["schema_version"], 3);
+    assert_eq!(migrated["schema_version"], 4);
     assert_eq!(migrated["jobs"], 1);
     assert_eq!(record(&migrated, "waiting")["status"], "cancelled");
     assert_eq!(record(&migrated, "later")["status"], "succeeded");
     assert_eq!(request_names(&harness.requests()), ["waiting", "later"]);
 }
 
+#[test]
+fn migrates_v3_retry_history_without_dropping_attempts() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("flaky-v3", &["nonzero", "success"])]);
+    let plan = harness.plan_v2(
+        "v3-retry-history",
+        json!([retry_task("flaky-v3", &[], 2, 0)]),
+    );
+    let state_path = harness.state("v3-retry-history");
+    run_document(&harness.run_json(&plan, &state_path));
+    assert_eq!(attempts(&read_state(&state_path), "flaky-v3").len(), 2);
+    downgrade_to_v3(&state_path);
+    assert_eq!(read_state(&state_path)["schema_version"], 3);
+    let before_resume = harness.requests().len();
+    harness.configure(&[]);
+    run_document(&harness.resume_json(&plan, &state_path));
+    let migrated = read_state(&state_path);
+    assert_eq!(migrated["schema_version"], 4);
+    assert_eq!(attempts(&migrated, "flaky-v3").len(), 2);
+    assert_eq!(harness.requests().len(), before_resume);
+}
 #[test]
 fn migrates_clean_v2_state_and_resumes_pending_work() {
     let harness = Harness::new();
@@ -2213,7 +2743,7 @@ fn migrates_clean_v2_state_and_resumes_pending_work() {
     harness.configure(&[]);
     run_document(&harness.resume_json(&plan, &state_path));
     let migrated = read_state(&state_path);
-    assert_eq!(migrated["schema_version"], 3);
+    assert_eq!(migrated["schema_version"], 4);
     assert_eq!(attempts(&migrated, "waiting").len(), 1);
     assert_eq!(record(&migrated, "later")["status"], "succeeded");
 }
@@ -2442,7 +2972,7 @@ fn successful_state_has_unique_attempt_identities_and_sanitizes_secrets() {
 
     let state: Value = serde_json::from_str(&persisted).unwrap();
     assert_eq!(document["data"]["run"], state);
-    assert_eq!(state["schema_version"], 3);
+    assert_eq!(state["schema_version"], 4);
     assert_eq!(state["jobs"], 1);
     assert_eq!(state["status"], "completed");
     let first = record(&state, "first");

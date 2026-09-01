@@ -1283,7 +1283,14 @@ fn build_request(
         arguments: args.program_and_args[1..].to_vec(),
         redact_argument_indexes: sorted,
         working_directory: working_directory.to_owned(),
-        environment: Vec::new(),
+        environment: args
+            .relay_environment
+            .iter()
+            .map(|(name, value)| EnvironmentVariable {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
         timeout_ms: args.timeout_ms,
         termination_grace_ms: args.termination_grace_ms,
         stdout_limit_bytes: args.stdout_limit_bytes,
@@ -2732,6 +2739,7 @@ mod tests {
             stderr_limit_bytes: 1 << 20,
             log_limit_bytes: 64 << 10,
             redact_argument_indexes: vec![],
+            relay_environment: vec![],
             program_and_args: vec!["/usr/bin/true".into()],
         };
         let error = build_request(&args, Path::new("/tmp")).unwrap_err();

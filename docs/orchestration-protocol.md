@@ -26,7 +26,7 @@ output schema version, and on-disk state schema version are independent:
 - `protocol_version: 1` identifies this orchestration contract.
 - `relay_version` identifies the Relay binary that reported it.
 - `output_schema_version: 1` identifies Relay's success and error envelopes.
-- aggregate run-state schema_version: 3 identifies the Rust-owned DAG state schema with bounded retry history; immutable protocol manifest remains v1.
+- aggregate run-state schema_version: 4 identifies the Rust-owned DAG state schema with bounded retry history and task-output provenance; immutable protocol manifest remains v1.
 
 `relay protocol` is project-independent. Global options may precede or follow
 the subcommand, and even `--scope repository` does not trigger repository
@@ -155,7 +155,7 @@ working directory unless that task supplies an absolute one. Every task is
 launched by direct argv: `program` and each `arguments` element remain separate
 OS arguments and are never parsed, interpolated, or evaluated by a shell.
 
-### Closed plan v1 and v2
+### Closed plan v1, v2, and v3
 
 Plan JSON is a closed schema that rejects unknown fields:
 
@@ -182,17 +182,66 @@ and `redact_argument_indexes` (at most 32 valid, unique indexes whose declared
 values total at most 64 KiB). All other numeric limits have a minimum of one.
 Schema v2 retry policy has `max_attempts` from
 1 through 10, including the initial attempt, and `delay_ms` from 0 through
-86,400,000. Missing `retry` means no retry. The plan document is bounded to
-1 MiB and NUL bytes are rejected in executable, working-directory, and argument
-strings.
+86,400,000. Missing `retry` means no retry. Plan schema v3 additionally
+allows typed `outputs` and explicit `inputs`; the plan document is bounded to
+1 MiB and NUL bytes are rejected in executable, working-directory, argument,
+output, and input strings.
+
+### Structured task outputs
+
+Plan schema v3 output declarations are an ordered array of closed objects:
+`{"name": "summary", "type": "json", "path": "summary.json"}` or
+`type: "file"`. Names are lowercase ASCII environment-safe identifiers.
+Paths are relative normal components only; Relay rejects traversal, absolute
+paths, symlinked components, and unsafe hardlinks. Relay creates
+`<project>/.relay/runs/outputs/<attempt-run-id>/`, then passes each actual path
+to the child as one `RELAY_OUTPUT_MANIFEST` JSON map from exact output names to
+paths through existing explicit environment request fields. Relay never reads human stdout as task data.
+
+JSON output is parsed, re-encoded, and bounded to 2 KiB. File outputs are not
+copied into state: Relay records path, size, SHA-256, producer task, aggregate
+run ID, attempt number, and attempt run ID after hashing at most 64 MiB. At most
+four outputs and four inputs are allowed per task; the output manifest is
+bounded to 4 KiB. Aggregate state remains bounded by the existing 4 MiB
+encoded-state limit; a regression test covers maximum structured metadata.
+
+Durability sequence is deliberate: Rust persists the running attempt identity;
+Relay prepares its attempt output directory; Go runs one child and durably writes
+its terminal record; Rust accepts only a matching successful terminal result;
+Rust opens declared files without following final symlinks, checks regular-file
+and link-count identity, hashes and validates them; Rust atomically persists
+output records with the terminal attempt. A crash before the final write leaves
+outputs unpromoted. Resume validates the same supervisor result and files, then
+promotes once without rerunning. Missing, malformed, changed, stale, failed,
+cancelled, timed-out, indeterminate, or mismatched evidence remains untrusted.
+
+Consumers declare ordered `inputs` such as
+`{"from_task":"inspect","output":"summary","as":"--summary"}`.
+Producer task/output must exist, be a direct or transitive dependency, and have
+a trusted successful record. JSON becomes one deterministic argv value; file
+outputs become their revalidated absolute path. There is no implicit namespace,
+filesystem guessing, shell expansion, expression language, upload, or artifact
+store.
+### Real repository validation example
+
+Local smoke used schema-v3 `inspect -> test -> summarize` tasks in a Relay
+checkout. `inspect` ran `/usr/bin/git status --short` and produced bounded JSON;
+`test` ran `/usr/bin/cargo test --lib --all-features` and produced a report
+artifact; `summarize` consumed both through explicit inputs. Actual Go supervisor
+run completed with three trusted outputs. Resume completed in 0.04 seconds with
+no task rerun. Separate real retry run recorded attempt 1 failed with no output
+record and attempt 2 succeeded with the only task output. A paused terminal Go
+success was followed by coordinator kill; resume reported reconciliation
+`completed`, promoted the JSON output, and the producer counter remained one.
+
 
 ### Aggregate and attempt state ownership
 
-Aggregate run-state v3 is a closed Rust schema. By default Rust atomically
+Aggregate run-state v4 is a closed Rust schema. By default Rust atomically
 persists it at `<project>/.relay/runs/<run-uuid>.json`; `--state-path` selects
 an absolute custom path, which remains Rust-owned. Valid aggregate v1 records
 omit `jobs` and imply sequential `jobs: 1`; v2 records include `jobs` but
-no retry history. Clean v1/v2 records migrate to v3 on safe resume. Running
+no retry history. Clean v1/v2/v3 records migrate to v4 on safe resume. Running
 records are reconciled from strict Go evidence before scheduling; unresolved
 running and indeterminate records remain non-resumable.
 Custom paths containing a `.relay` component are accepted only beneath the
@@ -203,9 +252,8 @@ compact JSON; retained failure codes are capped at 64 bytes and messages at
 256 bytes. Attempt reasons retain only termination classifications, avoiding
 large diagnostic duplication; the maximum valid 64-task, ten-attempt history
 is covered by a size-bound regression test below 4 MiB.
-The bound is additive: 1,048,576-byte plan cap plus 1,805,320-byte fixed
-per-task/attempt overhead equals 2,853,896 bytes, below the 4,194,304-byte
-aggregate cap.
+The 4 MiB aggregate cap remains enforced after bounded output metadata is added;
+the maximum structured-output state is covered by a dedicated regression test.
 
 Run status is one of `running`, `completed`, `failed`, `cancelled`, or
 `indeterminate`; task status is one of `pending`, `running`, `succeeded`,
@@ -218,10 +266,11 @@ and bounded execution summary. Closed decoding and resume validation reject
 unknown fields, malformed history, and inconsistent aggregate/task state.
 
 Arguments selected by `redact_argument_indexes` are stored as `<redacted>`;
-raw declared values are not copied into aggregate state. Before every launch,
+redacted argument values are not copied into aggregate state. Before every launch,
 Rust persists `running` plus a fresh attempt UUID and Go record path. A clean
-typed supervisor response is persisted in its attempt history; no captured
-stream text or environment values enter aggregate state.
+typed supervisor response is persisted in its attempt history. Captured stdout,
+stderr, and unrequested environment values remain excluded; declared structured
+values and bounded artifact metadata enter state only after output validation.
 
 Each attempt's Go-owned record is under
 `${TMPDIR}/relay/supervisor/<attempt-uuid>.json`. Validation guarantees that

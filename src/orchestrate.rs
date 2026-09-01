@@ -7,8 +7,10 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-#[cfg(any(debug_assertions, not(target_os = "linux")))]
+use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
+#[cfg(all(unix, not(target_os = "linux")))]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     env,
@@ -30,10 +32,12 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const PLAN_SCHEMA_VERSION: u32 = 2;
+const PLAN_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_PLAN_SCHEMA_VERSION: u32 = 2;
 const LEGACY_PLAN_SCHEMA_VERSION: u32 = 1;
-const RUN_STATE_SCHEMA_VERSION: u32 = 3;
-const PREVIOUS_RUN_STATE_SCHEMA_VERSION: u32 = 2;
+const RUN_STATE_SCHEMA_VERSION: u32 = 4;
+const PREVIOUS_RUN_STATE_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_PREVIOUS_RUN_STATE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_RUN_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_PLAN_BYTES: u64 = 1 << 20;
 const MAX_STATE_BYTES: u64 = 4 << 20;
@@ -49,6 +53,13 @@ const MAX_SUMMARY_MESSAGE_BYTES: usize = 256;
 const MAX_RETRY_ATTEMPTS: u32 = 10;
 const MAX_RETRY_DELAY_MS: u64 = 24 * 60 * 60 * 1000;
 const RETRY_POLL_INTERVAL_MS: u64 = 10;
+const MAX_OUTPUTS_PER_TASK: usize = 4;
+const MAX_OUTPUT_NAME_BYTES: usize = 64;
+const MAX_STRUCTURED_OUTPUT_BYTES: usize = 2 * 1024;
+const MAX_ARTIFACT_PATH_BYTES: usize = 512;
+const MAX_ARTIFACT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ARTIFACT_METADATA_BYTES: usize = 2 * 1024;
+const MAX_OUTPUT_MANIFEST_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +143,31 @@ impl RunError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputType {
+    Json,
+    File,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OutputDeclaration {
+    name: String,
+    #[serde(rename = "type")]
+    output_type: OutputType,
+    path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OutputInput {
+    from_task: String,
+    output: String,
+    #[serde(rename = "as")]
+    argument: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct Plan {
     schema_version: u32,
@@ -165,6 +201,10 @@ struct PlanTask {
         skip_serializing_if = "Option::is_none"
     )]
     retry: Option<RetryPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    outputs: Vec<OutputDeclaration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inputs: Vec<OutputInput>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -208,7 +248,43 @@ where
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+struct PlanTaskV2 {
+    id: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    program: String,
+    #[serde(default)]
+    arguments: Vec<String>,
+    working_directory: Option<String>,
+    timeout_ms: i64,
+    #[serde(default = "default_grace_ms")]
+    termination_grace_ms: i64,
+    #[serde(default = "default_output_limit")]
+    stdout_limit_bytes: i64,
+    #[serde(default = "default_output_limit")]
+    stderr_limit_bytes: i64,
+    #[serde(default = "default_log_limit")]
+    log_limit_bytes: i64,
+    #[serde(default)]
+    redact_argument_indexes: Vec<usize>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_retry_policy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    retry: Option<RetryPolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 struct PlanV2 {
+    schema_version: u32,
+    tasks: Vec<PlanTaskV2>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PlanV3 {
     schema_version: u32,
     tasks: Vec<PlanTask>,
 }
@@ -228,6 +304,8 @@ impl From<PlanTaskV1> for PlanTask {
             log_limit_bytes: task.log_limit_bytes,
             redact_argument_indexes: task.redact_argument_indexes,
             retry: None,
+            outputs: Vec::new(),
+            inputs: Vec::new(),
         }
     }
 }
@@ -238,6 +316,26 @@ impl<'de> Deserialize<'de> for Plan {
         D: serde::Deserializer<'de>,
     {
         decode_plan_value(Value::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+impl From<PlanTaskV2> for PlanTask {
+    fn from(task: PlanTaskV2) -> Self {
+        Self {
+            id: task.id,
+            depends_on: task.depends_on,
+            program: task.program,
+            arguments: task.arguments,
+            working_directory: task.working_directory,
+            timeout_ms: task.timeout_ms,
+            termination_grace_ms: task.termination_grace_ms,
+            stdout_limit_bytes: task.stdout_limit_bytes,
+            stderr_limit_bytes: task.stderr_limit_bytes,
+            log_limit_bytes: task.log_limit_bytes,
+            redact_argument_indexes: task.redact_argument_indexes,
+            retry: task.retry,
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+        }
     }
 }
 
@@ -261,10 +359,17 @@ fn decode_plan_value(value: Value) -> Result<Plan, String> {
                 tasks: plan.tasks.into_iter().map(Into::into).collect(),
             })
         }
+        version if version == u64::from(PREVIOUS_PLAN_SCHEMA_VERSION) => {
+            let plan: PlanV2 = serde_json::from_value(value)
+                .map_err(|error| format!("invalid plan schema_version {version}: {error}"))?;
+            Ok(Plan {
+                schema_version: plan.schema_version,
+                tasks: plan.tasks.into_iter().map(Into::into).collect(),
+            })
+        }
         version if version == u64::from(PLAN_SCHEMA_VERSION) => {
-            let plan: PlanV2 = serde_json::from_value(value).map_err(|error| {
-                format!("invalid plan schema_version {PLAN_SCHEMA_VERSION}: {error}")
-            })?;
+            let plan: PlanV3 = serde_json::from_value(value)
+                .map_err(|error| format!("invalid plan schema_version {version}: {error}"))?;
             Ok(Plan {
                 schema_version: plan.schema_version,
                 tasks: plan.tasks,
@@ -384,6 +489,8 @@ pub struct TaskRecord {
     pub attempt_run_id: Option<String>,
     pub supervisor_state_path: Option<String>,
     pub summary: Option<ExecutionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Vec<OutputRecord>>,
     pub attempts: Vec<AttemptRecord>,
     pub retry_ready_at: Option<String>,
 }
@@ -407,6 +514,25 @@ pub struct AttemptRecord {
     pub status: AttemptStatus,
     pub reason: Option<String>,
     pub summary: Option<ExecutionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Vec<OutputRecord>>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputRecord {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub output_type: OutputType,
+    pub path: String,
+    pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    pub value: Value,
+    pub run_id: String,
+    pub producer_task: String,
+    pub attempt: u32,
+    pub attempt_run_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -468,6 +594,60 @@ struct LegacyTaskRecord {
     summary: Option<ExecutionSummary>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptRecordV3 {
+    attempt: u32,
+    run_id: String,
+    supervisor_state_path: String,
+    status: AttemptStatus,
+    reason: Option<String>,
+    summary: Option<ExecutionSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskRecordV3 {
+    id: String,
+    status: TaskStatus,
+    reason: Option<String>,
+    attempt_run_id: Option<String>,
+    supervisor_state_path: Option<String>,
+    summary: Option<ExecutionSummary>,
+    attempts: Vec<AttemptRecordV3>,
+    retry_ready_at: Option<String>,
+}
+
+impl From<AttemptRecordV3> for AttemptRecord {
+    fn from(attempt: AttemptRecordV3) -> Self {
+        Self {
+            attempt: attempt.attempt,
+            run_id: attempt.run_id,
+            supervisor_state_path: attempt.supervisor_state_path,
+            status: attempt.status,
+            reason: attempt.reason,
+            summary: attempt.summary,
+            outputs: None,
+        }
+    }
+}
+
+impl From<TaskRecordV3> for TaskRecord {
+    fn from(task: TaskRecordV3) -> Self {
+        Self {
+            id: task.id,
+            status: task.status,
+            reason: task.reason,
+            attempt_run_id: task.attempt_run_id,
+            supervisor_state_path: task.supervisor_state_path,
+            summary: task.summary,
+            outputs: None,
+            attempts: task.attempts.into_iter().map(Into::into).collect(),
+            retry_ready_at: task.retry_ready_at,
+        }
+    }
+}
+
 pub struct RunResult {
     pub output: RunOutput,
     pub status: RunStatus,
@@ -512,6 +692,7 @@ fn reset_task_to_pending(task: &mut TaskRecord) {
     task.attempt_run_id = None;
     task.supervisor_state_path = None;
     task.summary = None;
+    task.outputs = None;
     task.retry_ready_at = None;
 }
 
@@ -533,6 +714,7 @@ fn mark_task_indeterminate(task: &mut TaskRecord, reason: String) {
     task.status = TaskStatus::Indeterminate;
     task.reason = Some(reason.clone());
     task.summary = None;
+    task.outputs = None;
     task.retry_ready_at = None;
     if let Some(attempt) = task.attempts.last_mut()
         && attempt.status == AttemptStatus::Running
@@ -547,6 +729,7 @@ fn complete_attempt(
     status: AttemptStatus,
     reason: Option<String>,
     summary: Option<ExecutionSummary>,
+    outputs: Option<Vec<OutputRecord>>,
 ) -> bool {
     let Some(attempt) = task.attempts.last_mut() else {
         return false;
@@ -557,6 +740,7 @@ fn complete_attempt(
     attempt.status = status;
     attempt.reason = reason;
     attempt.summary = summary;
+    attempt.outputs = outputs;
     true
 }
 
@@ -654,6 +838,7 @@ fn apply_completion(
     state: &mut RunState,
     completion: TaskCompletion,
     coordinator_cancelled: bool,
+    project_root: &Path,
 ) -> Option<SupervisorError> {
     if completion.index >= state.tasks.len() {
         return Some(SupervisorError::Transport(io::Error::other(
@@ -666,11 +851,61 @@ fn apply_completion(
     match completion.result {
         Ok(result) => {
             let execution = result.execution;
+            if !state.tasks[completion.index]
+                .attempts
+                .last()
+                .is_some_and(|attempt| {
+                    attempt.status == AttemptStatus::Running && attempt.run_id == execution.run_id
+                })
+            {
+                let source = SupervisorError::Transport(io::Error::other(
+                    "task completion did not match its attempt identity",
+                ));
+                mark_task_indeterminate(
+                    &mut state.tasks[completion.index],
+                    truncate(&source.to_string(), MAX_SUMMARY_MESSAGE_BYTES),
+                );
+                return Some(source);
+            }
             let execution_cancelled = execution_was_cancelled(&execution);
-            let succeeded = execution.task_succeeded();
+            let execution_succeeded = execution.task_succeeded();
+            let (outputs, output_error) =
+                if execution_succeeded && !plan.tasks[completion.index].outputs.is_empty() {
+                    match state.tasks[completion.index].attempts.last() {
+                        Some(attempt) => {
+                            match finalize_outputs(
+                                project_root,
+                                &state.run_id,
+                                &plan.tasks[completion.index],
+                                attempt,
+                            ) {
+                                Ok(outputs) => (Some(outputs), None),
+                                Err(error) => (None, Some(error)),
+                            }
+                        }
+                        None => (
+                            None,
+                            Some("successful completion has no attempt record".into()),
+                        ),
+                    }
+                } else {
+                    (None, None)
+                };
+            let succeeded = execution_succeeded && output_error.is_none();
             let summary = summarize(&execution);
-            let reason = (!succeeded).then(|| result_reason(&execution)).flatten();
-            let attempt_status = if succeeded {
+            let reason = if let Some(error) = output_error.as_deref() {
+                Some(truncate(
+                    &format!("output finalization refused: {error}"),
+                    MAX_SUMMARY_MESSAGE_BYTES,
+                ))
+            } else if !execution_succeeded {
+                result_reason(&execution)
+            } else {
+                None
+            };
+            let attempt_status = if output_error.is_some() {
+                AttemptStatus::Indeterminate
+            } else if succeeded {
                 AttemptStatus::Succeeded
             } else if execution_cancelled {
                 AttemptStatus::Cancelled
@@ -681,7 +916,8 @@ fn apply_completion(
                 &mut state.tasks[completion.index],
                 attempt_status,
                 reason.clone(),
-                Some(summary.clone()),
+                (attempt_status != AttemptStatus::Indeterminate).then(|| summary.clone()),
+                outputs.clone(),
             ) {
                 let source = SupervisorError::Transport(io::Error::other(
                     "task completion did not match a running attempt",
@@ -709,9 +945,15 @@ fn apply_completion(
             let task = &mut state.tasks[completion.index];
             task.retry_ready_at = None;
             task.summary = Some(summary);
+            task.outputs = outputs.clone();
             if succeeded {
                 task.status = TaskStatus::Succeeded;
                 task.reason = None;
+            } else if output_error.is_some() {
+                task.status = TaskStatus::Indeterminate;
+                task.reason = reason.clone();
+                task.summary = None;
+                task.outputs = None;
             } else if execution_cancelled {
                 task.status = TaskStatus::Cancelled;
                 task.reason = reason;
@@ -721,6 +963,7 @@ fn apply_completion(
                 task.attempt_run_id = None;
                 task.supervisor_state_path = None;
                 task.summary = None;
+                task.outputs = None;
                 task.retry_ready_at = Some(retry_ready_at(delay_ms));
             } else {
                 task.status = TaskStatus::Failed;
@@ -907,7 +1150,13 @@ fn shutdown_and_drain(
         }
         match completion {
             Some(completion) if !uncertain_tasks.contains(&index) => {
-                if let Some(source) = apply_completion(plan, state, completion, true) {
+                if let Some(source) = apply_completion(
+                    plan,
+                    state,
+                    completion,
+                    true,
+                    &project_root_for_state_path(&state.state_path),
+                ) {
                     record_shutdown_failure(
                         &mut cleanup_source,
                         &mut uncertain_tasks,
@@ -1003,6 +1252,7 @@ fn reconcile_running_attempts(
     state: &mut RunState,
     store: &mut StateStore,
     invocation_directory: &Path,
+    project_root: &Path,
     coordinator_cancelled: bool,
 ) -> Result<Vec<ReconciliationReport>, RunError> {
     let indexes: Vec<usize> = state
@@ -1039,12 +1289,15 @@ fn reconcile_running_attempts(
             });
             continue;
         }
+        let arguments = resolve_task_arguments(plan, state, index, project_root)?;
         let supervise_args = task_supervise_args(
             &args.supervisor,
             &plan.tasks[index],
             attempt_run_id.clone(),
             attempt_state_path.clone(),
-        );
+            &arguments,
+            project_root,
+        )?;
         match supervise::inspect_attempt(&supervise_args, invocation_directory) {
             supervise::AttemptInspection::Completed(execution) => {
                 let execution = *execution;
@@ -1099,7 +1352,9 @@ fn reconcile_running_attempts(
                 execution,
             }),
         };
-        if let Some(source) = apply_completion(plan, state, completion, coordinator_cancelled) {
+        if let Some(source) =
+            apply_completion(plan, state, completion, coordinator_cancelled, project_root)
+        {
             blocked = true;
             let reason = truncate(&source.to_string(), MAX_SUMMARY_MESSAGE_BYTES);
             mark_task_indeterminate(&mut state.tasks[index], reason.clone());
@@ -1210,9 +1465,15 @@ pub fn run(
         state = store.read()?;
         resolve_working_directories(&mut plan, invocation_directory, Some(&state.plan))?;
         validate_plan(&plan, invocation_directory)?;
-        preflight_tasks(&args.supervisor, &plan, &attempts, invocation_directory)?;
+        preflight_tasks(
+            &args.supervisor,
+            &plan,
+            &attempts,
+            invocation_directory,
+            project_root,
+        )?;
         let sanitized_plan = sanitize_plan(&plan);
-        validate_resume_state(&state, &sanitized_plan, store.path())?;
+        validate_resume_state(&state, &sanitized_plan, store.path(), project_root)?;
         let coordinator_cancelled = state.cancellation_requested;
         state.cancellation_requested = false;
         state.jobs = args.jobs;
@@ -1222,12 +1483,19 @@ pub fn run(
             &mut state,
             &mut store,
             invocation_directory,
+            project_root,
             coordinator_cancelled,
         )?;
     } else {
         resolve_working_directories(&mut plan, invocation_directory, None)?;
         validate_plan(&plan, invocation_directory)?;
-        preflight_tasks(&args.supervisor, &plan, &attempts, invocation_directory)?;
+        preflight_tasks(
+            &args.supervisor,
+            &plan,
+            &attempts,
+            invocation_directory,
+            project_root,
+        )?;
         ensure_state_parent(&requested_state_path)?;
         validate_state_path(&requested_state_path, project_root)?;
         store = StateStore::open(&requested_state_path, false)?;
@@ -1252,6 +1520,7 @@ pub fn run(
                     attempt_run_id: None,
                     supervisor_state_path: None,
                     summary: None,
+                    outputs: None,
                     attempts: Vec::new(),
                     retry_ready_at: None,
                 })
@@ -1367,6 +1636,7 @@ pub fn run(
                 status: AttemptStatus::Running,
                 reason: None,
                 summary: None,
+                outputs: None,
             });
             state.tasks[index].status = TaskStatus::Running;
             state.tasks[index].reason = None;
@@ -1425,31 +1695,65 @@ pub fn run(
                 break;
             }
 
-            let supervise_args = task_supervise_args(
+            let arguments = match resolve_task_arguments(&plan, &state, index, project_root) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    mark_task_indeterminate(
+                        &mut state.tasks[index],
+                        truncate(&error.to_string(), MAX_SUMMARY_MESSAGE_BYTES),
+                    );
+                    continue;
+                }
+            };
+            let supervise_args = match task_supervise_args(
                 &args.supervisor,
                 task,
                 attempt_run_id.clone(),
                 supervisor_state_path.clone(),
-            );
+                &arguments,
+                project_root,
+            ) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    mark_task_indeterminate(
+                        &mut state.tasks[index],
+                        truncate(&error.to_string(), MAX_SUMMARY_MESSAGE_BYTES),
+                    );
+                    continue;
+                }
+            };
             let sender = completed_sender.clone();
             let coordinator_for_task = Arc::clone(&coordinator);
+            let output_task = task.clone();
+            let output_project_root = project_root.to_owned();
+            let output_attempt_run_id = attempt_run_id.clone();
             let invocation_directory = invocation_directory.to_owned();
             let task_id = task.id.clone();
             let worker = thread::Builder::new()
                 .name(format!("relay-task-{task_id}"))
                 .spawn(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        supervise::execute_coordinated(
-                            supervise_args,
-                            &invocation_directory,
-                            &coordinator_for_task,
-                        )
-                    }))
-                    .unwrap_or_else(|_| {
+                    let result = if let Err(error) = prepare_output_paths(
+                        &output_project_root,
+                        &output_attempt_run_id,
+                        &output_task,
+                    ) {
                         Err(SupervisorError::Transport(io::Error::other(
-                            "supervisor worker panicked",
+                            error.to_string(),
                         )))
-                    });
+                    } else {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            supervise::execute_coordinated(
+                                supervise_args,
+                                &invocation_directory,
+                                &coordinator_for_task,
+                            )
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(SupervisorError::Transport(io::Error::other(
+                                "supervisor worker panicked",
+                            )))
+                        })
+                    };
                     let _ = sender.send(TaskCompletion { index, result });
                 });
             let worker = match worker {
@@ -1559,8 +1863,13 @@ pub fn run(
         }
 
         let coordinator_cancelled = coordinator.cancellation_requested();
-        if let Some(source) = apply_completion(&plan, &mut state, completion, coordinator_cancelled)
-            && boundary_error.is_none()
+        if let Some(source) = apply_completion(
+            &plan,
+            &mut state,
+            completion,
+            coordinator_cancelled,
+            project_root,
+        ) && boundary_error.is_none()
         {
             boundary_error = Some(source);
         }
@@ -1639,14 +1948,452 @@ fn resolve_working_directories(
     }
     Ok(())
 }
+fn attempt_output_root(project_root: &Path, attempt_run_id: &str) -> PathBuf {
+    project_root
+        .join(".relay")
+        .join("runs")
+        .join("outputs")
+        .join(attempt_run_id)
+}
+
+fn declared_output_path(
+    project_root: &Path,
+    attempt_run_id: &str,
+    declaration: &OutputDeclaration,
+) -> PathBuf {
+    attempt_output_root(project_root, attempt_run_id).join(&declaration.path)
+}
+
+fn output_environment(
+    project_root: &Path,
+    attempt_run_id: &str,
+    task: &PlanTask,
+) -> Result<Vec<(String, String)>, RunError> {
+    if task.outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut manifest = serde_json::Map::new();
+    for declaration in &task.outputs {
+        let path = declared_output_path(project_root, attempt_run_id, declaration);
+        let path = path.to_str().ok_or_else(|| {
+            RunError::Plan(format!(
+                "task {:?} output path must be valid UTF-8",
+                task.id
+            ))
+        })?;
+        manifest.insert(declaration.name.clone(), Value::String(path.to_owned()));
+    }
+    let value = serde_json::to_string(&Value::Object(manifest))
+        .map_err(|error| RunError::Plan(format!("output manifest cannot be encoded: {error}")))?;
+    if value.len() > MAX_OUTPUT_MANIFEST_BYTES {
+        return Err(RunError::Plan(format!(
+            "task {:?} output manifest exceeds {MAX_OUTPUT_MANIFEST_BYTES} bytes",
+            task.id
+        )));
+    }
+    Ok(vec![("RELAY_OUTPUT_MANIFEST".into(), value)])
+}
+
+fn prepare_output_paths(
+    project_root: &Path,
+    attempt_run_id: &str,
+    task: &PlanTask,
+) -> Result<(), RunError> {
+    let root = attempt_output_root(project_root, attempt_run_id);
+    let output_parent = project_root.join(".relay").join("runs").join("outputs");
+    reject_symlinked_components(&output_parent)
+        .map_err(|error| RunError::Plan(error.to_string()))?;
+    fs::create_dir_all(&root).map_err(|error| {
+        RunError::Plan(format!(
+            "could not create task output directory {}: {error}",
+            root.display()
+        ))
+    })?;
+    reject_symlinked_components(&root).map_err(|error| RunError::Plan(error.to_string()))?;
+    for declaration in &task.outputs {
+        let path = declared_output_path(project_root, attempt_run_id, declaration);
+        let parent = path.parent().expect("declared output path has a parent");
+        reject_symlinked_components(parent).map_err(|error| RunError::Plan(error.to_string()))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            RunError::Plan(format!(
+                "could not create task output directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        reject_symlinked_components(parent).map_err(|error| RunError::Plan(error.to_string()))?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(RunError::Plan(format!(
+                    "task {:?} output path already exists: {}",
+                    task.id, declaration.path
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(RunError::Plan(format!(
+                    "could not inspect task output path {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+fn project_root_for_state_path(state_path: &str) -> PathBuf {
+    let path = Path::new(state_path);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.file_name() == Some(OsStr::new("runs"))
+        && parent.parent().and_then(Path::file_name) == Some(OsStr::new(".relay"))
+    {
+        parent
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| parent.to_path_buf())
+    } else {
+        parent.to_path_buf()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_output_file(path: &Path) -> io::Result<File> {
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output path has no parent"))?;
+    let parent =
+        open_parent_nofollow(parent_path).map_err(|error| io::Error::other(error.to_string()))?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "output path has no filename")
+    })?;
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "output filename contains NUL"))?;
+    openat(
+        &parent,
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        0,
+    )
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_output_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_output_file(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = digest.as_ref();
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        result.push(HEX[usize::from(*byte >> 4)] as char);
+        result.push(HEX[usize::from(*byte & 0x0f)] as char);
+    }
+    result
+}
+
+fn read_hashed_output(
+    path: &Path,
+    maximum: u64,
+    capture: bool,
+) -> Result<(Option<Vec<u8>>, u64, String), String> {
+    reject_symlinked_components(path).map_err(|error| error.to_string())?;
+    let mut file = open_output_file(path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not stat {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("output is not a regular file: {}", path.display()));
+    }
+    #[cfg(target_os = "linux")]
+    if metadata.nlink() != 1 {
+        return Err(format!(
+            "output has unsafe hardlink count: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > maximum {
+        return Err(format!(
+            "output exceeds {maximum} bytes: {}",
+            path.display()
+        ));
+    }
+    let mut bytes = capture.then(|| Vec::with_capacity(metadata.len() as usize));
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .ok_or_else(|| format!("output size overflow: {}", path.display()))?;
+        if total > maximum {
+            return Err(format!(
+                "output exceeds {maximum} bytes: {}",
+                path.display()
+            ));
+        }
+        hasher.update(&buffer[..count]);
+        if let Some(bytes) = &mut bytes {
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| format!("could not restat {}: {error}", path.display()))?;
+    #[cfg(target_os = "linux")]
+    if after.nlink() != 1 {
+        return Err(format!(
+            "output link count changed while it was read: {}",
+            path.display()
+        ));
+    }
+    if after.len() != total {
+        return Err(format!(
+            "output changed while it was read: {}",
+            path.display()
+        ));
+    }
+    Ok((bytes, total, hex_digest(hasher.finalize())))
+}
+
+fn finalize_outputs(
+    project_root: &Path,
+    aggregate_run_id: &str,
+    task: &PlanTask,
+    attempt: &AttemptRecord,
+) -> Result<Vec<OutputRecord>, String> {
+    let mut records = Vec::with_capacity(task.outputs.len());
+    for declaration in &task.outputs {
+        let path = declared_output_path(project_root, &attempt.run_id, declaration);
+        let (bytes, size_bytes, sha256) = match declaration.output_type {
+            OutputType::Json => {
+                read_hashed_output(&path, MAX_STRUCTURED_OUTPUT_BYTES as u64, true)?
+            }
+            OutputType::File => read_hashed_output(&path, MAX_ARTIFACT_FILE_BYTES, false)?,
+        };
+        let value = match declaration.output_type {
+            OutputType::Json => {
+                let bytes = bytes.ok_or_else(|| "structured output was not captured".to_owned())?;
+                let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                    format!(
+                        "structured output {:?} is invalid JSON: {error}",
+                        declaration.name
+                    )
+                })?;
+                if serde_json::to_vec(&value)
+                    .map_err(|error| error.to_string())?
+                    .len()
+                    > MAX_STRUCTURED_OUTPUT_BYTES
+                {
+                    return Err(format!(
+                        "structured output {:?} exceeds {MAX_STRUCTURED_OUTPUT_BYTES} bytes",
+                        declaration.name
+                    ));
+                }
+                value
+            }
+            OutputType::File => Value::Null,
+        };
+        let path = path
+            .to_str()
+            .ok_or_else(|| "output path is not valid UTF-8".to_owned())?
+            .to_owned();
+        let record = OutputRecord {
+            name: declaration.name.clone(),
+            output_type: declaration.output_type,
+            path,
+            size_bytes,
+            sha256: Some(sha256),
+            value,
+            run_id: aggregate_run_id.to_owned(),
+            producer_task: task.id.clone(),
+            attempt: attempt.attempt,
+            attempt_run_id: attempt.run_id.clone(),
+        };
+        if declaration.output_type == OutputType::File
+            && serde_json::to_vec(&record)
+                .map_err(|error| error.to_string())?
+                .len()
+                > MAX_ARTIFACT_METADATA_BYTES
+        {
+            return Err(format!(
+                "artifact metadata {:?} exceeds {MAX_ARTIFACT_METADATA_BYTES} bytes",
+                declaration.name
+            ));
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn validate_output_record(
+    project_root: &Path,
+    aggregate_run_id: &str,
+    producer: &PlanTask,
+    declaration: &OutputDeclaration,
+    record: &OutputRecord,
+) -> Result<(), String> {
+    let expected_path = declared_output_path(project_root, &record.attempt_run_id, declaration);
+    if record.name != declaration.name
+        || record.run_id != aggregate_run_id
+        || record.output_type != declaration.output_type
+        || record.producer_task != producer.id
+        || record.path != expected_path.to_str().unwrap_or_default()
+        || record.sha256.as_deref().is_none()
+    {
+        return Err(format!(
+            "output {:?} has mismatched provenance",
+            declaration.name
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_task_arguments(
+    plan: &Plan,
+    state: &RunState,
+    index: usize,
+    project_root: &Path,
+) -> Result<Vec<String>, RunError> {
+    let task = &plan.tasks[index];
+    let mut arguments = task.arguments.clone();
+    for input in &task.inputs {
+        let producer_index = plan
+            .tasks
+            .iter()
+            .position(|candidate| candidate.id == input.from_task)
+            .ok_or_else(|| {
+                RunError::State(format!("input producer {:?} is missing", input.from_task))
+            })?;
+        let producer = &plan.tasks[producer_index];
+        let declaration = producer
+            .outputs
+            .iter()
+            .find(|output| output.name == input.output)
+            .ok_or_else(|| {
+                RunError::State(format!("input output {:?} is missing", input.output))
+            })?;
+        let producer_record = &state.tasks[producer_index];
+        if producer_record.status != TaskStatus::Succeeded {
+            return Err(RunError::State(format!(
+                "input producer {:?} did not succeed",
+                input.from_task
+            )));
+        }
+        let latest = producer_record
+            .attempts
+            .last()
+            .filter(|attempt| attempt.status == AttemptStatus::Succeeded)
+            .ok_or_else(|| {
+                RunError::State(format!(
+                    "input producer {:?} has no successful attempt",
+                    input.from_task
+                ))
+            })?;
+        let output = producer_record
+            .outputs
+            .as_ref()
+            .and_then(|outputs| outputs.iter().find(|output| output.name == input.output))
+            .ok_or_else(|| {
+                RunError::State(format!("input output {:?} is not trusted", input.output))
+            })?;
+        if latest
+            .outputs
+            .as_ref()
+            .and_then(|outputs| {
+                outputs
+                    .iter()
+                    .find(|candidate| candidate.name == output.name)
+            })
+            .is_none_or(|candidate| {
+                candidate.attempt != output.attempt
+                    || candidate.attempt_run_id != output.attempt_run_id
+                    || candidate.path != output.path
+                    || candidate.sha256 != output.sha256
+            })
+        {
+            return Err(RunError::State(format!(
+                "input output {:?} has mismatched attempt provenance",
+                input.output
+            )));
+        }
+        validate_output_record(project_root, &state.run_id, producer, declaration, output)
+            .map_err(RunError::State)?;
+        let path = Path::new(&output.path);
+        let value = match output.output_type {
+            OutputType::Json => {
+                let (bytes, size, sha256) =
+                    read_hashed_output(path, MAX_STRUCTURED_OUTPUT_BYTES as u64, true)
+                        .map_err(RunError::State)?;
+                if size != output.size_bytes || output.sha256.as_deref() != Some(sha256.as_str()) {
+                    return Err(RunError::State(format!(
+                        "input output {:?} changed after production",
+                        input.output
+                    )));
+                }
+                let bytes = bytes
+                    .ok_or_else(|| RunError::State("structured input was not captured".into()))?;
+                let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                    RunError::State(format!(
+                        "input output {:?} is invalid JSON: {error}",
+                        input.output
+                    ))
+                })?;
+                if output.value != value {
+                    return Err(RunError::State(format!(
+                        "input output {:?} value changed after production",
+                        input.output
+                    )));
+                }
+                serde_json::to_string(&value).map_err(|error| {
+                    RunError::State(format!(
+                        "input output {:?} cannot be encoded: {error}",
+                        input.output
+                    ))
+                })?
+            }
+            OutputType::File => {
+                let (_, size, sha256) = read_hashed_output(path, MAX_ARTIFACT_FILE_BYTES, false)
+                    .map_err(RunError::State)?;
+                if size != output.size_bytes || output.sha256.as_deref() != Some(sha256.as_str()) {
+                    return Err(RunError::State(format!(
+                        "input artifact {:?} changed after production",
+                        input.output
+                    )));
+                }
+                output.path.clone()
+            }
+        };
+        arguments.push(input.argument.clone());
+        arguments.push(value);
+    }
+    Ok(arguments)
+}
 
 fn task_supervise_args(
     supervisor: &Option<PathBuf>,
     task: &PlanTask,
     run_id: String,
     state_path: PathBuf,
-) -> SuperviseArgs {
-    SuperviseArgs {
+    arguments: &[String],
+    project_root: &Path,
+) -> Result<SuperviseArgs, RunError> {
+    let relay_environment = output_environment(project_root, &run_id, task)?;
+    Ok(SuperviseArgs {
         supervisor: supervisor.clone(),
         run_id: Some(run_id),
         state_path: Some(state_path),
@@ -1657,10 +2404,11 @@ fn task_supervise_args(
         stderr_limit_bytes: task.stderr_limit_bytes,
         log_limit_bytes: task.log_limit_bytes,
         redact_argument_indexes: task.redact_argument_indexes.clone(),
+        relay_environment,
         program_and_args: std::iter::once(task.program.clone())
-            .chain(task.arguments.iter().cloned())
+            .chain(arguments.iter().cloned())
             .collect(),
-    }
+    })
 }
 
 fn preflight_tasks(
@@ -1668,9 +2416,20 @@ fn preflight_tasks(
     plan: &Plan,
     attempts: &[(String, PathBuf)],
     invocation_directory: &Path,
+    project_root: &Path,
 ) -> Result<(), RunError> {
     for (task, (run_id, state_path)) in plan.tasks.iter().zip(attempts) {
-        let request = task_supervise_args(supervisor, task, run_id.clone(), state_path.clone());
+        if !task.outputs.is_empty() {
+            prepare_output_paths(project_root, run_id, task)?;
+        }
+        let request = task_supervise_args(
+            supervisor,
+            task,
+            run_id.clone(),
+            state_path.clone(),
+            &task.arguments,
+            project_root,
+        )?;
         supervise::preflight(&request, invocation_directory).map_err(|error| {
             RunError::Plan(format!(
                 "task {:?} supervisor request is invalid: {error}",
@@ -1716,10 +2475,10 @@ fn test_pause(_point: &str) -> Result<(), RunError> {
 fn validate_plan(plan: &Plan, invocation_directory: &Path) -> Result<(), RunError> {
     if !matches!(
         plan.schema_version,
-        LEGACY_PLAN_SCHEMA_VERSION | PLAN_SCHEMA_VERSION
+        LEGACY_PLAN_SCHEMA_VERSION | PREVIOUS_PLAN_SCHEMA_VERSION | PLAN_SCHEMA_VERSION
     ) {
         return Err(RunError::Plan(format!(
-            "schema_version must be {LEGACY_PLAN_SCHEMA_VERSION} or {PLAN_SCHEMA_VERSION}"
+            "schema_version must be {LEGACY_PLAN_SCHEMA_VERSION}, {PREVIOUS_PLAN_SCHEMA_VERSION}, or {PLAN_SCHEMA_VERSION}"
         )));
     }
     if plan.schema_version == LEGACY_PLAN_SCHEMA_VERSION
@@ -1776,7 +2535,145 @@ fn validate_plan(plan: &Plan, invocation_directory: &Path) -> Result<(), RunErro
             }
         }
     }
+    validate_output_declarations(plan)?;
     validate_acyclic(plan)
+}
+
+fn validate_output_declarations(plan: &Plan) -> Result<(), RunError> {
+    let ids: HashSet<&str> = plan.tasks.iter().map(|task| task.id.as_str()).collect();
+    for task in &plan.tasks {
+        if plan.schema_version != PLAN_SCHEMA_VERSION
+            && (!task.outputs.is_empty() || !task.inputs.is_empty())
+        {
+            return Err(RunError::Plan(format!(
+                "task {:?} outputs and inputs require plan schema_version {PLAN_SCHEMA_VERSION}",
+                task.id
+            )));
+        }
+        if task.outputs.len() > MAX_OUTPUTS_PER_TASK {
+            return Err(RunError::Plan(format!(
+                "task {:?} declares more than {MAX_OUTPUTS_PER_TASK} outputs",
+                task.id
+            )));
+        }
+        let mut output_names = HashSet::with_capacity(task.outputs.len());
+        for output in &task.outputs {
+            if !valid_output_name(&output.name) {
+                return Err(RunError::Plan(format!(
+                    "task {:?} output name {:?} must match [a-z][a-z0-9_]{{0,63}}",
+                    task.id, output.name
+                )));
+            }
+            if !output_names.insert(output.name.as_str()) {
+                return Err(RunError::Plan(format!(
+                    "task {:?} has duplicate output name {:?}",
+                    task.id, output.name
+                )));
+            }
+            validate_text(&format!("task {:?} output path", task.id), &output.path)?;
+            validate_output_path(&task.id, &output.path)?;
+        }
+        if task.inputs.len() > MAX_OUTPUTS_PER_TASK {
+            return Err(RunError::Plan(format!(
+                "task {:?} declares more than {MAX_OUTPUTS_PER_TASK} inputs",
+                task.id
+            )));
+        }
+        for input in &task.inputs {
+            validate_text(
+                &format!("task {:?} input producer", task.id),
+                &input.from_task,
+            )?;
+            validate_text(&format!("task {:?} input output", task.id), &input.output)?;
+            validate_text(
+                &format!("task {:?} input argument", task.id),
+                &input.argument,
+            )?;
+            if input.argument.is_empty() {
+                return Err(RunError::Plan(format!(
+                    "task {:?} input argument is empty",
+                    task.id
+                )));
+            }
+            if !ids.contains(input.from_task.as_str()) {
+                return Err(RunError::Plan(format!(
+                    "task {:?} input references unknown task {:?}",
+                    task.id, input.from_task
+                )));
+            }
+            let producer = plan
+                .tasks
+                .iter()
+                .find(|candidate| candidate.id == input.from_task)
+                .expect("validated producer task id");
+            if !producer
+                .outputs
+                .iter()
+                .any(|output| output.name == input.output)
+            {
+                return Err(RunError::Plan(format!(
+                    "task {:?} input references unknown output {:?} from {:?}",
+                    task.id, input.output, input.from_task
+                )));
+            }
+            if !is_transitive_dependency(plan, &task.id, &input.from_task) {
+                return Err(RunError::Plan(format!(
+                    "task {:?} input producer {:?} is not a dependency",
+                    task.id, input.from_task
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_output_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_OUTPUT_NAME_BYTES
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
+fn validate_output_path(task_id: &str, value: &str) -> Result<(), RunError> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.len() > MAX_ARTIFACT_PATH_BYTES
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(RunError::Plan(format!(
+            "task {:?} output path must be a relative path of normal components",
+            task_id
+        )));
+    }
+    Ok(())
+}
+
+fn is_transitive_dependency(plan: &Plan, task_id: &str, producer_id: &str) -> bool {
+    let mut pending = vec![task_id];
+    let mut visited = HashSet::new();
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        let Some(task) = plan.tasks.iter().find(|task| task.id == current) else {
+            continue;
+        };
+        if task
+            .depends_on
+            .iter()
+            .any(|dependency| dependency == producer_id)
+        {
+            return true;
+        }
+        pending.extend(task.depends_on.iter().map(String::as_str));
+    }
+    false
 }
 
 fn validate_task(task: &PlanTask) -> Result<(), RunError> {
@@ -2688,7 +3585,9 @@ fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
                 ));
             }
         },
-        PREVIOUS_RUN_STATE_SCHEMA_VERSION | RUN_STATE_SCHEMA_VERSION => match jobs {
+        PREVIOUS_PREVIOUS_RUN_STATE_SCHEMA_VERSION
+        | PREVIOUS_RUN_STATE_SCHEMA_VERSION
+        | RUN_STATE_SCHEMA_VERSION => match jobs {
             JobsField::Value(jobs) if jobs > 0 => jobs,
             JobsField::Value(_) => {
                 return Err(RunError::State("jobs must be a positive integer".into()));
@@ -2706,9 +3605,22 @@ fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
         }
     };
     let tasks = match schema_version {
-        LEGACY_RUN_STATE_SCHEMA_VERSION | PREVIOUS_RUN_STATE_SCHEMA_VERSION => tasks
+        LEGACY_RUN_STATE_SCHEMA_VERSION | PREVIOUS_PREVIOUS_RUN_STATE_SCHEMA_VERSION => tasks
             .into_iter()
             .map(|value| decode_legacy_task(value, path))
+            .collect::<Result<Vec<_>, _>>()?,
+        PREVIOUS_RUN_STATE_SCHEMA_VERSION => tasks
+            .into_iter()
+            .map(|value| {
+                serde_json::from_value::<TaskRecordV3>(value)
+                    .map(Into::into)
+                    .map_err(|error| {
+                        RunError::State(format!(
+                            "could not decode v3 task in {}: {error}",
+                            path.display()
+                        ))
+                    })
+            })
             .collect::<Result<Vec<_>, _>>()?,
         RUN_STATE_SCHEMA_VERSION => tasks
             .into_iter()
@@ -2764,6 +3676,7 @@ fn decode_legacy_task(value: Value, path: &Path) -> Result<TaskRecord, RunError>
             status,
             reason: reason.clone(),
             summary: summary.clone(),
+            outputs: None,
         }],
         _ => Vec::new(),
     };
@@ -2774,6 +3687,7 @@ fn decode_legacy_task(value: Value, path: &Path) -> Result<TaskRecord, RunError>
         attempt_run_id,
         supervisor_state_path,
         summary,
+        outputs: None,
         attempts,
         retry_ready_at: None,
     })
@@ -2789,8 +3703,169 @@ fn attempt_status_from_task_status(status: TaskStatus) -> Option<AttemptStatus> 
         TaskStatus::Pending | TaskStatus::Blocked => None,
     }
 }
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
-fn validate_resume_state(state: &RunState, plan: &Plan, state_path: &Path) -> Result<(), RunError> {
+fn validate_attempt_outputs(
+    project_root: &Path,
+    aggregate_run_id: &str,
+    plan_task: &PlanTask,
+    attempt: &AttemptRecord,
+) -> Result<(), RunError> {
+    let Some(outputs) = &attempt.outputs else {
+        if attempt.status == AttemptStatus::Succeeded && !plan_task.outputs.is_empty() {
+            return Err(RunError::State(format!(
+                "successful attempt {:?} has no output records",
+                attempt.run_id
+            )));
+        }
+        return Ok(());
+    };
+    if attempt.status != AttemptStatus::Succeeded {
+        return Err(RunError::State(format!(
+            "non-successful attempt {:?} contains trusted outputs",
+            attempt.run_id
+        )));
+    }
+    if outputs.len() != plan_task.outputs.len() {
+        return Err(RunError::State(format!(
+            "attempt {:?} output count does not match declaration",
+            attempt.run_id
+        )));
+    }
+    let mut names = HashSet::with_capacity(outputs.len());
+    for record in outputs {
+        let declaration = plan_task
+            .outputs
+            .iter()
+            .find(|declaration| declaration.name == record.name)
+            .ok_or_else(|| {
+                RunError::State(format!(
+                    "attempt {:?} contains undeclared output {:?}",
+                    attempt.run_id, record.name
+                ))
+            })?;
+        if !names.insert(record.name.as_str())
+            || record.attempt != attempt.attempt
+            || record.attempt_run_id != attempt.run_id
+            || !valid_sha256(record.sha256.as_deref().unwrap_or_default())
+        {
+            return Err(RunError::State(format!(
+                "attempt {:?} contains invalid output provenance",
+                attempt.run_id
+            )));
+        }
+        validate_output_record(
+            project_root,
+            aggregate_run_id,
+            plan_task,
+            declaration,
+            record,
+        )
+        .map_err(RunError::State)?;
+        let path = Path::new(&record.path);
+        match record.output_type {
+            OutputType::Json => {
+                if record.size_bytes > MAX_STRUCTURED_OUTPUT_BYTES as u64 {
+                    return Err(RunError::State(format!(
+                        "structured output {:?} exceeds its bound",
+                        record.name
+                    )));
+                }
+                let (bytes, size, sha256) =
+                    read_hashed_output(path, MAX_STRUCTURED_OUTPUT_BYTES as u64, true)
+                        .map_err(RunError::State)?;
+                if size != record.size_bytes || record.sha256.as_deref() != Some(sha256.as_str()) {
+                    return Err(RunError::State(format!(
+                        "structured output {:?} changed after persistence",
+                        record.name
+                    )));
+                }
+                let bytes = bytes
+                    .ok_or_else(|| RunError::State("structured output bytes missing".into()))?;
+                let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                    RunError::State(format!(
+                        "structured output {:?} is invalid JSON: {error}",
+                        record.name
+                    ))
+                })?;
+                if record.value != value {
+                    return Err(RunError::State(format!(
+                        "structured output {:?} value mismatch",
+                        record.name
+                    )));
+                }
+            }
+            OutputType::File => {
+                if record.value != Value::Null {
+                    return Err(RunError::State(format!(
+                        "file output {:?} contains structured data",
+                        record.name
+                    )));
+                }
+                if serde_json::to_vec(record)
+                    .map_err(|error| RunError::State(error.to_string()))?
+                    .len()
+                    > MAX_ARTIFACT_METADATA_BYTES
+                {
+                    return Err(RunError::State(format!(
+                        "artifact metadata {:?} exceeds its bound",
+                        record.name
+                    )));
+                }
+                let (bytes, size, sha256) =
+                    read_hashed_output(path, MAX_ARTIFACT_FILE_BYTES, false)
+                        .map_err(RunError::State)?;
+                drop(bytes);
+                if size != record.size_bytes || record.sha256.as_deref() != Some(sha256.as_str()) {
+                    return Err(RunError::State(format!(
+                        "artifact {:?} changed after persistence",
+                        record.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_task_outputs(
+    project_root: &Path,
+    aggregate_run_id: &str,
+    plan_task: &PlanTask,
+    task: &TaskRecord,
+) -> Result<(), RunError> {
+    for attempt in &task.attempts {
+        validate_attempt_outputs(project_root, aggregate_run_id, plan_task, attempt)?;
+    }
+    let should_have_outputs = task.status == TaskStatus::Succeeded && !plan_task.outputs.is_empty();
+    if task.outputs.is_some() != should_have_outputs {
+        return Err(RunError::State(format!(
+            "task {:?} has inconsistent output records",
+            task.id
+        )));
+    }
+    if let Some(outputs) = &task.outputs {
+        let latest = task.attempts.last().ok_or_else(|| {
+            RunError::State(format!("task {:?} has outputs without an attempt", task.id))
+        })?;
+        if latest.status != AttemptStatus::Succeeded || latest.outputs.as_ref() != Some(outputs) {
+            return Err(RunError::State(format!(
+                "task {:?} outputs do not match latest successful attempt",
+                task.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_resume_state(
+    state: &RunState,
+    plan: &Plan,
+    state_path: &Path,
+    project_root: &Path,
+) -> Result<(), RunError> {
     if state.schema_version != RUN_STATE_SCHEMA_VERSION {
         return Err(RunError::State(format!(
             "schema_version must be {RUN_STATE_SCHEMA_VERSION}"
@@ -2854,6 +3929,7 @@ fn validate_resume_state(state: &RunState, plan: &Plan, state_path: &Path) -> Re
     for (index, task) in state.tasks.iter().enumerate() {
         let plan_task = &plan.tasks[index];
         validate_attempt_history(task, plan_task, &mut attempt_ids, &mut supervisor_paths)?;
+        validate_task_outputs(project_root, &state.run_id, plan_task, task)?;
         let has_current = task.attempt_run_id.is_some() && task.supervisor_state_path.is_some();
         if task.attempt_run_id.is_some() != task.supervisor_state_path.is_some() {
             return Err(RunError::State(format!(
@@ -3538,6 +4614,18 @@ fn render(path: &Path, state: RunState, reconciliation: Vec<ReconciliationReport
         if let Some(supervisor_path) = &task.supervisor_state_path {
             human.push_str(&format!(" [{}]", supervisor_path));
         }
+        if let Some(outputs) = &task.outputs
+            && !outputs.is_empty()
+        {
+            human.push_str("\n    outputs:");
+            for output in outputs {
+                let description = match output.output_type {
+                    OutputType::Json => "json",
+                    OutputType::File => output.path.as_str(),
+                };
+                human.push_str(&format!("\n      {} -> {}", output.name, description));
+            }
+        }
     }
     if !reconciliation.is_empty() {
         human.push_str("\nReconciliation:");
@@ -3622,6 +4710,8 @@ mod tests {
                         max_attempts: MAX_RETRY_ATTEMPTS,
                         delay_ms: 0,
                     }),
+                    outputs: Vec::new(),
+                    inputs: Vec::new(),
                 })
                 .collect(),
         };
@@ -3643,6 +4733,7 @@ mod tests {
                             status: AttemptStatus::Failed,
                             reason: Some("start_error".into()),
                             summary: Some(maximum_summary()),
+                            outputs: None,
                         }
                     })
                     .collect();
@@ -3654,6 +4745,7 @@ mod tests {
                     attempt_run_id: Some(latest.run_id.clone()),
                     supervisor_state_path: Some(latest.supervisor_state_path.clone()),
                     summary: latest.summary.clone(),
+                    outputs: None,
                     attempts,
                     retry_ready_at: None,
                 }
@@ -3695,7 +4787,13 @@ mod tests {
         );
         assert!(worst_case_bound < MAX_STATE_BYTES as usize);
         validate_plan(&state.plan, Path::new("/tmp")).unwrap();
-        validate_resume_state(&state, &state.plan, Path::new(&state.state_path)).unwrap();
+        validate_resume_state(
+            &state,
+            &state.plan,
+            Path::new(&state.state_path),
+            Path::new("/tmp"),
+        )
+        .unwrap();
         let encoded = encode_state(&state).unwrap();
         println!("maximum retry aggregate: {} bytes", encoded.len());
         assert_eq!(
@@ -3734,5 +4832,57 @@ mod tests {
         let encoded = encode_state(&state).unwrap();
         println!("maximum diagnostic aggregate: {} bytes", encoded.len());
         assert!(encoded.len() < MAX_STATE_BYTES as usize);
+    }
+
+    #[test]
+    fn maximum_structured_output_metadata_fits_aggregate_state_limit() {
+        let mut state = maximum_state();
+        let value = Value::String("x".repeat(MAX_STRUCTURED_OUTPUT_BYTES - 128));
+        for (index, task) in state.tasks.iter_mut().enumerate() {
+            let outputs = (0..MAX_OUTPUTS_PER_TASK)
+                .map(|output_index| OutputRecord {
+                    name: format!("out{index}_{output_index}"),
+                    output_type: OutputType::Json,
+                    path: format!("/tmp/output-{index}-{output_index}.json"),
+                    size_bytes: MAX_STRUCTURED_OUTPUT_BYTES as u64,
+                    sha256: Some("0".repeat(64)),
+                    value: value.clone(),
+                    run_id: state.run_id.clone(),
+                    producer_task: task.id.clone(),
+                    attempt: 1,
+                    attempt_run_id: "00000000-0000-4000-8000-000000000001".into(),
+                })
+                .collect::<Vec<_>>();
+            task.outputs = Some(outputs.clone());
+            if let Some(attempt) = task.attempts.last_mut() {
+                attempt.outputs = Some(outputs);
+            }
+        }
+        let encoded = encode_state(&state).unwrap();
+        println!(
+            "maximum structured output aggregate: {} bytes",
+            encoded.len()
+        );
+        assert!(encoded.len() < MAX_STATE_BYTES as usize);
+    }
+
+    #[test]
+    fn oversized_artifact_is_rejected_before_reading() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact.bin");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_ARTIFACT_FILE_BYTES + 1).unwrap();
+        let error = read_hashed_output(&path, MAX_ARTIFACT_FILE_BYTES, false).unwrap_err();
+        assert!(error.contains("exceeds"));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_artifact_is_rejected_without_blocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact.fifo");
+        let path_string = CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path_string.as_ptr(), 0o600) }, 0);
+        let error = read_hashed_output(&path, MAX_ARTIFACT_FILE_BYTES, false).unwrap_err();
+        assert!(error.contains("regular file"));
     }
 }

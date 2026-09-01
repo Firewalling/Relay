@@ -61,8 +61,9 @@ initial run, a task without `working_directory` uses Relay's invocation
 directory; that resolved absolute directory is persisted and reused on resume.
 
 Plan schema v1 is closed, so unknown fields are errors. Plan schema v2 is also
-closed and adds optional per-task retries; a `retry` field is invalid in v1.
-This complete two-task plan creates a marker and verifies it:
+closed and adds optional per-task retries; a `retry` field is invalid in v1. Plan
+schema v3 adds typed task outputs and explicit dependency inputs; v3 remains
+closed. This complete two-task plan creates a marker and verifies it:
 
 ```json
 {
@@ -120,22 +121,54 @@ failure, timeout, or definite non-cancellation forced cleanup. Relay never
 retries supervisor transport/protocol errors, indeterminate outcomes, or
 cancellation. A retry waits as pending, consumes no job slot, and keeps
 descendants unready; unrelated ready work continues. Exhausted failures block
-descendants. Aggregate run-state schema v3 stores retry history; valid v1/v2
-records migrate to v3 on safe resume. Reconciliation may safely promote a
-strictly validated terminal Go result without creating another attempt.
+descendants. Aggregate run-state schema v4 stores retry history and output
+provenance; valid v1/v2/v3 records migrate to v4 on safe resume. Reconciliation
+may safely promote a strictly validated terminal Go result without creating
+another attempt.
+
+### Structured task outputs
+
+Schema-v3 tasks may declare up to four named outputs. Each declaration uses
+`{"name": "summary", "type": "json", "path": "summary.json"}` or
+`type: "file"`. `path` is relative, traversal-free, and resolved inside a
+fresh project/run/attempt directory. Relay passes its absolute path to the
+program through explicit `RELAY_OUTPUT_MANIFEST` JSON map from names to paths; it never
+scrapes stdout or expands shell syntax. JSON files are parsed and retained up to
+2 KiB. File outputs are retained as bounded metadata and SHA-256 identity after
+hashing files up to 64 MiB.
+
+Output records include task, aggregate run ID, attempt number, attempt run ID,
+type, path, size, and identity. Relay publishes records only after a typed
+successful terminal attempt and validates them again on resume and consumption.
+Failed, cancelled, timed-out, indeterminate, stale, malformed, symlinked, and
+hardlinked outputs are not trusted. Retries get new output directories.
+
+Consumers use typed `inputs`, for example:
+
+```json
+{"from_task":"inspect","output":"summary","as":"--summary"}
+```
+
+Only successful direct or transitive dependencies may supply inputs. JSON values
+become one deterministic argv value; files become their validated absolute path.
+Human output lists output names concisely; `--json` includes bounded values and
+metadata. Relay does not provide an output blob store, remote uploads, workflow
+expressions, or shell interpolation.
 
 Rust atomically owns aggregate record. Its default path is
 `<project>/.relay/runs/<run-uuid>.json`, where `<project>` is selected by
 global scope rules; explicit new-run paths must be absolute. Aggregate run-state
-v3 contains run status, timestamps, ordered task records, retry deadlines, and
+v4 contains run status, timestamps, ordered task records, retry deadlines, and
 bounded `attempts` history. Each history entry retains attempt number, fresh
-UUID, Go state path, terminal status, reason, and bounded execution summary.
+UUID, Go state path, terminal status, reason, bounded execution summary, and
+optional output records with exact producer and aggregate/attempt provenance.
 Aggregate state uses compact JSON. Retained failure codes are capped at 64 bytes
 and messages at 256 bytes; attempt reasons keep only termination classifications
 so maximum 64-task, ten-attempt retry history stays below 4 MiB.
 The plan copy is sanitized: argument values named by
-`redact_argument_indexes` become `<redacted>`. Review other plan fields and
-captured process output for secrets.
+`redact_argument_indexes` become `<redacted>`. Declared structured output values
+are intentionally persisted for consumers; do not declare secrets as outputs.
+Review other plan fields and captured process output for secrets.
 
 Each attempt has a fresh UUID and separate Go-owned record under
 `${TMPDIR}/relay/supervisor/<attempt-uuid>.json`; validation guarantees that
@@ -480,7 +513,8 @@ Relay's inspectable project-local layout is:
 ├── operations/
 │   └── <operation-id>.json
 ├── runs/
-│   └── <run-id>.json
+│   ├── <run-id>.json
+│   └── outputs/<attempt-run-id>/<declared-path>
 ├── lock
 └── summary-<session-id>.md
 ```
@@ -488,9 +522,9 @@ Relay's inspectable project-local layout is:
 Session JSON records and JSON Lines events use on-disk `schema_version: 1`;
 the crate version is independent. Optional continuation fields are
 backward-compatible. Rust-owned run aggregates use separate closed
-`schema_version: 3` with bounded retry history. Aggregate v1 records omit
+`schema_version: 4` with bounded retry history and successful-attempt output provenance. Aggregate v1 records omit
 `jobs` and imply `jobs: 1`; aggregate v2 records store `jobs` but no retry
-history. Clean v1/v2 records migrate to v3 on safe resume. Running or
+history. Clean v1/v2/v3 records migrate to v4 on safe resume. Running or
 indeterminate records remain non-resumable. Unsupported versions, unknown
 fields, and malformed JSON/JSONL are reported, never silently upgraded,
 discarded, or overwritten.
