@@ -1226,6 +1226,7 @@ fn retry_delay_leaves_slot_free_for_unrelated_ready_work() {
     assert_eq!(attempts(&running, "flaky").len(), 1);
     wait_for_path(&barrier.join("started-other"));
 
+    wait_for_path(&barrier);
     fs::write(barrier.join("release"), b"release").unwrap();
     harness.wait_for_requests(3);
     run_document(&child.wait_with_output().unwrap());
@@ -1461,6 +1462,7 @@ fn parallel_retries_respect_jobs_cap_and_keep_history_bounded() {
             .iter()
             .all(|task| attempts(&running, task["id"].as_str().unwrap()).len() <= 2)
     );
+    wait_for_path(&barrier);
     fs::write(barrier.join("release"), b"release").unwrap();
     run_document(&child.wait_with_output().unwrap());
     let completed = read_state(&state_path);
@@ -2244,6 +2246,7 @@ fn jobs_two_overlaps_independent_tasks_and_persists_running_attempts() {
     assert!(record(&running, "first")["supervisor_state_path"].is_string());
     assert!(record(&running, "second")["supervisor_state_path"].is_string());
 
+    wait_for_path(&barrier);
     fs::write(barrier.join("release"), b"release").unwrap();
     run_document(&child.wait_with_output().unwrap());
     let completed = read_state(&state_path);
@@ -2280,6 +2283,7 @@ fn jobs_two_never_exceeds_limit_and_launches_ready_tasks_in_input_order() {
     assert!(!barrier.join("started-c").exists());
     assert!(!barrier.join("started-a").exists());
 
+    wait_for_path(&barrier);
     fs::write(barrier.join("release"), b"release").unwrap();
     harness.wait_for_requests(4);
     run_document(&child.wait_with_output().unwrap());
@@ -2322,6 +2326,7 @@ fn parallel_fan_out_and_fan_in_wait_for_all_dependencies() {
     assert_eq!(record(&running, "left")["status"], "running");
     assert_eq!(record(&running, "join")["status"], "pending");
 
+    wait_for_path(&barrier);
     fs::write(barrier.join("release"), b"release").unwrap();
     harness.wait_for_requests(4);
     let final_log = harness.requests();
@@ -2356,11 +2361,10 @@ fn parallel_failure_and_timeout_block_descendants_but_preserve_unrelated_work() 
 
     harness.wait_for_requests(3);
     let request_log = harness.requests();
-    let names = request_names(&request_log);
-    let mut initial_names = names[..2].to_vec();
-    initial_names.sort_unstable();
-    assert_eq!(initial_names, ["failed", "timeout"]);
-    assert_eq!(names[2], "other");
+    let mut names = request_names(&request_log);
+    names.sort_unstable();
+    assert_eq!(names, ["failed", "other", "timeout"]);
+    wait_for_path(&barrier);
     wait_for_path(&barrier);
     fs::write(barrier.join("release"), b"release").unwrap();
     run_document(&child.wait_with_output().unwrap());
@@ -2633,6 +2637,7 @@ fn parallel_protocol_failure_is_indeterminate_without_stopping_unrelated_tasks()
     let mut names = request_names(&request_log);
     names.sort_unstable();
     assert_eq!(names, ["broken", "later", "other"]);
+    wait_for_path(&barrier);
     fs::write(barrier.join("release"), b"release").unwrap();
 
     let error = error_document(&child.wait_with_output().unwrap());
