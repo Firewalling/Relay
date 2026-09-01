@@ -924,6 +924,10 @@ fn execute_inner(
         return Err(SupervisorError::CancelledBeforeLaunch);
     }
     test_pause("after_spawn_cancellation_check")?;
+    if coordinator.is_some_and(CoordinatorSignals::cancellation_requested) {
+        drop(launch_reservation);
+        return Err(SupervisorError::CancelledBeforeLaunch);
+    }
     let spawn_result = command.spawn();
     let mut child = spawn_result.map_err(|source| SupervisorError::Spawn {
         path: supervisor,

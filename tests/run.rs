@@ -1224,6 +1224,7 @@ fn retry_delay_leaves_slot_free_for_unrelated_ready_work() {
     assert_eq!(record(&running, "flaky")["status"], "pending");
     assert_eq!(record(&running, "other")["status"], "running");
     assert_eq!(attempts(&running, "flaky").len(), 1);
+    wait_for_path(&barrier.join("started-other"));
 
     fs::write(barrier.join("release"), b"release").unwrap();
     harness.wait_for_requests(3);
