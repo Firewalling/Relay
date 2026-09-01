@@ -197,6 +197,8 @@ pub struct SuperviseArgs {
     /// Zero-based child argument index to redact from persisted output.
     #[arg(long = "redact-argument-index")]
     pub redact_argument_indexes: Vec<usize>,
+    #[arg(skip)]
+    pub relay_environment: Vec<(String, String)>,
     /// Absolute program path and literal arguments, following `--`.
     #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
     pub program_and_args: Vec<String>,
