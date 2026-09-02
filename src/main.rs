@@ -33,7 +33,7 @@ fn main() -> ExitCode {
         }
     };
     if let Command::Workflow(args) = cli.command {
-        let project = match project::discover(&invocation_directory, cli.scope) {
+        let project = match project::discover_workflow(&invocation_directory, cli.scope) {
             Ok(project) => project,
             Err(error) => {
                 emit_error(

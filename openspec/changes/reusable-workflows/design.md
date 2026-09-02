@@ -8,6 +8,8 @@ Relay already validates closed plan JSON, schedules bounded DAG tasks, persists 
 
 Definitions are direct JSON files at `<project>/relay-workflows/`. Directory discovery is project-scoped, non-recursive, deterministic, bounded, and rejects symlinks. Each file must use a `.json` extension; the validated definition name is its identity. Files are version-control friendly; `.relay` remains transient runtime state.
 
+Normal Relay commands retain `.relay`-only auto discovery. Workflow commands use a workflow-aware auto scope that also recognizes the nearest `relay-workflows/` directory; `current` and `repository` scopes remain unchanged. Workflow definitions therefore do not silently change unrelated command roots.
+
 ### Schema v1
 
 A closed workflow object contains `schema_version`, `name`, ordered `tasks`, and optional `inputs` map. Inputs use only `string`, `integer`, or `boolean`, with `required` and typed `default`. Tasks use literal absolute `program`, literal `arguments` plus typed `{"workflow_input":"name"}` references, dependencies, existing task configuration, existing `retry`, existing `outputs`, and existing typed output `inputs`. Workflow-level output aliases and workflow composition are not supported.

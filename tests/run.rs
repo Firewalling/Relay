@@ -5249,7 +5249,67 @@ fn workflow_resume_keeps_original_plan_after_change_delete_and_malformed_file() 
     assert_eq!(malformed["data"]["run"]["status"], "completed");
     assert_eq!(harness.requests().len(), 4);
 }
+#[test]
+fn workflow_resume_with_redacted_arguments_is_rejected_before_launching() {
+    let harness = Harness::new();
+    let mut second = task("second", &["first"]);
+    second["arguments"] = json!(["workflow-secret"]);
+    second["redact_argument_indexes"] = json!([0]);
+    harness.workflow_file(
+        "redacted-resume",
+        &json!({
+            "schema_version": 1,
+            "name": "redacted-resume",
+            "tasks": [task("first", &[]), second]
+        }),
+    );
 
+    let state = harness.state("workflow-redacted-resume");
+    let marker = harness
+        .directory
+        .path()
+        .join("workflow-redacted-resume.marker");
+    let mut child = harness.spawn_workflow_json("redacted-resume", &state, &marker);
+    harness.wait_for_requests(1);
+    let running = wait_for_running_task(&state, "first");
+    let first_supervisor_state = PathBuf::from(
+        record(&running, "first")["supervisor_state_path"]
+            .as_str()
+            .unwrap(),
+    );
+    wait_for_path(&first_supervisor_state);
+    wait_for_path(&marker);
+    assert_eq!(
+        read_state(&first_supervisor_state)["execution"]["lifecycle"],
+        "completed"
+    );
+    assert_eq!(request_names(&harness.requests()), ["first"]);
+
+    let persisted_before = fs::read(&state).unwrap();
+    let persisted_text = String::from_utf8(persisted_before.clone()).unwrap();
+    assert!(persisted_text.contains("<redacted>"));
+    assert!(!persisted_text.contains("workflow-secret"));
+    assert_eq!(record(&read_state(&state), "second")["status"], "pending");
+
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+    let before_resume_requests = harness.requests().len();
+
+    let output = harness.resume_workflow_json("redacted-resume", &state);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["command"], "workflow");
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("redacted_argument_indexes")
+    );
+    assert_eq!(harness.requests().len(), before_resume_requests);
+    assert_eq!(fs::read(&state).unwrap(), persisted_before);
+}
 #[test]
 fn invalid_workflow_launches_no_child_process() {
     let harness = Harness::new();

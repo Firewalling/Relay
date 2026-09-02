@@ -31,13 +31,30 @@ pub fn discover(
     invocation_directory: &Path,
     scope: ProjectScope,
 ) -> Result<ProjectContext, ProjectError> {
+    discover_with_markers(invocation_directory, scope, &[".relay"])
+}
+
+pub fn discover_workflow(
+    invocation_directory: &Path,
+    scope: ProjectScope,
+) -> Result<ProjectContext, ProjectError> {
+    discover_with_markers(invocation_directory, scope, &[".relay", "relay-workflows"])
+}
+
+fn discover_with_markers(
+    invocation_directory: &Path,
+    scope: ProjectScope,
+    markers: &[&str],
+) -> Result<ProjectContext, ProjectError> {
     let invocation_directory = invocation_directory.to_owned();
     let git_repository_root = git::repository_root(&invocation_directory)?;
     let relay_project_root = match scope {
-        ProjectScope::Auto => {
-            discover_upward(&invocation_directory, git_repository_root.as_deref())?
-                .unwrap_or_else(|| invocation_directory.clone())
-        }
+        ProjectScope::Auto => discover_upward(
+            &invocation_directory,
+            git_repository_root.as_deref(),
+            markers,
+        )?
+        .unwrap_or_else(|| invocation_directory.clone()),
         ProjectScope::Current => invocation_directory.clone(),
         ProjectScope::Repository => git_repository_root
             .clone()
@@ -52,10 +69,14 @@ pub fn discover(
     })
 }
 
-fn discover_upward(start: &Path, git_root: Option<&Path>) -> Result<Option<PathBuf>, ProjectError> {
+fn discover_upward(
+    start: &Path,
+    git_root: Option<&Path>,
+    markers: &[&str],
+) -> Result<Option<PathBuf>, ProjectError> {
     let mut current = Some(start);
     while let Some(directory) = current {
-        for marker in [".relay", "relay-workflows"] {
+        for marker in markers {
             let marker_path = directory.join(marker);
             match fs::symlink_metadata(&marker_path) {
                 Ok(_) => return Ok(Some(directory.to_owned())),
@@ -152,16 +173,33 @@ mod tests {
         assert!(matches!(error, ProjectError::RepositoryScopeOutsideGit));
     }
     #[test]
-    fn auto_selects_workflow_project_ancestor() {
+    fn workflow_auto_selects_nearest_ancestor_without_changing_normal_scope() {
         let repository = tempfile::tempdir().unwrap();
         git(repository.path(), &["init", "--quiet"]);
-        let project = repository.path().join("project");
-        let invocation = project.join("nested");
+        fs::create_dir(repository.path().join(".relay")).unwrap();
+        let project = repository.path().join("nested");
+        let invocation = project.join("deep");
         fs::create_dir_all(&invocation).unwrap();
         fs::create_dir(project.join("relay-workflows")).unwrap();
 
-        let context = discover(&invocation, ProjectScope::Auto).unwrap();
+        let normal = discover(&invocation, ProjectScope::Auto).unwrap();
+        let workflow = discover_workflow(&invocation, ProjectScope::Auto).unwrap();
 
-        assert_eq!(context.relay_project_root, project);
+        assert_eq!(normal.relay_project_root, repository.path());
+        assert_eq!(workflow.relay_project_root, project);
+    }
+
+    #[test]
+    fn workflow_explicit_scopes_select_current_or_repository() {
+        let repository = tempfile::tempdir().unwrap();
+        git(repository.path(), &["init", "--quiet"]);
+        let invocation = repository.path().join("nested");
+        fs::create_dir(&invocation).unwrap();
+
+        let current = discover_workflow(&invocation, ProjectScope::Current).unwrap();
+        let repository_scope = discover_workflow(&invocation, ProjectScope::Repository).unwrap();
+
+        assert_eq!(current.relay_project_root, invocation);
+        assert_eq!(repository_scope.relay_project_root, repository.path());
     }
 }

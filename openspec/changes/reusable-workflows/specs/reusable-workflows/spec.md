@@ -2,7 +2,7 @@
 
 ### Requirement: Version-controlled definitions
 
-Relay SHALL discover non-recursive JSON workflow definitions from `<project>/relay-workflows/`. Discovery SHALL be project-scoped, deterministic, bounded, and SHALL reject symlinked workflow directories and files. A definition name SHALL be a safe identifier; JSON filenames are not workflow identity.
+Relay SHALL discover non-recursive JSON workflow definitions from `<project>/relay-workflows/`. Discovery SHALL be project-scoped, deterministic, bounded, and SHALL reject symlinked workflow directories and files. A definition name SHALL be a safe identifier; JSON filenames are not workflow identity. Workflow commands SHALL recognize `relay-workflows/` during `--scope auto` discovery, but normal Relay commands SHALL retain `.relay/`-only auto discovery; explicit `current` and `repository` scopes SHALL remain unchanged.
 
 ### Requirement: Closed declarative schema
 
@@ -18,7 +18,7 @@ A valid workflow SHALL compile into Relay's existing plan schema and execute thr
 
 ### Requirement: Immutable workflow runs
 
-Fresh workflow runs SHALL persist workflow name, workflow schema version, canonical definition SHA-256, resolved scalar inputs, and the resolved sanitized plan in aggregate state schema v5. Workflow resume SHALL use that persisted plan and SHALL not require the live definition to be present or valid. A valid changed live definition MAY be reported but SHALL not alter execution.
+Fresh workflow runs SHALL persist workflow name, workflow schema version, canonical definition SHA-256, resolved scalar inputs, and the resolved sanitized plan in aggregate state schema v5. Workflow resume SHALL use that persisted plan and SHALL not require the live definition to be present or valid. A valid changed live definition MAY be reported but SHALL not alter execution. If the persisted resolved plan contains `redact_argument_indexes`, workflow resume SHALL fail before any new child launch because exact original argv cannot be reconstructed; Relay SHALL not persist original redacted values or reparse the live definition or inputs.
 
 ### Requirement: Inspectable CLI
 

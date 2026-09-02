@@ -1546,15 +1546,9 @@ fn run_plan(
     }
     if resuming
         && workflow_resume.is_none()
-        && supplied_plan.as_ref().is_some_and(|plan| {
-            plan.tasks
-                .iter()
-                .any(|task| !task.redact_argument_indexes.is_empty())
-        })
+        && let Some(plan) = supplied_plan.as_ref()
     {
-        return Err(RunError::State(
-            "resume is unavailable for plans containing redacted_argument_indexes".into(),
-        ));
+        reject_redacted_resume(plan)?;
     }
     if !resuming && let Some(workflow) = workflow_metadata.as_ref() {
         validate_workflow_metadata(workflow)?;
@@ -1583,6 +1577,7 @@ fn run_plan(
     if resuming {
         store = StateStore::open(&requested_state_path, true)?;
         state = store.read()?;
+        reject_redacted_resume(&state.plan)?;
         if let Some(request) = workflow_resume.as_ref() {
             let metadata = state.workflow.as_ref().ok_or_else(|| {
                 RunError::State(format!(
@@ -3001,6 +2996,19 @@ fn valid_task_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+fn reject_redacted_resume(plan: &Plan) -> Result<(), RunError> {
+    if plan
+        .tasks
+        .iter()
+        .any(|task| !task.redact_argument_indexes.is_empty())
+    {
+        return Err(RunError::State(
+            "resume is unavailable for plans containing redacted_argument_indexes".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn sanitize_plan(plan: &Plan) -> Plan {
     let mut sanitized = plan.clone();
     for task in &mut sanitized.tasks {
@@ -4134,16 +4142,7 @@ fn validate_resume_state(
             state.state_path
         )));
     }
-    if state
-        .plan
-        .tasks
-        .iter()
-        .any(|task| !task.redact_argument_indexes.is_empty())
-    {
-        return Err(RunError::State(
-            "resume is unavailable for plans containing redacted_argument_indexes".into(),
-        ));
-    }
+    reject_redacted_resume(&state.plan)?;
     if &state.plan != plan {
         return Err(RunError::State(
             "resume plan does not match persisted sanitized plan".into(),

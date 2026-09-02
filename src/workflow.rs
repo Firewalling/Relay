@@ -1073,7 +1073,19 @@ mod tests {
         let error = load_all(directory.path()).unwrap_err();
         assert!(error.to_string().contains("duplicate workflow name"));
     }
+    #[test]
+    fn workflow_definition_count_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        for index in 0..=MAX_WORKFLOWS {
+            let name = format!("workflow-{index}");
+            write_workflow(&workflows, &format!("{name}.json"), &minimal(&name));
+        }
 
+        let error = discover_paths(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("more than 64 definitions"));
+    }
     #[cfg(unix)]
     #[test]
     fn symlinked_workflow_definition_is_rejected() {

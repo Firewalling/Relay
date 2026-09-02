@@ -176,13 +176,13 @@ plan-v3. Programs and explicit working directories remain absolute paths.
     {
       "id": "inspect",
       "program": "/usr/bin/cargo",
-      "arguments": ["metadata", "--format-version", "1"],
+      "arguments": ["metadata", "--format-version", "1"]
     },
     {
       "id": "test",
       "depends_on": ["inspect"],
       "program": "/usr/bin/cargo",
-      "arguments": ["test", "--profile", {"workflow_input": "profile"}],
+      "arguments": ["test", "--profile", {"workflow_input": "profile"}]
     }
   ]
 }
@@ -538,6 +538,12 @@ Relay stores state at a selected Relay project root:
   directory.
 - `--scope current` always uses the invocation directory.
 - `--scope repository` uses the Git worktree root and fails outside Git.
+
+Workflow commands use the same explicit scope rules. Under `--scope auto`,
+they also search upward for the nearest `relay-workflows/` directory so workflow
+definitions can live in a project without `.relay/` state. This workflow-only
+marker never changes project discovery for other Relay commands; they continue to
+use `.relay/` semantics.
 
 This lets a nested project retain its session when commands run from deeper
 directories. In a monorepo, start with `--scope current` in a package directory
