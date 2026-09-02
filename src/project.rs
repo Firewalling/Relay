@@ -55,15 +55,17 @@ pub fn discover(
 fn discover_upward(start: &Path, git_root: Option<&Path>) -> Result<Option<PathBuf>, ProjectError> {
     let mut current = Some(start);
     while let Some(directory) = current {
-        let relay = directory.join(".relay");
-        match fs::symlink_metadata(&relay) {
-            Ok(_) => return Ok(Some(directory.to_owned())),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(ProjectError::Inspect {
-                    path: relay,
-                    source,
-                });
+        for marker in [".relay", "relay-workflows"] {
+            let marker_path = directory.join(marker);
+            match fs::symlink_metadata(&marker_path) {
+                Ok(_) => return Ok(Some(directory.to_owned())),
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(ProjectError::Inspect {
+                        path: marker_path,
+                        source,
+                    });
+                }
             }
         }
 
@@ -148,5 +150,18 @@ mod tests {
         let error = discover(directory.path(), ProjectScope::Repository).unwrap_err();
 
         assert!(matches!(error, ProjectError::RepositoryScopeOutsideGit));
+    }
+    #[test]
+    fn auto_selects_workflow_project_ancestor() {
+        let repository = tempfile::tempdir().unwrap();
+        git(repository.path(), &["init", "--quiet"]);
+        let project = repository.path().join("project");
+        let invocation = project.join("nested");
+        fs::create_dir_all(&invocation).unwrap();
+        fs::create_dir(project.join("relay-workflows")).unwrap();
+
+        let context = discover(&invocation, ProjectScope::Auto).unwrap();
+
+        assert_eq!(context.relay_project_root, project);
     }
 }

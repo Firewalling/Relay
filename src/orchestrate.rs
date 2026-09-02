@@ -12,7 +12,7 @@ use std::fs::OpenOptions;
 #[cfg(all(unix, not(target_os = "linux")))]
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     env,
     ffi::OsStr,
     fs::{self, File},
@@ -32,16 +32,17 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const PLAN_SCHEMA_VERSION: u32 = 3;
+pub(crate) const PLAN_SCHEMA_VERSION: u32 = 3;
 const PREVIOUS_PLAN_SCHEMA_VERSION: u32 = 2;
 const LEGACY_PLAN_SCHEMA_VERSION: u32 = 1;
-const RUN_STATE_SCHEMA_VERSION: u32 = 4;
-const PREVIOUS_RUN_STATE_SCHEMA_VERSION: u32 = 3;
-const PREVIOUS_PREVIOUS_RUN_STATE_SCHEMA_VERSION: u32 = 2;
+const RUN_STATE_SCHEMA_VERSION: u32 = 5;
+const PREVIOUS_RUN_STATE_SCHEMA_VERSION: u32 = 4;
+const PREVIOUS_PREVIOUS_RUN_STATE_SCHEMA_VERSION: u32 = 3;
+const RUN_STATE_V2_SCHEMA_VERSION: u32 = 2;
 const LEGACY_RUN_STATE_SCHEMA_VERSION: u32 = 1;
-const MAX_PLAN_BYTES: u64 = 1 << 20;
+pub(crate) const MAX_PLAN_BYTES: u64 = 1 << 20;
 const MAX_STATE_BYTES: u64 = 4 << 20;
-const MAX_TASKS: usize = 64;
+pub(crate) const MAX_TASKS: usize = 64;
 const MAX_TIMEOUT_MS: i64 = 24 * 60 * 60 * 1000;
 const MAX_GRACE_MS: i64 = 60_000;
 const MAX_OUTPUT_BYTES: i64 = 8 * 1024 * 1024;
@@ -60,6 +61,11 @@ const MAX_ARTIFACT_PATH_BYTES: usize = 512;
 const MAX_ARTIFACT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ARTIFACT_METADATA_BYTES: usize = 2 * 1024;
 const MAX_OUTPUT_MANIFEST_BYTES: usize = 4 * 1024;
+const MAX_WORKFLOW_METADATA_BYTES: usize = 16 * 1024;
+const MAX_WORKFLOW_NAME_BYTES: usize = 48;
+const MAX_WORKFLOW_INPUTS: usize = 16;
+const MAX_WORKFLOW_INPUT_NAME_BYTES: usize = 48;
+const MAX_WORKFLOW_INPUT_STRING_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -378,6 +384,25 @@ fn decode_plan_value(value: Value) -> Result<Plan, String> {
         schema_version => Err(format!("unsupported plan schema_version {schema_version}")),
     }
 }
+pub(crate) fn validate_plan_value(
+    value: Value,
+    invocation_directory: &Path,
+) -> Result<(), RunError> {
+    let plan = serde_json::from_value::<Plan>(value).map_err(|error| {
+        RunError::Plan(format!("could not decode resolved workflow plan: {error}"))
+    })?;
+    validate_plan(&plan, invocation_directory)
+}
+fn validate_encoded_plan_size(plan: &Plan) -> Result<(), RunError> {
+    let bytes = serde_json::to_vec(plan)
+        .map_err(|error| RunError::Plan(format!("plan cannot be encoded: {error}")))?;
+    if bytes.len() as u64 > MAX_PLAN_BYTES {
+        return Err(RunError::Plan(format!(
+            "encoded plan exceeds {MAX_PLAN_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RetryPolicy {
@@ -397,13 +422,13 @@ where
         .map_err(serde::de::Error::custom)
 }
 
-const fn default_grace_ms() -> i64 {
+pub(crate) const fn default_grace_ms() -> i64 {
     2_000
 }
-const fn default_output_limit() -> i64 {
+pub(crate) const fn default_output_limit() -> i64 {
     1 << 20
 }
-const fn default_log_limit() -> i64 {
+pub(crate) const fn default_log_limit() -> i64 {
     64 << 10
 }
 
@@ -534,6 +559,14 @@ pub struct OutputRecord {
     pub attempt: u32,
     pub attempt_run_id: String,
 }
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunMetadata {
+    pub name: String,
+    pub schema_version: u32,
+    pub definition_sha256: String,
+    pub inputs: BTreeMap<String, Value>,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -546,6 +579,8 @@ pub struct RunState {
     pub status: RunStatus,
     pub cancellation_requested: bool,
     pub jobs: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowRunMetadata>,
     plan: Plan,
     pub tasks: Vec<TaskRecord>,
 }
@@ -579,10 +614,11 @@ struct RunStateWire {
     cancellation_requested: bool,
     #[serde(default, deserialize_with = "deserialize_jobs_field")]
     jobs: JobsField,
+    #[serde(default)]
+    workflow: Option<WorkflowRunMetadata>,
     plan: Plan,
     tasks: Vec<Value>,
 }
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyTaskRecord {
@@ -1408,14 +1444,96 @@ pub fn run(
     let raw_plan = read_bounded(&args.plan, MAX_PLAN_BYTES).map_err(|error| {
         RunError::Plan(format!("could not read {}: {error}", args.plan.display()))
     })?;
-    let mut plan: Plan = serde_json::from_slice(&raw_plan).map_err(|error| {
+    let plan: Plan = serde_json::from_slice(&raw_plan).map_err(|error| {
         RunError::Plan(format!("could not decode {}: {error}", args.plan.display()))
     })?;
-    validate_plan(&plan, invocation_directory)?;
+    run_plan(
+        args,
+        invocation_directory,
+        project_root,
+        Some(plan),
+        None,
+        None,
+    )
+}
+
+pub fn run_resolved(
+    args: RunArgs,
+    invocation_directory: &Path,
+    project_root: &Path,
+    value: Value,
+    workflow: WorkflowRunMetadata,
+) -> Result<RunResult, RunError> {
+    let plan: Plan = serde_json::from_value(value).map_err(|error| {
+        RunError::Plan(format!("could not decode resolved workflow plan: {error}"))
+    })?;
+    run_plan(
+        args,
+        invocation_directory,
+        project_root,
+        Some(plan),
+        Some(workflow),
+        None,
+    )
+}
+
+pub fn run_workflow_resume(
+    args: RunArgs,
+    invocation_directory: &Path,
+    project_root: &Path,
+    workflow_name: String,
+    current_definition_sha256: Option<String>,
+) -> Result<RunResult, RunError> {
+    if args.resume.is_none() {
+        return Err(RunError::State(
+            "workflow resume requires an aggregate state path".into(),
+        ));
+    }
+    run_plan(
+        args,
+        invocation_directory,
+        project_root,
+        None,
+        None,
+        Some(WorkflowResumeRequest {
+            name: workflow_name,
+            current_definition_sha256,
+        }),
+    )
+}
+
+struct WorkflowResumeRequest {
+    name: String,
+    current_definition_sha256: Option<String>,
+}
+
+fn run_plan(
+    args: RunArgs,
+    invocation_directory: &Path,
+    project_root: &Path,
+    mut supplied_plan: Option<Plan>,
+    workflow_metadata: Option<WorkflowRunMetadata>,
+    workflow_resume: Option<WorkflowResumeRequest>,
+) -> Result<RunResult, RunError> {
+    let resuming = args.resume.is_some();
+    if !resuming && supplied_plan.is_none() {
+        return Err(RunError::Plan(
+            "a resolved plan is required for a new run".into(),
+        ));
+    }
+    if resuming && supplied_plan.is_none() && workflow_resume.is_none() {
+        return Err(RunError::State(
+            "a plan is required when resuming directly".into(),
+        ));
+    }
+    if resuming && workflow_metadata.is_some() {
+        return Err(RunError::State(
+            "workflow metadata cannot be supplied while resuming".into(),
+        ));
+    }
     if args.jobs == 0 {
         return Err(RunError::Plan("jobs must be a positive integer".into()));
     }
-
     if args.state_path.is_some() && args.resume.is_some() {
         return Err(RunError::State(
             "state_path and resume are mutually exclusive".into(),
@@ -1426,18 +1544,27 @@ pub fn run(
     {
         return Err(RunError::Plan("supervisor path must be absolute".into()));
     }
-
-    let resuming = args.resume.is_some();
     if resuming
-        && plan
-            .tasks
-            .iter()
-            .any(|task| !task.redact_argument_indexes.is_empty())
+        && workflow_resume.is_none()
+        && supplied_plan.as_ref().is_some_and(|plan| {
+            plan.tasks
+                .iter()
+                .any(|task| !task.redact_argument_indexes.is_empty())
+        })
     {
         return Err(RunError::State(
             "resume is unavailable for plans containing redacted_argument_indexes".into(),
         ));
     }
+    if !resuming && let Some(workflow) = workflow_metadata.as_ref() {
+        validate_workflow_metadata(workflow)?;
+    }
+    if let Some(plan) = supplied_plan.as_ref()
+        && (!resuming || workflow_resume.is_none())
+    {
+        validate_plan(plan, invocation_directory)?;
+    }
+
     let requested_state_path = match args.resume.clone().or(args.state_path.clone()) {
         Some(path) => path,
         None => project_root
@@ -1447,24 +1574,46 @@ pub fn run(
     };
     validate_state_path(&requested_state_path, project_root)?;
 
-    let attempts: Vec<(String, PathBuf)> = plan
-        .tasks
-        .iter()
-        .map(|_| {
-            let run_id = Uuid::new_v4().to_string();
-            let path = supervisor_state_path(&run_id)?;
-            Ok((run_id, path))
-        })
-        .collect::<Result<_, RunError>>()?;
-
-    let mut store;
-    let mut state;
+    let mut plan: Plan;
+    let mut store: StateStore;
+    let mut state: RunState;
     let mut reconciliation = Vec::new();
+    let mut workflow_notice = None;
+    let attempts: Vec<(String, PathBuf)>;
     if resuming {
         store = StateStore::open(&requested_state_path, true)?;
         state = store.read()?;
+        if let Some(request) = workflow_resume.as_ref() {
+            let metadata = state.workflow.as_ref().ok_or_else(|| {
+                RunError::State(format!(
+                    "aggregate state is not a workflow run for {:?}",
+                    request.name
+                ))
+            })?;
+            if metadata.name != request.name {
+                return Err(RunError::State(format!(
+                    "aggregate state belongs to workflow {:?}, not {:?}",
+                    metadata.name, request.name
+                )));
+            }
+            plan = state.plan.clone();
+        } else {
+            plan = supplied_plan
+                .take()
+                .expect("direct resume plan checked before state open");
+        }
         resolve_working_directories(&mut plan, invocation_directory, Some(&state.plan))?;
+        validate_encoded_plan_size(&plan)?;
         validate_plan(&plan, invocation_directory)?;
+        attempts = plan
+            .tasks
+            .iter()
+            .map(|_| {
+                let run_id = Uuid::new_v4().to_string();
+                let path = supervisor_state_path(&run_id)?;
+                Ok((run_id, path))
+            })
+            .collect::<Result<_, RunError>>()?;
         preflight_tasks(
             &args.supervisor,
             &plan,
@@ -1474,6 +1623,15 @@ pub fn run(
         )?;
         let sanitized_plan = sanitize_plan(&plan);
         validate_resume_state(&state, &sanitized_plan, store.path(), project_root)?;
+        if let Some(request) = workflow_resume.as_ref()
+            && let Some(current) = request.current_definition_sha256.as_deref()
+            && state
+                .workflow
+                .as_ref()
+                .is_some_and(|workflow| workflow.definition_sha256 != current)
+        {
+            workflow_notice = Some("workflow definition changed since run started".into());
+        }
         let coordinator_cancelled = state.cancellation_requested;
         state.cancellation_requested = false;
         state.jobs = args.jobs;
@@ -1487,8 +1645,19 @@ pub fn run(
             coordinator_cancelled,
         )?;
     } else {
+        plan = supplied_plan.expect("new run plan checked before state open");
         resolve_working_directories(&mut plan, invocation_directory, None)?;
+        validate_encoded_plan_size(&plan)?;
         validate_plan(&plan, invocation_directory)?;
+        attempts = plan
+            .tasks
+            .iter()
+            .map(|_| {
+                let run_id = Uuid::new_v4().to_string();
+                let path = supervisor_state_path(&run_id)?;
+                Ok((run_id, path))
+            })
+            .collect::<Result<_, RunError>>()?;
         preflight_tasks(
             &args.supervisor,
             &plan,
@@ -1509,6 +1678,7 @@ pub fn run(
             status: RunStatus::Running,
             cancellation_requested: false,
             jobs: args.jobs,
+            workflow: workflow_metadata,
             plan: sanitize_plan(&plan),
             tasks: plan
                 .tasks
@@ -1914,7 +2084,7 @@ pub fn run(
     if let Some(source) = boundary_error {
         return Err(supervisor_error(&state, source));
     }
-    Ok(render(store.path(), state, reconciliation))
+    Ok(render(store.path(), state, reconciliation, workflow_notice))
 }
 
 fn resolve_working_directories(
@@ -2088,7 +2258,7 @@ fn open_output_file(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
-fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+pub(crate) fn hex_digest(digest: impl AsRef<[u8]>) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let bytes = digest.as_ref();
     let mut result = String::with_capacity(bytes.len() * 2);
@@ -3573,9 +3743,15 @@ fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
         status,
         cancellation_requested,
         jobs,
+        workflow,
         plan,
         tasks,
     } = wire;
+    if schema_version != RUN_STATE_SCHEMA_VERSION && workflow.is_some() {
+        return Err(RunError::State(format!(
+            "workflow metadata requires aggregate state schema_version {RUN_STATE_SCHEMA_VERSION}"
+        )));
+    }
     let jobs = match schema_version {
         LEGACY_RUN_STATE_SCHEMA_VERSION => match jobs {
             JobsField::Missing => 1,
@@ -3585,7 +3761,8 @@ fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
                 ));
             }
         },
-        PREVIOUS_PREVIOUS_RUN_STATE_SCHEMA_VERSION
+        RUN_STATE_V2_SCHEMA_VERSION
+        | PREVIOUS_PREVIOUS_RUN_STATE_SCHEMA_VERSION
         | PREVIOUS_RUN_STATE_SCHEMA_VERSION
         | RUN_STATE_SCHEMA_VERSION => match jobs {
             JobsField::Value(jobs) if jobs > 0 => jobs,
@@ -3605,11 +3782,11 @@ fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
         }
     };
     let tasks = match schema_version {
-        LEGACY_RUN_STATE_SCHEMA_VERSION | PREVIOUS_PREVIOUS_RUN_STATE_SCHEMA_VERSION => tasks
+        LEGACY_RUN_STATE_SCHEMA_VERSION | RUN_STATE_V2_SCHEMA_VERSION => tasks
             .into_iter()
             .map(|value| decode_legacy_task(value, path))
             .collect::<Result<Vec<_>, _>>()?,
-        PREVIOUS_RUN_STATE_SCHEMA_VERSION => tasks
+        PREVIOUS_PREVIOUS_RUN_STATE_SCHEMA_VERSION => tasks
             .into_iter()
             .map(|value| {
                 serde_json::from_value::<TaskRecordV3>(value)
@@ -3622,7 +3799,7 @@ fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?,
-        RUN_STATE_SCHEMA_VERSION => tasks
+        PREVIOUS_RUN_STATE_SCHEMA_VERSION | RUN_STATE_SCHEMA_VERSION => tasks
             .into_iter()
             .map(|value| {
                 serde_json::from_value(value).map_err(|error| {
@@ -3644,6 +3821,7 @@ fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
         status,
         cancellation_requested,
         jobs,
+        workflow,
         plan,
         tasks,
     })
@@ -3705,6 +3883,79 @@ fn attempt_status_from_task_status(status: TaskStatus) -> Option<AttemptStatus> 
 }
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+fn validate_workflow_metadata(workflow: &WorkflowRunMetadata) -> Result<(), RunError> {
+    if !valid_workflow_name(&workflow.name) {
+        return Err(RunError::State(format!(
+            "persisted workflow name {:?} is invalid",
+            workflow.name
+        )));
+    }
+    if workflow.schema_version != 1 {
+        return Err(RunError::State(format!(
+            "unsupported persisted workflow schema_version {}",
+            workflow.schema_version
+        )));
+    }
+    if !valid_sha256(&workflow.definition_sha256) {
+        return Err(RunError::State(
+            "persisted workflow definition hash is invalid".into(),
+        ));
+    }
+    if workflow.inputs.len() > MAX_WORKFLOW_INPUTS {
+        return Err(RunError::State(format!(
+            "persisted workflow contains more than {MAX_WORKFLOW_INPUTS} inputs"
+        )));
+    }
+    for (name, value) in &workflow.inputs {
+        if !valid_workflow_input_name(name) {
+            return Err(RunError::State(format!(
+                "persisted workflow input name {:?} is invalid",
+                name
+            )));
+        }
+        match value {
+            Value::String(value) if value.len() <= MAX_WORKFLOW_INPUT_STRING_BYTES => {}
+            Value::Bool(_) => {}
+            Value::Number(value) if value.as_i64().is_some() => {}
+            _ => {
+                return Err(RunError::State(format!(
+                    "persisted workflow input {:?} is not a bounded scalar",
+                    name
+                )));
+            }
+        }
+    }
+    if serde_json::to_vec(workflow)
+        .map_err(|error| RunError::State(format!("workflow metadata cannot be encoded: {error}")))?
+        .len()
+        > MAX_WORKFLOW_METADATA_BYTES
+    {
+        return Err(RunError::State(format!(
+            "persisted workflow metadata exceeds {MAX_WORKFLOW_METADATA_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn valid_workflow_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_WORKFLOW_NAME_BYTES
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_workflow_input_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_WORKFLOW_INPUT_NAME_BYTES
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
 }
 
 fn validate_attempt_outputs(
@@ -3870,6 +4121,9 @@ fn validate_resume_state(
         return Err(RunError::State(format!(
             "schema_version must be {RUN_STATE_SCHEMA_VERSION}"
         )));
+    }
+    if let Some(workflow) = state.workflow.as_ref() {
+        validate_workflow_metadata(workflow)?;
     }
     if state.jobs == 0 {
         return Err(RunError::State("jobs must be a positive integer".into()));
@@ -4599,13 +4853,28 @@ fn truncate(value: &str, maximum: usize) -> String {
     value[..end].to_owned()
 }
 
-fn render(path: &Path, state: RunState, reconciliation: Vec<ReconciliationReport>) -> RunResult {
+fn render(
+    path: &Path,
+    state: RunState,
+    reconciliation: Vec<ReconciliationReport>,
+    workflow_notice: Option<String>,
+) -> RunResult {
     let mut human = format!(
         "Run {}: {}\nState: {}\nTasks:",
         state.run_id,
         state.status.as_str(),
         path.display()
     );
+    if let Some(workflow) = state.workflow.as_ref() {
+        human.push_str(&format!(
+            "\nWorkflow: {}\nDefinition: {}",
+            workflow.name,
+            short_hash(&workflow.definition_sha256)
+        ));
+    }
+    if let Some(notice) = workflow_notice.as_deref() {
+        human.push_str(&format!("\nNotice: {notice}"));
+    }
     for task in &state.tasks {
         human.push_str(&format!("\n  {}: {}", task.id, task.status.as_str()));
         if let Some(reason) = &task.reason {
@@ -4639,17 +4908,21 @@ fn render(path: &Path, state: RunState, reconciliation: Vec<ReconciliationReport
         }
     }
     let status = state.status;
+    let mut data = json!({
+        "state_path": path.to_string_lossy(),
+        "run": state,
+        "reconciliation": reconciliation,
+    });
+    if let Some(notice) = workflow_notice {
+        data["workflow_notice"] = Value::String(notice);
+    }
     RunResult {
         status,
-        output: RunOutput {
-            human,
-            data: json!({
-                "state_path": path.to_string_lossy(),
-                "run": state,
-                "reconciliation": reconciliation,
-            }),
-        },
+        output: RunOutput { human, data },
     }
+}
+fn short_hash(value: &str) -> &str {
+    value.get(..12).unwrap_or(value)
 }
 
 fn path_string(path: &Path) -> Result<String, RunError> {
@@ -4760,6 +5033,7 @@ mod tests {
             status: RunStatus::Failed,
             cancellation_requested: false,
             jobs: 1,
+            workflow: None,
             plan,
             tasks,
         }
@@ -4884,5 +5158,29 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(path_string.as_ptr(), 0o600) }, 0);
         let error = read_hashed_output(&path, MAX_ARTIFACT_FILE_BYTES, false).unwrap_err();
         assert!(error.contains("regular file"));
+    }
+    #[test]
+    fn encoded_plan_size_is_bounded_before_persistence() {
+        let plan = Plan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            tasks: vec![PlanTask {
+                id: "oversized".into(),
+                depends_on: Vec::new(),
+                program: "/bin/true".into(),
+                arguments: vec!["x".repeat(MAX_PLAN_BYTES as usize)],
+                working_directory: Some("/tmp".into()),
+                timeout_ms: 1,
+                termination_grace_ms: default_grace_ms(),
+                stdout_limit_bytes: default_output_limit(),
+                stderr_limit_bytes: default_output_limit(),
+                log_limit_bytes: default_log_limit(),
+                redact_argument_indexes: Vec::new(),
+                retry: None,
+                outputs: Vec::new(),
+                inputs: Vec::new(),
+            }],
+        };
+        let error = validate_encoded_plan_size(&plan).unwrap_err();
+        assert!(error.to_string().contains("encoded plan exceeds"));
     }
 }

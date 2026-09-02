@@ -207,7 +207,7 @@ state_path = request["state_path"]
 os.makedirs(os.path.dirname(state_path), exist_ok=True)
 temporary = state_path + ".fake.tmp"
 with open(temporary, "w", encoding="utf-8") as destination:
-    json.dump(execution, destination, separators=(",", ":"))
+    json.dump(execution if legacy else {"run_state_version":2,"supervisor_version":"fake-v1","state_path":state_path,"execution":execution}, destination, separators=(",", ":"))
 os.replace(temporary, state_path)
 response = {"output_schema_version":1,"ok":True,"command":"supervise","data":execution}
 sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
@@ -354,6 +354,154 @@ impl Harness {
             ])
             .output()
             .expect("resume relay coordinator")
+    }
+    fn workflow_file(&self, name: &str, definition: &Value) -> PathBuf {
+        let directory = self.directory.path().join("relay-workflows");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{name}.json"));
+        fs::write(&path, serde_json::to_vec_pretty(definition).unwrap()).unwrap();
+        path
+    }
+
+    fn workflow_run_json(&self, name: &str, state: &Path, inputs: &[&str]) -> Output {
+        let mut command = self.command();
+        command.args([
+            "--json",
+            "--scope",
+            "current",
+            "workflow",
+            "run",
+            name,
+            "--supervisor",
+            self.supervisor.to_str().unwrap(),
+            "--state-path",
+            state.to_str().unwrap(),
+        ]);
+        for input in inputs {
+            command.args(["--input", input]);
+        }
+        command.output().expect("run reusable workflow")
+    }
+    fn workflow_run_json_jobs(
+        &self,
+        name: &str,
+        state: &Path,
+        jobs: usize,
+        inputs: &[&str],
+    ) -> Output {
+        let jobs = jobs.to_string();
+        let mut command = self.command();
+        command.args([
+            "--json",
+            "--scope",
+            "current",
+            "workflow",
+            "run",
+            name,
+            "--jobs",
+            jobs.as_str(),
+            "--supervisor",
+            self.supervisor.to_str().unwrap(),
+            "--state-path",
+            state.to_str().unwrap(),
+        ]);
+        for input in inputs {
+            command.args(["--input", input]);
+        }
+        command.output().expect("run reusable workflow with jobs")
+    }
+
+    fn workflow_validate_json(&self, name: &str, inputs: &[&str]) -> Output {
+        let mut command = self.command();
+        command.args(["--json", "--scope", "current", "workflow", "validate", name]);
+        for input in inputs {
+            command.args(["--input", input]);
+        }
+        command.output().expect("validate reusable workflow")
+    }
+
+    fn workflow_show_json(&self, name: &str) -> Output {
+        self.command()
+            .args(["--json", "--scope", "current", "workflow", "show", name])
+            .output()
+            .expect("show reusable workflow")
+    }
+
+    fn workflow_list_json(&self) -> Output {
+        self.command()
+            .args(["--json", "--scope", "current", "workflow", "list"])
+            .output()
+            .expect("list reusable workflows")
+    }
+
+    fn spawn_workflow_json(&self, name: &str, state: &Path, marker: &Path) -> Child {
+        let jobs = "1";
+        let release = marker.with_extension("release");
+        self.command()
+            .env("RELAY_TEST_RUN_PAUSE", "after_supervisor_result")
+            .env("RELAY_TEST_RUN_MARKER", marker)
+            .env("RELAY_TEST_RUN_RELEASE", release)
+            .args([
+                "--json",
+                "--scope",
+                "current",
+                "workflow",
+                "run",
+                name,
+                "--jobs",
+                jobs,
+                "--supervisor",
+                self.supervisor.to_str().unwrap(),
+                "--state-path",
+                state.to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn reusable workflow")
+    }
+    fn spawn_workflow_without_pause(&self, name: &str, state: &Path) -> Child {
+        self.command()
+            .args([
+                "--json",
+                "--scope",
+                "current",
+                "workflow",
+                "run",
+                name,
+                "--jobs",
+                "1",
+                "--supervisor",
+                self.supervisor.to_str().unwrap(),
+                "--state-path",
+                state.to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn reusable workflow without pause")
+    }
+
+    fn resume_workflow_json(&self, name: &str, state: &Path) -> Output {
+        self.command()
+            .args([
+                "--json",
+                "--scope",
+                "current",
+                "workflow",
+                "run",
+                name,
+                "--jobs",
+                "1",
+                "--supervisor",
+                self.supervisor.to_str().unwrap(),
+                "--resume",
+                state.to_str().unwrap(),
+            ])
+            .output()
+            .expect("resume reusable workflow")
     }
 
     fn spawn_json(&self, plan: &Path, state: &Path) -> Child {
@@ -2558,7 +2706,7 @@ fn persistence_failure_during_cancellation_drains_two_active_workers() {
     let error = error_document(&terminate(child));
     assert_eq!(error["error"]["code"], "run_state_invalid");
     let state = read_state(&state_path);
-    assert_eq!(state["schema_version"], 4);
+    assert_eq!(state["schema_version"], 5);
     assert_eq!(state["jobs"], 2);
     assert_eq!(state["status"], "cancelled");
     assert_eq!(state["cancellation_requested"], true);
@@ -2612,7 +2760,7 @@ fn persistence_failure_after_one_completion_drains_remaining_worker() {
     let error = error_document(&child.wait_with_output().unwrap());
     assert_eq!(error["error"]["code"], "run_state_invalid");
     let state = read_state(&state_path);
-    assert_eq!(state["schema_version"], 4);
+    assert_eq!(state["schema_version"], 5);
     assert_eq!(state["jobs"], 2);
     assert_eq!(record(&state, "first")["status"], "succeeded");
     assert_eq!(record(&state, "second")["status"], "cancelled");
@@ -2703,7 +2851,7 @@ fn migrates_clean_v1_state_and_resumes_pending_work() {
     run_document(&harness.resume_json(&plan, &state_path));
 
     let migrated = read_state(&state_path);
-    assert_eq!(migrated["schema_version"], 4);
+    assert_eq!(migrated["schema_version"], 5);
     assert_eq!(migrated["jobs"], 1);
     assert_eq!(record(&migrated, "waiting")["status"], "cancelled");
     assert_eq!(record(&migrated, "later")["status"], "succeeded");
@@ -2727,7 +2875,7 @@ fn migrates_v3_retry_history_without_dropping_attempts() {
     harness.configure(&[]);
     run_document(&harness.resume_json(&plan, &state_path));
     let migrated = read_state(&state_path);
-    assert_eq!(migrated["schema_version"], 4);
+    assert_eq!(migrated["schema_version"], 5);
     assert_eq!(attempts(&migrated, "flaky-v3").len(), 2);
     assert_eq!(harness.requests().len(), before_resume);
 }
@@ -2749,9 +2897,30 @@ fn migrates_clean_v2_state_and_resumes_pending_work() {
     harness.configure(&[]);
     run_document(&harness.resume_json(&plan, &state_path));
     let migrated = read_state(&state_path);
-    assert_eq!(migrated["schema_version"], 4);
+    assert_eq!(migrated["schema_version"], 5);
     assert_eq!(attempts(&migrated, "waiting").len(), 1);
     assert_eq!(record(&migrated, "later")["status"], "succeeded");
+}
+
+#[test]
+fn migrates_v4_direct_state_without_workflow_metadata() {
+    let harness = Harness::new();
+    let plan = harness.plan("direct-v4", json!([task("only", &[])]));
+    let state_path = harness.state("direct-v4");
+    run_document(&harness.run_json(&plan, &state_path));
+    let mut state = read_state(&state_path);
+    assert_eq!(state["schema_version"], 5);
+    assert!(state["workflow"].is_null());
+    state["schema_version"] = json!(4);
+    fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    let before_resume = harness.requests().len();
+
+    run_document(&harness.resume_json(&plan, &state_path));
+
+    let migrated = read_state(&state_path);
+    assert_eq!(migrated["schema_version"], 5);
+    assert!(migrated["workflow"].is_null());
+    assert_eq!(harness.requests().len(), before_resume);
 }
 
 #[test]
@@ -2978,7 +3147,7 @@ fn successful_state_has_unique_attempt_identities_and_sanitizes_secrets() {
 
     let state: Value = serde_json::from_str(&persisted).unwrap();
     assert_eq!(document["data"]["run"], state);
-    assert_eq!(state["schema_version"], 4);
+    assert_eq!(state["schema_version"], 5);
     assert_eq!(state["jobs"], 1);
     assert_eq!(state["status"], "completed");
     let first = record(&state, "first");
@@ -4894,4 +5063,623 @@ fn real_go_reconciles_parallel_attempts_independently() {
     assert_eq!(attempts(&final_state, "uncertain").len(), 1);
     assert!(completed_marker.is_file());
     kill_real_attempt(&final_state, "active");
+}
+fn workflow_document(output: &Output) -> Value {
+    assert!(
+        output.stderr.is_empty(),
+        "workflow envelope unexpectedly wrote stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let document: Value = serde_json::from_slice(&output.stdout).expect("workflow JSON envelope");
+    assert_eq!(document["output_schema_version"], 1);
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["command"], "workflow");
+    document
+}
+
+fn reusable_verify_definition() -> Value {
+    json!({
+        "schema_version": 1,
+        "name": "verify",
+        "inputs": {
+            "profile": {"type":"string", "default":"dev"}
+        },
+        "tasks": [
+            {
+                "id":"inspect",
+                "program":"/fake/inspect",
+                "arguments":["--profile", {"workflow_input":"profile"}],
+                "outputs":[
+                    {"name":"summary", "type":"json", "path":"summary.json"},
+                    {"name":"report", "type":"file", "path":"report.txt"}
+                ]
+            },
+            {
+                "id":"test",
+                "depends_on":["inspect"],
+                "program":"/fake/test",
+                "arguments":["--profile", {"workflow_input":"profile"}],
+                "inputs":[
+                    {"from_task":"inspect", "output":"summary", "as":"--summary"},
+                    {"from_task":"inspect", "output":"report", "as":"--report"}
+                ]
+            }
+        ]
+    })
+}
+
+#[test]
+fn reusable_workflow_inspection_and_execution_reuse_existing_outputs() {
+    let harness = Harness::new();
+    harness.workflow_file("verify", &reusable_verify_definition());
+
+    let list = workflow_document(&harness.workflow_list_json());
+    assert_eq!(list["data"]["workflows"], json!(["verify"]));
+    let show = workflow_document(&harness.workflow_show_json("verify"));
+    assert_eq!(show["data"]["workflow"]["name"], "verify");
+    assert_eq!(
+        show["data"]["workflow"]["tasks"][0]["outputs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let human = harness
+        .command()
+        .args(["--scope", "current", "workflow", "show", "verify"])
+        .output()
+        .unwrap();
+    assert_eq!(human.status.code(), Some(0));
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("Workflow: verify"));
+    assert!(human.contains("Tasks:"));
+    let checked =
+        workflow_document(&harness.workflow_validate_json("verify", &["profile=release"]));
+    assert_eq!(checked["data"]["inputs"]["profile"], "release");
+    assert_eq!(
+        checked["data"]["plan"]["tasks"][0]["arguments"],
+        json!(["--profile", "release"])
+    );
+    assert!(harness.requests().is_empty());
+
+    let first_state = harness.state("workflow-first");
+    let first =
+        workflow_document(&harness.workflow_run_json("verify", &first_state, &["profile=release"]));
+    assert_eq!(first["data"]["run"]["status"], "completed");
+    let persisted = read_state(&first_state);
+    assert_eq!(persisted["workflow"]["name"], "verify");
+    assert_eq!(persisted["workflow"]["inputs"]["profile"], "release");
+    assert_eq!(
+        persisted["workflow"]["definition_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(record(&persisted, "inspect")["status"], "succeeded");
+    assert_eq!(
+        record(&persisted, "inspect")["outputs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let requests = harness.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["arguments"], json!(["--profile", "release"]));
+    assert_eq!(requests[1]["program"], "/fake/test");
+    assert_eq!(requests[1]["arguments"][0], "--profile");
+    assert_eq!(requests[1]["arguments"][1], "release");
+    assert_eq!(requests[1]["arguments"][2], "--summary");
+    assert_eq!(requests[1]["arguments"][4], "--report");
+
+    let second_state = harness.state("workflow-second");
+    let second = workflow_document(&harness.workflow_run_json(
+        "verify",
+        &second_state,
+        &["profile=release"],
+    ));
+    assert_eq!(second["data"]["run"]["status"], "completed");
+    assert_eq!(harness.requests().len(), 4);
+}
+
+#[test]
+fn workflow_resume_keeps_original_plan_after_change_delete_and_malformed_file() {
+    let harness = Harness::new();
+    let original = reusable_verify_definition();
+    harness.workflow_file("verify", &original);
+    let state = harness.state("workflow-resume");
+    let marker = harness.directory.path().join("workflow-resume.marker");
+    let mut child = harness.spawn_workflow_json("verify", &state, &marker);
+    harness.wait_for_requests(1);
+    let running = wait_for_running_task(&state, "inspect");
+    assert_eq!(running["status"], "running");
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+
+    let mut changed = original.clone();
+    changed["tasks"][1]["program"] = json!("/fake/changed");
+    harness.workflow_file("verify", &changed);
+    let resumed = workflow_document(&harness.resume_workflow_json("verify", &state));
+    assert_eq!(resumed["data"]["run"]["status"], "completed");
+    assert_eq!(
+        resumed["data"]["workflow_notice"],
+        "workflow definition changed since run started"
+    );
+    assert_eq!(
+        resumed["data"]["run"]["workflow"]["definition_sha256"],
+        running["workflow"]["definition_sha256"]
+    );
+    let requests = harness.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1]["program"], "/fake/test");
+    assert_ne!(requests[1]["program"], "/fake/changed");
+    let completed = read_state(&state);
+    assert_eq!(record(&completed, "inspect")["status"], "succeeded");
+    assert_eq!(record(&completed, "test")["status"], "succeeded");
+    assert_eq!(attempts(&completed, "inspect").len(), 1);
+
+    harness.workflow_file("verify", &original);
+    let deleted_state = harness.state("workflow-resume-deleted");
+    let deleted_marker = harness
+        .directory
+        .path()
+        .join("workflow-resume-deleted.marker");
+    let mut deleted_child = harness.spawn_workflow_json("verify", &deleted_state, &deleted_marker);
+    harness.wait_for_requests(3);
+    let deleted_running = wait_for_running_task(&deleted_state, "inspect");
+    assert_eq!(deleted_running["status"], "running");
+    assert_eq!(
+        unsafe { libc::kill(deleted_child.id() as i32, libc::SIGKILL) },
+        0
+    );
+    deleted_child.wait().unwrap();
+    fs::remove_file(harness.directory.path().join("relay-workflows/verify.json")).unwrap();
+    let deleted = workflow_document(&harness.resume_workflow_json("verify", &deleted_state));
+    assert_eq!(deleted["data"]["run"]["status"], "completed");
+    assert_eq!(attempts(&read_state(&deleted_state), "inspect").len(), 1);
+    assert_eq!(harness.requests().len(), 4);
+    fs::write(
+        harness.directory.path().join("relay-workflows/verify.json"),
+        b"{not-json",
+    )
+    .unwrap();
+    let malformed = workflow_document(&harness.resume_workflow_json("verify", &deleted_state));
+    assert_eq!(malformed["data"]["run"]["status"], "completed");
+    assert_eq!(harness.requests().len(), 4);
+}
+
+#[test]
+fn invalid_workflow_launches_no_child_process() {
+    let harness = Harness::new();
+    harness.workflow_file(
+        "invalid",
+        &json!({
+            "schema_version": 1,
+            "name": "invalid",
+            "tasks": [{"id":"task", "program":"/fake/task"}],
+            "unknown": true
+        }),
+    );
+    let state = harness.state("invalid-workflow");
+    let output = harness.workflow_run_json("invalid", &state, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+    assert!(!state.exists());
+    assert!(harness.requests().is_empty());
+
+    let invalid_name = harness.workflow_run_json("../escape", &harness.state("invalid-name"), &[]);
+    assert_eq!(invalid_name.status.code(), Some(1));
+    assert!(harness.requests().is_empty());
+}
+#[test]
+fn tampered_workflow_metadata_is_rejected_on_resume() {
+    let harness = Harness::new();
+    harness.workflow_file("verify", &reusable_verify_definition());
+    let state = harness.state("tampered-workflow");
+    workflow_document(&harness.workflow_run_json("verify", &state, &["profile=release"]));
+    let mut persisted = read_state(&state);
+    persisted["workflow"]["name"] = json!("../escape");
+    fs::write(&state, serde_json::to_vec(&persisted).unwrap()).unwrap();
+    let before = harness.requests().len();
+
+    let output = harness.resume_workflow_json("verify", &state);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["command"], "workflow");
+    assert_eq!(error["error"]["code"], "run_state_invalid");
+    assert_eq!(harness.requests().len(), before);
+}
+
+#[test]
+fn workflow_reuses_retry_and_failure_propagation_semantics() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("flaky", &["nonzero", "success"])]);
+    harness.workflow_file(
+        "retry",
+        &json!({
+            "schema_version": 1,
+            "name": "retry",
+            "tasks": [{
+                "id":"flaky",
+                "program":"/fake/flaky",
+                "retry":{"max_attempts":2,"delay_ms":0}
+            }]
+        }),
+    );
+    let retry_state = harness.state("workflow-retry");
+    workflow_document(&harness.workflow_run_json("retry", &retry_state, &[]));
+    let retry = read_state(&retry_state);
+    assert_eq!(retry["status"], "completed");
+    assert_eq!(attempts(&retry, "flaky").len(), 2);
+
+    let failure = Harness::new();
+    failure.configure(&[("fail", "nonzero")]);
+    failure.workflow_file(
+        "failure",
+        &json!({
+            "schema_version": 1,
+            "name": "failure",
+            "tasks": [
+                {"id":"fail","program":"/fake/fail"},
+                {"id":"blocked","depends_on":["fail"],"program":"/fake/blocked"}
+            ]
+        }),
+    );
+    let failure_state = failure.state("workflow-failure");
+    let output = failure.workflow_run_json("failure", &failure_state, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["data"]["run"]["status"], "failed");
+    let state = read_state(&failure_state);
+    assert_eq!(record(&state, "fail")["status"], "failed");
+    assert_eq!(record(&state, "blocked")["status"], "blocked");
+    assert_eq!(failure.requests().len(), 1);
+}
+
+#[test]
+fn workflow_cancellation_keeps_existing_coordinator_semantics() {
+    let harness = Harness::new();
+    harness.configure(&[("waiting", "wait_cancel")]);
+    harness.workflow_file(
+        "cancel",
+        &json!({
+            "schema_version": 1,
+            "name": "cancel",
+            "tasks": [{"id":"waiting", "program":"/fake/waiting"}]
+        }),
+    );
+    let state = harness.state("workflow-cancel");
+    let child = harness.spawn_workflow_without_pause("cancel", &state);
+    harness.wait_for_requests(1);
+    let output = terminate(child);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.status.code(), Some(1));
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["command"], "workflow");
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["data"]["run"]["status"], "cancelled");
+    let persisted = read_state(&state);
+    assert_eq!(record(&persisted, "waiting")["status"], "cancelled");
+    assert_eq!(attempts(&persisted, "waiting").len(), 1);
+}
+
+#[test]
+fn workflow_honors_bounded_parallelism() {
+    let harness = Harness::new();
+    harness.workflow_file(
+        "parallel",
+        &json!({
+            "schema_version": 1,
+            "name": "parallel",
+            "tasks": [
+                {"id":"left", "program":"/fake/left"},
+                {"id":"right", "program":"/fake/right"}
+            ]
+        }),
+    );
+    let state = harness.state("workflow-parallel");
+    workflow_document(&harness.workflow_run_json_jobs("parallel", &state, 2, &[]));
+    let persisted = read_state(&state);
+    assert_eq!(persisted["jobs"], 2);
+    assert_eq!(record(&persisted, "left")["status"], "succeeded");
+    assert_eq!(record(&persisted, "right")["status"], "succeeded");
+    assert_eq!(harness.requests().len(), 2);
+}
+
+fn real_workflow_command(
+    supervisor: &Path,
+    directory: &Path,
+    temporary_root: &Path,
+    name: &str,
+    state: &Path,
+    resume: bool,
+) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_relay"));
+    command
+        .current_dir(directory)
+        .env("TMPDIR", temporary_root)
+        .args([
+            "--json",
+            "--scope",
+            "current",
+            "workflow",
+            "run",
+            name,
+            "--jobs",
+            "1",
+            "--supervisor",
+        ])
+        .arg(supervisor);
+    if resume {
+        command.args(["--resume", state.to_str().unwrap()]);
+    } else {
+        command.args([
+            "--state-path",
+            state.to_str().unwrap(),
+            "--input",
+            "profile=release",
+        ]);
+    }
+    command
+}
+
+fn real_workflow_run(
+    supervisor: &Path,
+    directory: &Path,
+    temporary_root: &Path,
+    name: &str,
+    state: &Path,
+) -> Output {
+    real_workflow_command(supervisor, directory, temporary_root, name, state, false)
+        .output()
+        .expect("run real reusable workflow")
+}
+
+fn real_workflow_resume(
+    supervisor: &Path,
+    directory: &Path,
+    temporary_root: &Path,
+    name: &str,
+    state: &Path,
+) -> Output {
+    real_workflow_command(supervisor, directory, temporary_root, name, state, true)
+        .output()
+        .expect("resume real reusable workflow")
+}
+
+fn spawn_real_workflow_crash(
+    supervisor: &Path,
+    directory: &Path,
+    temporary_root: &Path,
+    name: &str,
+    state: &Path,
+    marker: &Path,
+) -> Child {
+    let release = marker.with_extension("release");
+    let mut command =
+        real_workflow_command(supervisor, directory, temporary_root, name, state, false);
+    command
+        .env("RELAY_TEST_RUN_PAUSE", "after_supervisor_result")
+        .env("RELAY_TEST_RUN_MARKER", marker)
+        .env("RELAY_TEST_RUN_RELEASE", release)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.spawn().expect("spawn real reusable workflow")
+}
+
+fn real_verify_definition(counter: &Path) -> Value {
+    let counter = counter.to_str().unwrap();
+    let inspect = r#"import json,os,sys
+with open(sys.argv[1],"a") as f: f.write("inspect\n")
+manifest=json.loads(os.environ["RELAY_OUTPUT_MANIFEST"])
+with open(manifest["summary"],"w") as f: json.dump({"kind":"inspect","ok":True},f)
+with open(manifest["report"],"w") as f: f.write("inspect artifact\n")
+"#;
+    let format = r#"import sys
+with open(sys.argv[1],"a") as f: f.write("format\n")
+"#;
+    let test = r#"import json,os,sys
+assert sys.argv[2] == "--profile" and sys.argv[3] == "release"
+assert sys.argv[4] == "--summary" and json.loads(sys.argv[5])["kind"] == "inspect"
+assert sys.argv[6] == "--report" and os.path.isfile(sys.argv[7])
+with open(sys.argv[1],"a") as f: f.write("test\n")
+manifest=json.loads(os.environ["RELAY_OUTPUT_MANIFEST"])
+with open(manifest["summary"],"w") as f: json.dump({"kind":"test","ok":True},f)
+with open(manifest["report"],"w") as f: f.write("test artifact\n")
+"#;
+    let report = r#"import os,sys
+assert sys.argv[2] == "--test-report" and os.path.isfile(sys.argv[3])
+with open(sys.argv[1],"a") as f: f.write("report\n")
+manifest=os.environ["RELAY_OUTPUT_MANIFEST"]
+paths=__import__("json").loads(manifest)
+with open(paths["final"],"w") as f: f.write("final report\n")
+"#;
+    json!({
+        "schema_version": 1,
+        "name": "verify",
+        "inputs": {"profile": {"type":"string", "required":true}},
+        "tasks": [
+            {
+                "id":"inspect",
+                "program":"/usr/bin/python3",
+                "arguments":["-c", inspect, counter],
+                "outputs":[
+                    {"name":"summary", "type":"json", "path":"inspect.json"},
+                    {"name":"report", "type":"file", "path":"inspect.txt"}
+                ]
+            },
+            {
+                "id":"format",
+                "program":"/usr/bin/python3",
+                "arguments":["-c", format, counter]
+            },
+            {
+                "id":"test",
+                "depends_on":["inspect","format"],
+                "program":"/usr/bin/python3",
+                "arguments":["-c", test, counter, "--profile", {"workflow_input":"profile"}],
+                "outputs":[
+                    {"name":"summary", "type":"json", "path":"test.json"},
+                    {"name":"report", "type":"file", "path":"test.txt"}
+                ],
+                "inputs":[
+                    {"from_task":"inspect", "output":"summary", "as":"--summary"},
+                    {"from_task":"inspect", "output":"report", "as":"--report"}
+                ]
+            },
+            {
+                "id":"report",
+                "depends_on":["test"],
+                "program":"/usr/bin/python3",
+                "arguments":["-c", report, counter],
+                "outputs":[{"name":"final", "type":"file", "path":"final.txt"}],
+                "inputs":[{"from_task":"test", "output":"report", "as":"--test-report"}]
+            }
+        ]
+    })
+}
+
+#[test]
+fn real_go_reusable_workflow_runs_repeats_and_resumes_original_plan() {
+    let Some(supervisor) = real_supervisor_path() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create real workflow directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).unwrap();
+    let workflows = directory.path().join("relay-workflows");
+    fs::create_dir(&workflows).unwrap();
+
+    let first_counter = directory.path().join("first-counter");
+    let first_definition = real_verify_definition(&first_counter);
+    let workflow_path = workflows.join("verify.json");
+    fs::write(
+        &workflow_path,
+        serde_json::to_vec_pretty(&first_definition).unwrap(),
+    )
+    .unwrap();
+    let first_state = directory.path().join("first.state.json");
+    let first = workflow_document(&real_workflow_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        "verify",
+        &first_state,
+    ));
+    assert_eq!(first["data"]["run"]["status"], "completed");
+    assert_eq!(
+        fs::read_to_string(&first_counter).unwrap().lines().count(),
+        4
+    );
+    let first_persisted = read_state(&first_state);
+    assert_eq!(first_persisted["workflow"]["inputs"]["profile"], "release");
+    let inspect_output = &record(&first_persisted, "inspect")["outputs"][0];
+    assert_eq!(
+        inspect_output["attempt_run_id"],
+        attempts(&first_persisted, "inspect")[0]["run_id"]
+    );
+    assert_eq!(inspect_output["producer_task"], "inspect");
+
+    let second_counter = directory.path().join("second-counter");
+    fs::write(
+        &workflow_path,
+        serde_json::to_vec_pretty(&real_verify_definition(&second_counter)).unwrap(),
+    )
+    .unwrap();
+    let second_state = directory.path().join("second.state.json");
+    let second = workflow_document(&real_workflow_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        "verify",
+        &second_state,
+    ));
+    assert_eq!(second["data"]["run"]["status"], "completed");
+    assert_eq!(
+        fs::read_to_string(&second_counter).unwrap().lines().count(),
+        4
+    );
+
+    let resume_counter = directory.path().join("resume-counter");
+    let original = real_verify_definition(&resume_counter);
+    fs::write(
+        &workflow_path,
+        serde_json::to_vec_pretty(&original).unwrap(),
+    )
+    .unwrap();
+    let resume_state = directory.path().join("resume.state.json");
+    let marker = directory.path().join("resume.marker");
+    let mut child = spawn_real_workflow_crash(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        "verify",
+        &resume_state,
+        &marker,
+    );
+    let running = wait_for_running_task(&resume_state, "inspect");
+    assert_eq!(running["status"], "running");
+    let go_state = PathBuf::from(
+        record(&running, "inspect")["supervisor_state_path"]
+            .as_str()
+            .unwrap(),
+    );
+    wait_for_path(&marker);
+    let mut go_record = read_state(&go_state);
+    assert_eq!(go_record["run_state_version"], 2);
+    assert_eq!(go_record["execution"]["lifecycle"], "completed");
+    go_record["run_state_version"] = json!(1);
+    go_record.as_object_mut().unwrap().remove("state_path");
+    go_record
+        .as_object_mut()
+        .unwrap()
+        .remove("process_identity");
+    fs::write(&go_state, serde_json::to_vec(&go_record).unwrap()).unwrap();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+
+    let mut changed = original.clone();
+    changed["tasks"][3]["program"] = json!("/usr/bin/false");
+    fs::write(&workflow_path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+    let resumed = workflow_document(&real_workflow_resume(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        "verify",
+        &resume_state,
+    ));
+    assert_eq!(resumed["data"]["run"]["status"], "completed");
+    assert_eq!(
+        resumed["data"]["workflow_notice"],
+        "workflow definition changed since run started"
+    );
+    assert_eq!(
+        resumed["data"]["run"]["workflow"]["definition_sha256"],
+        running["workflow"]["definition_sha256"]
+    );
+    assert_eq!(
+        fs::read_to_string(&resume_counter).unwrap().lines().count(),
+        4
+    );
+    let final_state = read_state(&resume_state);
+    assert_eq!(attempts(&final_state, "inspect").len(), 1);
+    assert_eq!(record(&final_state, "inspect")["status"], "succeeded");
+    assert_eq!(record(&final_state, "test")["status"], "succeeded");
+    assert_eq!(record(&final_state, "report")["status"], "succeeded");
+    for task in ["inspect", "test", "report"] {
+        for output in record(&final_state, task)["outputs"].as_array().unwrap() {
+            assert_eq!(output["producer_task"], task);
+            assert_eq!(
+                output["attempt_run_id"],
+                attempts(&final_state, task)[0]["run_id"]
+            );
+        }
+    }
 }

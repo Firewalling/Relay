@@ -7,3 +7,4 @@ pub mod orchestrate;
 pub mod project;
 pub mod storage;
 pub mod supervise;
+pub mod workflow;

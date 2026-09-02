@@ -57,6 +57,8 @@ pub enum Command {
     Run(RunArgs),
     /// Run one absolute program through the Rust launcher and Go one-child supervisor.
     Supervise(SuperviseArgs),
+    /// Run, inspect, and validate project-local reusable workflows.
+    Workflow(WorkflowArgs),
     /// Prints the negotiated, versioned Rust/Go process contract and launches nothing.
     Protocol,
     /// Start a session with a goal.
@@ -95,6 +97,7 @@ impl Command {
             Self::Run(_) => "run",
             Self::Protocol => "protocol",
             Self::Supervise(_) => "supervise",
+            Self::Workflow(_) => "workflow",
             Self::Start(_) => "start",
             Self::Status => "status",
             Self::Checkpoint(_) => "checkpoint",
@@ -111,6 +114,65 @@ impl Command {
             Self::Completions(_) => "completions",
         }
     }
+}
+
+#[derive(Debug, Args)]
+pub struct WorkflowArgs {
+    #[command(subcommand)]
+    pub command: WorkflowCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkflowCommand {
+    /// List project-local reusable workflows.
+    List,
+    /// Show one reusable workflow without executing it.
+    Show(WorkflowNameArgs),
+    /// Parse and validate one reusable workflow.
+    Validate(WorkflowValidateArgs),
+    /// Run one reusable workflow through the existing coordinator.
+    Run(WorkflowRunArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WorkflowNameArgs {
+    /// Workflow name.
+    pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkflowValidateArgs {
+    /// Optional NAME=VALUE input overrides used during validation.
+    #[arg(long = "input", value_name = "NAME=VALUE", allow_hyphen_values = true)]
+    pub inputs: Vec<String>,
+    /// Workflow name.
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(group(
+    ArgGroup::new("state")
+        .args(["state_path", "resume"])
+        .multiple(false)
+))]
+pub struct WorkflowRunArgs {
+    /// Absolute path to the relay-supervisor executable.
+    #[arg(long)]
+    pub supervisor: Option<std::path::PathBuf>,
+    /// Maximum number of DAG tasks to run simultaneously.
+    #[arg(long, default_value_t = 1, value_parser = parse_jobs)]
+    pub jobs: usize,
+    /// Absolute aggregate run state path for a new run.
+    #[arg(long)]
+    pub state_path: Option<std::path::PathBuf>,
+    /// Absolute aggregate run state path to resume.
+    #[arg(long)]
+    pub resume: Option<std::path::PathBuf>,
+    /// Optional NAME=VALUE workflow input override.
+    #[arg(long = "input", value_name = "NAME=VALUE", allow_hyphen_values = true)]
+    pub inputs: Vec<String>,
+    /// Workflow name.
+    pub name: String,
 }
 
 #[derive(Debug, Args)]
