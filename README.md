@@ -5,10 +5,11 @@
 Relay contains a Rust CLI for recording project-local work sessions,
 checkpoints, categorized notes, handoffs, and bounded context for the next
 terminal agent. It also provides a Rust-owned, one-shot `relay run` coordinator
-for deterministic bounded-parallel DAG plans and `relay supervise`, a Rust launcher
-for one explicitly requested local child process through the standalone Go
-supervisor. Relay does not implement an agent or model runtime, call
-model-provider APIs, inspect chat transcripts, or replace Git.
+for deterministic bounded-parallel DAG plans, reusable project-local workflows,
+and `relay supervise`, a Rust launcher for one explicitly requested local child
+process through the standalone Go supervisor. Relay does not implement an
+agent or model runtime, call model-provider APIs, inspect chat transcripts, or
+replace Git.
 
 ## Prerequisites and installation
 
@@ -121,10 +122,9 @@ failure, timeout, or definite non-cancellation forced cleanup. Relay never
 retries supervisor transport/protocol errors, indeterminate outcomes, or
 cancellation. A retry waits as pending, consumes no job slot, and keeps
 descendants unready; unrelated ready work continues. Exhausted failures block
-descendants. Aggregate run-state schema v4 stores retry history and output
-provenance; valid v1/v2/v3 records migrate to v4 on safe resume. Reconciliation
-may safely promote a strictly validated terminal Go result without creating
-another attempt.
+descendants. Aggregate run-state schema v5 stores retry history and output
+provenance; valid v1/v2/v3/v4 records migrate to v5 on safe resume.
+Reconciliation may safely promote a strictly validated terminal Go result without creating another attempt.
 
 ### Structured task outputs
 
@@ -155,10 +155,69 @@ Human output lists output names concisely; `--json` includes bounded values and
 metadata. Relay does not provide an output blob store, remote uploads, workflow
 expressions, or shell interpolation.
 
+## Reusable workflows
+
+Store version-controlled workflow definitions as JSON files in
+relay-workflows/. Each file defines one named, closed DAG. Inputs are only
+scalar string, integer, or boolean values. Task arguments use literal strings
+or explicit typed references; Relay never evaluates shell syntax or performs
+environment expansion.
+Workflow task timeout defaults to 60,000 ms; remaining task defaults match
+plan-v3. Programs and explicit working directories remain absolute paths.
+
+~~~json
+{
+  "schema_version": 1,
+  "name": "verify",
+  "inputs": {
+    "profile": {"type": "string", "default": "dev"}
+  },
+  "tasks": [
+    {
+      "id": "inspect",
+      "program": "/usr/bin/cargo",
+      "arguments": ["metadata", "--format-version", "1"]
+    },
+    {
+      "id": "test",
+      "depends_on": ["inspect"],
+      "program": "/usr/bin/cargo",
+      "arguments": ["test", "--profile", {"workflow_input": "profile"}]
+    }
+  ]
+}
+~~~
+
+Inspect or validate before execution, then run repeatedly:
+
+~~~sh
+relay workflow list
+relay workflow show verify
+relay workflow validate verify --input profile=release
+relay workflow run verify --input profile=release
+relay workflow run verify --resume /absolute/path/to/run.json
+~~~
+
+Workflow resolution compiles into the existing plan-v3 model, so DAG
+scheduling, bounded parallelism, retries, cancellation, structured outputs,
+artifacts, and crash reconciliation remain unchanged. Fresh workflow runs
+persist definition SHA-256, resolved inputs, and sanitized resolved plan in
+aggregate state. Resume uses that persisted plan even if live definition is
+changed, deleted, or malformed; a valid changed definition is reported without
+changing execution. Persisted inputs are not a secret store.
+Workflow definitions execute local commands and are not a sandbox or trust boundary. The definition hash identifies normalized content; it is not protection against a malicious local user.
+
+Workflow limits are 1 MiB per file, 64 definitions per project, 48-byte names,
+16 inputs, 4 KiB per input string, 64 tasks, and 16 KiB persisted metadata.
+Resolved plan encoding remains capped at 1 MiB after input expansion and working-directory resolution.
+Workflow-level output aliases, imports, composition, expressions, conditionals,
+loops, scripting, remote execution, daemon mode, and model/provider integrations
+are not supported.
+
 Rust atomically owns aggregate record. Its default path is
 `<project>/.relay/runs/<run-uuid>.json`, where `<project>` is selected by
 global scope rules; explicit new-run paths must be absolute. Aggregate run-state
-v4 contains run status, timestamps, ordered task records, retry deadlines, and
+v5 contains run status, timestamps, ordered task records, retry deadlines, and
 bounded `attempts` history. Each history entry retains attempt number, fresh
 UUID, Go state path, terminal status, reason, bounded execution summary, and
 optional output records with exact producer and aggregate/attempt provenance.
@@ -480,6 +539,12 @@ Relay stores state at a selected Relay project root:
 - `--scope current` always uses the invocation directory.
 - `--scope repository` uses the Git worktree root and fails outside Git.
 
+Workflow commands use the same explicit scope rules. Under `--scope auto`,
+they also search upward for the nearest `relay-workflows/` directory so workflow
+definitions can live in a project without `.relay/` state. This workflow-only
+marker never changes project discovery for other Relay commands; they continue to
+use `.relay/` semantics.
+
 This lets a nested project retain its session when commands run from deeper
 directories. In a monorepo, start with `--scope current` in a package directory
 to give that subtree independent Relay state. Git snapshots and changed paths
@@ -522,9 +587,10 @@ Relay's inspectable project-local layout is:
 Session JSON records and JSON Lines events use on-disk `schema_version: 1`;
 the crate version is independent. Optional continuation fields are
 backward-compatible. Rust-owned run aggregates use separate closed
-`schema_version: 4` with bounded retry history and successful-attempt output provenance. Aggregate v1 records omit
-`jobs` and imply `jobs: 1`; aggregate v2 records store `jobs` but no retry
-history. Clean v1/v2/v3 records migrate to v4 on safe resume. Running or
+schema_version: 5 with bounded retry history, successful-attempt output provenance,
+and optional reusable-workflow identity metadata. Aggregate v1 records omit
+jobs and imply jobs: 1; aggregate v2 records store jobs but no retry history.
+Clean v1/v2/v3/v4 records migrate to v5 on safe resume. Running or
 indeterminate records remain non-resumable. Unsupported versions, unknown
 fields, and malformed JSON/JSONL are reported, never silently upgraded,
 discarded, or overwritten.

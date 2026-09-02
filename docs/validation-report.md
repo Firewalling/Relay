@@ -425,3 +425,39 @@ replace repository tools, source inspection, or native task runners. The stronge
 keep decision is the durable session/context/handoff plus crash-safe run state;
 the strongest simplify/deprecate decisions are verbose DAG authoring and the
 unconsumed future protocol advertisement.
+
+## 14. Reusable workflows milestone
+
+This section supersedes the historical recommendation above for the current
+workflow milestone. Workflow definitions live in version-controlled
+relay-workflows/ JSON files. The Rust resolver validates bounded scalar inputs,
+explicit argv references, task DAGs, retries, task outputs, and artifact inputs,
+then calls the existing plan-v3 coordinator.
+
+Real Go integration used a locally built relay-supervisor and an isolated
+project with actual local task programs. Workflow verify ran inspect, format, test, and report
+tasks with a required profile input, structured JSON outputs, file artifacts,
+and downstream output consumption. It completed twice as fresh runs. An
+interrupted run was resumed after changing its workflow file; persisted plan
+arguments and exact output attempt provenance remained unchanged, with no
+duplicate successful inspect attempt. The same resume path also passed after
+definition deletion and malformed replacement in the Rust integration suite.
+
+Workflow-level output aliases, composition, imports, Lua, scripting, dynamic
+control flow, remote execution, daemon mode, secret management, and provider
+integrations remain deliberately deferred.
+
+### Review answers
+
+1. Resolution is deterministic: sorted JSON files, BTreeMap inputs, ordered tasks, and canonical serialization.
+2. Malformed definitions and inputs launch zero child processes; validation precedes preflight.
+3. String inputs stay single literal argv elements; no shell or interpolation exists.
+4. Workflow execution calls existing plan-v3 DAG machinery; no second scheduler exists.
+5. A changed definition cannot alter an existing interrupted run; persisted plan wins.
+6. Deleting or malforming live definition does not block safe workflow resume.
+7. State stores workflow name, schema version, SHA-256, resolved inputs, and sanitized plan.
+8. Output and artifact trust checks remain in existing Rust finalization and consumption paths.
+9. File, count, name, input, task, parser-depth, metadata, plan, output, and aggregate bounds are enforced.
+10. The schema has no expressions, branching, loops, imports, functions, or dynamic task generation.
+11. Direct relay run remains covered by the existing full Rust and real Go suites.
+12. Small workflow definitions remove repeated plan boilerplate while retaining explicit task configuration.

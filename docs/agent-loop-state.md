@@ -607,3 +607,17 @@ cargo test --all-targets --all-features                   PASS (68 tests)
 1. In a new authorized run on a workstation with a verified Go toolchain, implement the strict protocol-v1 Go decoder, minimal versioned Go-owned run-state schema, and canonical Go CI gates.
 2. Add bounded dependency-aware direct-argv supervision with filtered environments, bounded secret-safe logs, cancellation/timeouts, explicit retries, child cleanup, and deterministic status/resume.
 3. Only after that execution boundary is verified, add the embedded sandboxed Lua workflow validator/runtime and the required Rust/Go/Lua end-to-end test.
+
+## Current architecture note — reusable workflows
+
+The historical cycle log above predates the reusable-workflows milestone. Relay
+now also supports version-controlled JSON definitions in
+relay-workflows/, typed scalar inputs, explicit argv references, and
+workflow list/show/validate/run commands. Rust resolves each definition into
+the existing plan-v3 scheduler; no Lua or workflow runtime was added.
+
+Aggregate run-state schema v5 optionally stores workflow name, workflow schema
+version, canonical definition SHA-256, resolved inputs, and the sanitized
+resolved plan. Workflow resume uses that persisted plan after live definition
+changes, deletion, or malformed contents. Existing direct plan runs and older
+aggregate state schemas remain supported through explicit migration.

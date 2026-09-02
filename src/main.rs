@@ -3,7 +3,7 @@ use relay::{
     app,
     cli::{Cli, Command, generate_completions},
     model::{ErrorEnvelope, OUTPUT_SCHEMA_VERSION, OutputError, SuccessEnvelope},
-    orchestrate, project, supervise,
+    orchestrate, project, supervise, workflow,
 };
 use serde::Serialize;
 use std::{env, ffi::OsStr, io::Write, process::ExitCode};
@@ -32,6 +32,47 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Command::Workflow(args) = cli.command {
+        let project = match project::discover_workflow(&invocation_directory, cli.scope) {
+            Ok(project) => project,
+            Err(error) => {
+                emit_error(
+                    json_output,
+                    command_name,
+                    "project_discovery",
+                    &error.to_string(),
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        return match workflow::run(args, &invocation_directory, &project.relay_project_root) {
+            Ok(workflow::WorkflowResult::Inspection(output)) => {
+                emit_success(json_output, command_name, output)
+            }
+            Ok(workflow::WorkflowResult::Run(result)) => {
+                let exit_code = if result.succeeded() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                };
+                emit_success(json_output, command_name, result.output);
+                exit_code
+            }
+            Err(workflow::WorkflowError::Run(error)) => {
+                emit_run_error(json_output, command_name, &error);
+                ExitCode::FAILURE
+            }
+            Err(error) => {
+                emit_error(
+                    json_output,
+                    command_name,
+                    "workflow_invalid",
+                    &error.to_string(),
+                );
+                ExitCode::FAILURE
+            }
+        };
+    }
     if let Command::Run(args) = cli.command {
         let project = match project::discover(&invocation_directory, cli.scope) {
             Ok(project) => project,

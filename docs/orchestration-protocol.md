@@ -26,7 +26,7 @@ output schema version, and on-disk state schema version are independent:
 - `protocol_version: 1` identifies this orchestration contract.
 - `relay_version` identifies the Relay binary that reported it.
 - `output_schema_version: 1` identifies Relay's success and error envelopes.
-- aggregate run-state schema_version: 4 identifies the Rust-owned DAG state schema with bounded retry history and task-output provenance; immutable protocol manifest remains v1.
+- aggregate run-state schema_version: 5 identifies the Rust-owned DAG state with bounded retry history, task-output provenance, and optional workflow identity metadata; immutable protocol manifest remains v1.
 
 `relay protocol` is project-independent. Global options may precede or follow
 the subcommand, and even `--scope repository` does not trigger repository
@@ -130,9 +130,9 @@ stdin data.
   Rust `run` command, so that coordinator does not retroactively change the
   manifest. Advertising it, advertising parallel execution, or changing
   allowed operations requires a future protocol version and fixtures.
-- **Lua** remains the owner of a future workflow layer and remains
-  `implemented: false`; there is no workflow language, parser, runtime, or
-  sandbox.
+- **Lua** remains the owner of a future scripting/workflow-runtime layer and
+  remains unimplemented; no Lua language, runtime, or sandbox exists. Rust's
+  declarative reusable workflow configuration is separate and documented below.
 
 The Rust aggregate run-state schema and Go attempt-record schema are separately
 versioned subordinate contracts, not extensions to Rust's existing project
@@ -237,11 +237,11 @@ success was followed by coordinator kill; resume reported reconciliation
 
 ### Aggregate and attempt state ownership
 
-Aggregate run-state v4 is a closed Rust schema. By default Rust atomically
+Aggregate run-state v5 is a closed Rust schema. By default Rust atomically
 persists it at `<project>/.relay/runs/<run-uuid>.json`; `--state-path` selects
 an absolute custom path, which remains Rust-owned. Valid aggregate v1 records
-omit `jobs` and imply sequential `jobs: 1`; v2 records include `jobs` but
-no retry history. Clean v1/v2/v3 records migrate to v4 on safe resume. Running
+omit jobs and imply sequential jobs: 1; v2 records include jobs but no retry
+history. Clean v1/v2/v3/v4 records migrate to v5 on safe resume. Running
 records are reconciled from strict Go evidence before scheduling; unresolved
 running and indeterminate records remain non-resumable.
 Custom paths containing a `.relay` component are accepted only beneath the
@@ -337,6 +337,73 @@ Neither the coordinator nor the supervisor guarantees containment or cleanup of 
 that detaches into another session/group, nor recovery after supervisor
 `SIGKILL`, kernel failure, or machine loss; use an external cgroup or service
 boundary when those guarantees are required.
+
+## Reusable workflow definitions
+
+Reusable workflows are a Rust-owned CLI layer above plan decoding. Definitions
+are version-controlled JSON files in `<project>/relay-workflows/`. Discovery is
+non-recursive, project-scoped, deterministic, capped at 64 files, and rejects
+symlinked directories or files. Workflow names use `[A-Za-z0-9][A-Za-z0-9._-]{0,47}`; definitions use `schema_version` 1 and closed
+objects. The definition name is the identity; JSON filenames only need a `.json`
+extension.
+
+The schema supports up to 16 scalar inputs (string, integer, boolean) with
+required/default fields and up to 64 tasks. Task configuration, retries,
+declared JSON/file outputs, and typed downstream output inputs reuse plan-v3
+semantics. Arguments are literal strings or explicit objects such as
+{"workflow_input":"profile"}. Input values become literal argv elements;
+there is no interpolation, shell evaluation, expression parser, environment
+lookup, command substitution, workflow import, or nested workflow call.
+Omitted task timeout defaults to 60,000 ms; remaining task defaults match
+plan-v3. Programs and explicit working directories remain absolute paths.
+
+~~~json
+{
+  "schema_version": 1,
+  "name": "verify",
+  "inputs": {"profile": {"type": "string", "default": "dev"}},
+  "tasks": [
+    {"id": "inspect", "program": "/usr/bin/cargo", "arguments": ["metadata"]},
+    {"id": "test", "depends_on": ["inspect"], "program": "/usr/bin/cargo",
+     "arguments": ["test", "--profile", {"workflow_input": "profile"}]}
+  ]
+}
+~~~
+
+Use stable commands to enumerate, inspect, validate, and execute:
+
+~~~text
+relay workflow list
+relay workflow show verify
+relay workflow validate verify --input profile=release
+relay workflow run verify --input profile=release
+relay workflow run verify --resume /absolute/path/to/run.json
+~~~
+
+Validation reads and resolves only; malformed definitions, duplicate JSON keys,
+unknown fields, invalid names, bad types/defaults/references, cycles, unsafe
+paths, and bounds fail before preflight or child launch. Workflow resolution
+produces the existing sanitized plan model, so the existing Rust scheduler,
+bounded parallelism, retry, cancellation, structured-output, artifact, and
+reconciliation rules remain authoritative. Workflow-level output aliases and
+composition are intentionally absent.
+
+Fresh workflow aggregate state is schema v5 and includes optional metadata:
+workflow name, workflow schema version, canonical definition SHA-256, resolved
+scalar inputs, and the resolved sanitized plan. Resume reads that persisted plan
+without reparsing the live definition. A valid changed definition may produce a
+notice but never changes execution; deleted, malformed, or symlinked definitions
+do not prevent safe resume. Passing new --input values during resume is rejected;
+persisted inputs remain authoritative and are not a secret store.
+Workflow definitions execute user-selected local commands and are not a sandbox or trust boundary. The definition hash identifies normalized content; it is not protection against a malicious local user.
+
+Workflow files are capped at 1 MiB, names and input names at 48 bytes, input
+strings at 4 KiB, and persisted workflow metadata at 16 KiB. The workflow layer
+adds no Lua, scripting, conditionals, loops, matrices, functions, dynamic task
+generation, schedules, triggers, daemon, remote executor, network service,
+registry, secret manager, UI/TUI, cache, or model/provider integration.
+
+Resolved plan encoding remains capped at 1 MiB after input expansion and working-directory resolution.
 
 ## Go one-child supervisor
 
