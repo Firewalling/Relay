@@ -461,3 +461,17 @@ integrations remain deliberately deferred.
 10. The schema has no expressions, branching, loops, imports, functions, or dynamic task generation.
 11. Direct relay run remains covered by the existing full Rust and real Go suites.
 12. Small workflow definitions remove repeated plan boilerplate while retaining explicit task configuration.
+## 15. Agent-native handoff milestone
+
+This milestone adds immutable schema-version-2 handoff records without adding an agent runtime. Relay remains local, deterministic, bounded, and Rust-owned for lifecycle, storage, Git, aggregate run state, workflow metadata, and trusted output validation.
+
+Structured records append to .relay/handoffs.jsonl and receive UUIDs. Generated Markdown remains under .relay/handoffs/ as a deterministic human view. The old relay handoff AGENT form still creates records; relay handoff create --to AGENT adds explicit target syntax. show, latest, list, and context --handoff consume records without transcript access or read-time migration. Legacy Markdown-only artifacts remain byte-preserved and readable.
+
+Records snapshot goal, source/target statements, typed explicit and recorded-note entries, checkpoints, notes, scoped Git branch/commit/cleanliness/changed files, and optional aggregate run/workflow state. Run reads use project-local nofollow state access without taking a live coordinator's exclusive lock. Handoff ledger capacity validation and append share one no-follow file descriptor under project lock. Outputs are attached only when existing Rust validation proves successful task and attempt provenance; structured JSON stays bounded and file artifact bytes are not copied.
+
+Real Agent A to Agent B scenario used a temporary Git repository and locally built relay-supervisor. Agent A started a session, recorded a decision, created a checkpoint, ran a reusable workflow producing one JSON output and one file artifact, changed a tracked file, and created a handoff. A fresh environment process consumed context --handoff with the exact handoff ID and observed goal, explicit work, decision, checkpoint, branch, commit, changed file, run identity, workflow hash, trusted output hash/attempt identity, artifact reference, and next action. Ledger text did not contain file artifact contents. After changing the workflow definition, Git state, and notes, the original handoff JSON remained byte-equivalent and still showed its creation-time Git/run snapshots.
+
+Security coverage rejects project escapes, traversal, symlinked or hardlinked handoff/run files, malformed or unsupported records, duplicate IDs, oversized state, stale/tampered run outputs, and invalid provenance. Human rendering escapes terminal controls. Persisted free text, workflow inputs, and structured values remain user-visible data; Relay does not reconstruct secrets or redacted argv values.
+Verification passed: cargo fmt --check, strict Cargo Clippy, complete Rust targets (237 tests), gofmt, git diff --check, go vet, race-enabled Go tests (three packages), real Go supervisor build, and real Rust-to-Go run suite (108 tests).
+
+Deferred remain provider APIs, prompt generation, agent spawning, autonomous loops, daemons, networking, remote handoffs, authentication, uploads, embeddings, semantic ranking, workflow control flow, scripting, and UI/TUI.

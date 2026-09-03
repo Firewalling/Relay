@@ -78,6 +78,8 @@ pub fn capture(directory: &Path) -> Result<GitSnapshot, GitError> {
         clean: Some(changed_files.is_empty()),
         changed_files,
         git_path_encoding: escaped.then(|| "escaped_bytes_v1".into()),
+        changed_files_truncated: false,
+        changed_files_omitted: 0,
     })
 }
 

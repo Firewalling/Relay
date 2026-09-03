@@ -621,3 +621,18 @@ version, canonical definition SHA-256, resolved inputs, and the sanitized
 resolved plan. Workflow resume uses that persisted plan after live definition
 changes, deletion, or malformed contents. Existing direct plan runs and older
 aggregate state schemas remain supported through explicit migration.
+## Cycle 9 — agent-native handoffs
+
+This cycle extends Relay continuity with schema-versioned handoff snapshots. Relay remains a synchronous local Rust coordinator and does not become an agent runtime.
+
+Structured records use schema version 2 and UUID identity. Each record captures creation time, target agent, optional explicit source agent, session snapshot, goal, completed/decision/blocker/next-action entries, entry provenance, unavailable markers, bounded Git state, checkpoint/note references, and optional run/workflow/output references. Explicit statements are labeled explicit; imported note facts are labeled recorded_note; Git and run/output data remain separate derived/trusted sections.
+
+Records append to .relay/handoffs.jsonl. One generated Markdown view remains under .relay/handoffs/ for human use. Renderer reads structured data; Markdown is derivative. Legacy Markdown-only artifacts remain readable without read-time migration. Unsupported versions, malformed records, duplicate IDs, oversized state, and unsafe paths fail without rewriting source bytes.
+
+Run references use canonical project-local aggregate state. A lock-free nofollow reader allows a live run status snapshot without competing with its coordinator lock. Existing Rust aggregate validation remains authoritative. Only successful task outputs with matching attempt, attempt-run, hash, size, type, path, and task provenance are exposed. File contents stay outside handoff records; bounded structured JSON values may be copied because aggregate output semantics already persist them. Workflow name/schema/hash/inputs are copied as a historical snapshot.
+
+Agent B can consume relay context --handoff latest or an exact ID. Human output is concise, deterministic, control-character-safe, and bounded. JSON returns the handoff plus session, Git, notes, checkpoints, runs, outputs, unavailable sections, and truncation metadata in the existing output-schema-v1 envelope. Later Git edits, notes, workflow edits, run transitions, and artifact changes do not mutate an existing record; a new handoff captures new state.
+
+Security review covers project-local run paths, traversal, symlink and hardlink rejection, malformed legacy input, duplicate IDs, redacted argv preservation, bounded fields, JSON string encoding, and untrusted persisted text. Free-text fields remain persisted data, not a secret store or executable instruction source.
+
+Deferred: provider APIs, prompt generation, agent spawning, autonomous loops, daemons, networking, remote handoffs, authentication, uploads, semantic ranking, embeddings, UI/TUI, workflow conditions, scripting, and secret management.

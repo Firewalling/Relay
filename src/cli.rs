@@ -315,6 +315,9 @@ pub struct ContextArgs {
     /// Select a session UUID or unambiguous prefix.
     #[arg(long)]
     pub session: Option<String>,
+    /// Select a structured handoff UUID, prefix, or latest alias.
+    #[arg(long)]
+    pub handoff: Option<String>,
     /// Include only these note categories.
     #[arg(long = "category", value_enum)]
     pub categories: Vec<NoteCategory>,
@@ -350,25 +353,47 @@ pub struct CheckpointArgs {
 
 #[derive(Debug, Args)]
 pub struct HandoffArgs {
-    /// Agent receiving the handoff.
-    #[arg(value_parser = parse_agent)]
+    /// Existing target-agent form, or create/show/latest/list action.
+    #[arg(default_value = "__create__", value_parser = parse_handoff_subject)]
     pub agent: String,
-
+    /// Handoff UUID or prefix for the show action.
+    pub selector: Option<String>,
+    /// Agent receiving the handoff in explicit create form.
+    #[arg(long, alias = "target", value_parser = parse_agent)]
+    pub to: Option<String>,
+    /// Agent creating the handoff, when explicitly known.
+    #[arg(long = "source-agent", alias = "from", value_parser = parse_agent)]
+    pub source_agent: Option<String>,
+    /// Optional handoff goal override.
+    #[arg(long, value_parser = parse_goal)]
+    pub goal: Option<String>,
     /// Work completed during the session.
-    #[arg(long = "completed-work")]
+    #[arg(long = "completed-work", alias = "completed")]
     pub completed_work: Vec<String>,
-
     /// An important decision made during the session.
     #[arg(long)]
     pub decision: Vec<String>,
-
     /// A failure or blocked item.
-    #[arg(long)]
+    #[arg(long = "failure", alias = "blocker")]
     pub failure: Vec<String>,
-
     /// Suggested next action for the receiving agent.
     #[arg(long = "next-action")]
     pub next_action: Option<String>,
+    /// Additional suggested next actions.
+    #[arg(long = "next-actions")]
+    pub next_actions: Vec<String>,
+    /// Project-local aggregate run state to reference.
+    #[arg(long = "run")]
+    pub runs: Vec<std::path::PathBuf>,
+    /// Explicit checkpoint UUID, prefix, or latest selector.
+    #[arg(long = "checkpoint")]
+    pub checkpoints: Vec<String>,
+    /// Explicit note event UUID or prefix.
+    #[arg(long = "note")]
+    pub notes: Vec<String>,
+    /// Previous handoff UUID to supersede.
+    #[arg(long)]
+    pub supersedes: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -457,6 +482,10 @@ fn parse_rfc3339_utc(value: &str) -> Result<DateTime<Utc>, String> {
             "invalid RFC3339 timestamp; expected a value such as 2025-01-02T03:04:05Z or 2025-01-02T03:04:05+02:00"
                 .to_owned()
         })
+}
+
+fn parse_handoff_subject(value: &str) -> Result<String, String> {
+    parse_nonblank(value, "handoff action or target agent")
 }
 
 fn parse_goal(value: &str) -> Result<String, String> {
@@ -789,5 +818,52 @@ mod tests {
     #[test]
     fn supervise_requires_separator_for_program_argv() {
         assert!(Cli::try_parse_from(["relay", "supervise", "/usr/bin/printf"]).is_err());
+    }
+    #[test]
+    fn parses_structured_handoff_actions_and_context_selector() {
+        let cli = Cli::try_parse_from([
+            "relay",
+            "handoff",
+            "create",
+            "--to",
+            "agent-b",
+            "--from",
+            "agent-a",
+            "--next-actions",
+            "review",
+            "--run",
+            ".relay/runs/run.json",
+        ])
+        .unwrap();
+        let Command::Handoff(args) = cli.command else {
+            panic!("expected handoff create");
+        };
+        assert_eq!(args.agent, "create");
+        assert_eq!(args.selector, None);
+        assert_eq!(args.to.as_deref(), Some("agent-b"));
+        assert_eq!(args.source_agent.as_deref(), Some("agent-a"));
+        assert_eq!(args.next_actions, ["review"]);
+        assert_eq!(
+            args.runs,
+            [std::path::PathBuf::from(".relay/runs/run.json")]
+        );
+
+        let Command::Handoff(args) = Cli::try_parse_from(["relay", "handoff", "show", "1234"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected handoff show");
+        };
+        assert_eq!(args.agent, "show");
+        assert_eq!(args.selector.as_deref(), Some("1234"));
+
+        let Command::Context(args) =
+            Cli::try_parse_from(["relay", "context", "--handoff", "latest"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected context");
+        };
+        assert_eq!(args.handoff.as_deref(), Some("latest"));
     }
 }

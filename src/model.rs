@@ -1,12 +1,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
 pub const OUTPUT_SCHEMA_VERSION: u32 = 1;
 pub const ORCHESTRATION_PROTOCOL_VERSION: u32 = 1;
+pub const HANDOFF_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -111,6 +113,7 @@ pub struct Checkpoint {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitSnapshot {
     pub schema_version: u32,
     pub available: bool,
@@ -121,6 +124,196 @@ pub struct GitSnapshot {
     pub changed_files: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_path_encoding: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub changed_files_truncated: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub changed_files_omitted: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffRecord {
+    pub schema_version: u32,
+    pub id: Uuid,
+    pub artifact_path: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session: Option<HandoffSessionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_agent: Option<String>,
+    pub target_agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub completed: Vec<HandoffEntry>,
+    #[serde(default)]
+    pub decisions: Vec<HandoffEntry>,
+    #[serde(default)]
+    pub blockers: Vec<HandoffEntry>,
+    #[serde(default)]
+    pub next_actions: Vec<HandoffEntry>,
+    pub references: HandoffReferences,
+    pub git: GitSnapshot,
+    #[serde(default)]
+    pub unavailable: Vec<HandoffUnavailable>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffEntry {
+    pub text: String,
+    pub source: HandoffEntrySource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffEntrySource {
+    Explicit,
+    RecordedNote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffUnavailable {
+    SourceSession,
+    SourceAgent,
+    Goal,
+    Completed,
+    Decisions,
+    Blockers,
+    NextActions,
+    Git,
+    Checkpoints,
+    Notes,
+    Runs,
+    Outputs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffSessionSnapshot {
+    pub id: Uuid,
+    pub goal: String,
+    pub state: SessionState,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffReferences {
+    #[serde(default)]
+    pub checkpoints: Vec<HandoffCheckpointReference>,
+    #[serde(default)]
+    pub notes: Vec<HandoffNoteReference>,
+    #[serde(default)]
+    pub runs: Vec<HandoffRunReference>,
+    #[serde(default)]
+    pub outputs: Vec<HandoffOutputReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffCheckpointReference {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    pub path: String,
+    pub git: GitSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffNoteReference {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub category: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffRunReference {
+    pub run_id: String,
+    pub state_path: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<HandoffWorkflowSnapshot>,
+    #[serde(default)]
+    pub tasks: Vec<HandoffTaskSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffWorkflowSnapshot {
+    pub name: String,
+    pub schema_version: u32,
+    pub definition_sha256: String,
+    pub inputs: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffTaskSnapshot {
+    pub id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_run_id: Option<String>,
+    #[serde(default)]
+    pub outputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffOutputReference {
+    pub run_id: String,
+    pub task: String,
+    pub output: String,
+    pub attempt: u32,
+    pub attempt_run_id: String,
+    #[serde(rename = "type")]
+    pub output_type: HandoffOutputType,
+    pub path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffOutputType {
+    Json,
+    File,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
