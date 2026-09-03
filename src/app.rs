@@ -15,6 +15,8 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::{
     collections::HashSet,
     fs,
@@ -2311,39 +2313,138 @@ fn operation_is_provably_complete(
     marker: &OperationMarker,
     events: &[Event],
 ) -> bool {
-    let paths_safe = marker.effects.iter().all(|effect| {
-        let path = Path::new(&effect.path);
-        effect.completed
-            && !path.is_absolute()
-            && path.components().all(|component| {
-                matches!(
-                    component,
-                    std::path::Component::Normal(_) | std::path::Component::CurDir
-                )
-            })
-            && effect.path.starts_with(".relay/")
-            && project.join(path).exists()
-    });
-    if !paths_safe {
-        return false;
-    }
-    let expected_event = match marker.command.as_str() {
-        "start" => Some("session.started"),
-        "resume" => Some("session.resumed"),
-        "checkpoint" => Some("checkpoint.created"),
-        "handoff" => Some("handoff.generated"),
-        "finish" => Some("session.finished"),
-        "note" => Some("note.recorded"),
-        "history.materialize" => None,
+    let (expected_effects, expected_event) = match marker.command.as_str() {
+        "start" => (
+            &["session_record", "current_session", "event"][..],
+            Some("session.started"),
+        ),
+        "resume" => (
+            &["session_record", "current_session", "event"][..],
+            Some("session.resumed"),
+        ),
+        "checkpoint" => (&["artifact", "event"][..], Some("checkpoint.created")),
+        "handoff" => (
+            &[
+                "record",
+                "artifact",
+                "event",
+                "session_record",
+                "current_session",
+            ][..],
+            Some("handoff.generated"),
+        ),
+        "finish" => (
+            &["artifact", "event", "session_record", "current_session"][..],
+            Some("session.finished"),
+        ),
+        "note" => (&["event"][..], Some("note.recorded")),
+        "history.materialize" => (&["session_record"][..], None),
         _ => return false,
     };
+    if marker.effects.len() != expected_effects.len()
+        || marker
+            .effects
+            .iter()
+            .zip(expected_effects)
+            .any(|(effect, expected)| effect.kind != *expected)
+    {
+        return false;
+    }
+    if marker
+        .effects
+        .iter()
+        .any(|effect| !effect.completed || !operation_effect_is_safe(project, marker, effect))
+    {
+        return false;
+    }
     expected_event.is_none_or(|kind| {
         marker.session_id.is_some_and(|session_id| {
-            events
-                .iter()
-                .any(|event| event.session_id == session_id && event.event_type == kind)
+            events.iter().any(|event| {
+                event.session_id == session_id
+                    && event.event_type == kind
+                    && operation_event_matches(marker, event)
+            })
         })
     })
+}
+
+fn operation_effect_is_safe(
+    project: &Path,
+    marker: &OperationMarker,
+    effect: &OperationEffect,
+) -> bool {
+    let path = Path::new(&effect.path);
+    if path.is_absolute()
+        || !path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+        || !effect.path.starts_with(".relay/")
+    {
+        return false;
+    }
+    let path_matches = match effect.kind.as_str() {
+        "event" => effect.path == ".relay/events.jsonl",
+        "record" => effect.path == ".relay/handoffs.jsonl",
+        "current_session" => effect.path == ".relay/session.json",
+        "session_record" => marker
+            .session_id
+            .is_some_and(|id| effect.path == format!(".relay/sessions/{id}.json")),
+        "artifact" => match marker.command.as_str() {
+            "checkpoint" => {
+                effect.path.starts_with(".relay/checkpoints/")
+                    && path.extension() == Some(std::ffi::OsStr::new("json"))
+            }
+            "handoff" => {
+                effect.path.starts_with(".relay/handoffs/")
+                    && path.extension() == Some(std::ffi::OsStr::new("md"))
+            }
+            "finish" => marker
+                .session_id
+                .is_some_and(|id| effect.path == format!(".relay/summary-{id}.md")),
+            _ => false,
+        },
+        _ => false,
+    };
+    path_matches && operation_effect_file_is_safe(project, path)
+}
+
+fn operation_effect_file_is_safe(project: &Path, path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(project.join(path)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        metadata.is_file() && metadata.nlink() == 1
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
+fn operation_event_matches(marker: &OperationMarker, event: &Event) -> bool {
+    let artifact = marker
+        .effects
+        .iter()
+        .find(|effect| effect.kind == "artifact")
+        .map(|effect| effect.path.as_str());
+    match marker.command.as_str() {
+        "checkpoint" => event.payload["path"].as_str() == artifact,
+        "handoff" => {
+            event.payload["path"].as_str() == artifact
+                && event.payload["record_path"].as_str()
+                    == marker
+                        .effects
+                        .iter()
+                        .find(|effect| effect.kind == "record")
+                        .map(|effect| effect.path.as_str())
+        }
+        "finish" => event.payload["summary_path"].as_str() == artifact,
+        _ => true,
+    }
 }
 
 fn inspect_artifacts(
@@ -2748,10 +2849,21 @@ fn create_state_directories(paths: &Paths) -> Result<(), AppError> {
         &paths.sessions,
         &paths.operations,
     ] {
+        #[cfg(unix)]
+        let existed = fs::symlink_metadata(path).is_ok();
         fs::create_dir_all(path).map_err(|source| AppError::Io {
             path: path.to_owned(),
             source,
         })?;
+        #[cfg(unix)]
+        if path == &paths.handoffs && !existed {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+                AppError::Io {
+                    path: path.to_owned(),
+                    source,
+                }
+            })?;
+        }
     }
     Ok(())
 }
@@ -2788,10 +2900,19 @@ fn validate_state_paths(paths: &Paths) -> Result<(), AppError> {
 }
 
 fn relative_to_project(project: &Path, path: &Path) -> String {
-    path.strip_prefix(project)
+    let relative = path
+        .strip_prefix(project)
         .unwrap_or(path)
         .to_string_lossy()
-        .into_owned()
+        .into_owned();
+    #[cfg(windows)]
+    {
+        relative.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        relative
+    }
 }
 
 fn state_name(state: &SessionState) -> &'static str {
@@ -2878,7 +2999,7 @@ mod tests {
 
     fn handoff_args(agent: &str) -> HandoffArgs {
         HandoffArgs {
-            agent: agent.into(),
+            agent: Some(agent.into()),
             selector: None,
             to: None,
             source_agent: None,
@@ -3055,7 +3176,7 @@ mod tests {
         )
         .unwrap();
         let args = HandoffArgs {
-            agent: "codex".into(),
+            agent: Some("codex".into()),
             selector: None,
             to: None,
             source_agent: None,

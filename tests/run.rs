@@ -5814,6 +5814,23 @@ fn handoff_carries_trusted_run_outputs_without_copying_artifacts() {
             .unwrap()
             .contains("fake report")
     );
+    let ledger = harness.directory.path().join(".relay/handoffs.jsonl");
+    let ledger_before = fs::read(&ledger).unwrap();
+    let output_path = harness
+        .directory
+        .path()
+        .join(outputs[0]["path"].as_str().unwrap());
+    fs::write(&output_path, b"tampered").unwrap();
+    let id = record["id"].as_str().unwrap();
+    let reread = harness
+        .command()
+        .args(["--json", "--scope", "current", "context", "--handoff", id])
+        .output()
+        .unwrap();
+    assert!(!reread.status.success());
+    assert!(reread.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&reread.stderr).contains("changed after persistence"));
+    assert_eq!(fs::read(&ledger).unwrap(), ledger_before);
 }
 #[test]
 fn handoff_reads_running_run_without_taking_aggregate_lock() {

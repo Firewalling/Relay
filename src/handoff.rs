@@ -7,7 +7,8 @@ use crate::{
         HandoffSessionSnapshot, HandoffTaskSnapshot, HandoffUnavailable, HandoffWorkflowSnapshot,
         SCHEMA_VERSION, Session, SessionState,
     },
-    orchestrate::{OutputRecord, OutputType, RunState, TaskStatus},
+    orchestrate::{AttemptStatus, OutputRecord, OutputType, RunState, TaskStatus},
+    storage,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::Value;
@@ -52,7 +53,7 @@ fn safe_regular_file(metadata: &fs::Metadata) -> bool {
 fn safe_regular_file(metadata: &fs::Metadata) -> bool {
     metadata.is_file()
 }
-fn read_handoff_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
+fn open_handoff_file(path: &Path) -> Result<fs::File, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("could not inspect handoff file {}: {error}", path.display()))?;
     if metadata.file_type().is_symlink() {
@@ -64,12 +65,6 @@ fn read_handoff_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
     if !safe_regular_file(&metadata) {
         return Err(format!(
             "handoff file is not a singly-linked regular file: {}",
-            path.display()
-        ));
-    }
-    if metadata.len() > maximum {
-        return Err(format!(
-            "handoff file exceeds {maximum} bytes: {}",
             path.display()
         ));
     }
@@ -89,6 +84,24 @@ fn read_handoff_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
     if !safe_regular_file(&opened) {
         return Err(format!(
             "handoff file is not a singly-linked regular file: {}",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+fn validate_handoff_file(path: &Path) -> Result<(), String> {
+    open_handoff_file(path).map(|_| ())
+}
+
+fn read_handoff_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
+    let file = open_handoff_file(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect handoff file {}: {error}", path.display()))?;
+    if metadata.len() > maximum {
+        return Err(format!(
+            "handoff file exceeds {maximum} bytes: {}",
             path.display()
         ));
     }
@@ -114,8 +127,8 @@ pub enum HandoffAction {
 }
 
 pub fn action(args: &HandoffArgs) -> Result<HandoffAction, String> {
-    match args.agent.as_str() {
-        "__create__" => {
+    match args.agent.as_deref() {
+        None => {
             if args.selector.is_some() {
                 return Err("handoff create does not accept a selector".into());
             }
@@ -125,25 +138,25 @@ pub fn action(args: &HandoffArgs) -> Result<HandoffAction, String> {
                 .ok_or_else(|| "handoff create requires --to <agent>".to_owned())?;
             Ok(HandoffAction::Create { target })
         }
-        "show" => {
+        Some("show") => {
             if args.selector.is_none() || has_create_options(args) {
                 return Err("handoff show requires one id and no create options".into());
             }
             Ok(HandoffAction::Show(args.selector.clone().unwrap()))
         }
-        "latest" => {
+        Some("latest") => {
             if args.selector.is_some() || has_create_options(args) {
                 return Err("handoff latest accepts no selector or create options".into());
             }
             Ok(HandoffAction::Latest)
         }
-        "list" => {
+        Some("list") => {
             if args.selector.is_some() || has_create_options(args) {
                 return Err("handoff list accepts no selector or create options".into());
             }
             Ok(HandoffAction::List)
         }
-        "create" if args.to.is_some() => {
+        Some("create") if args.to.is_some() => {
             if args.selector.is_some() {
                 return Err("handoff create does not accept a selector".into());
             }
@@ -151,8 +164,8 @@ pub fn action(args: &HandoffArgs) -> Result<HandoffAction, String> {
                 target: args.to.clone().unwrap(),
             })
         }
-        "create" => Err("handoff create requires --to <agent>".into()),
-        subject => {
+        Some("create") => Err("handoff create requires --to <agent>".into()),
+        Some(subject) => {
             if args.selector.is_some() || args.to.is_some() {
                 return Err("target options require handoff create".into());
             }
@@ -251,101 +264,7 @@ pub fn read_records(path: &Path) -> Result<Vec<HandoffRecord>, String> {
         }
     }
     let bytes = read_handoff_bytes(path, MAX_HANDOFF_LEDGER_BYTES)?;
-    if bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-    if !bytes.ends_with(b"\n") {
-        return Err("handoff ledger has an unterminated final record".into());
-    }
-    let mut records = Vec::new();
-    let mut ids = HashSet::new();
-    for (index, line) in bytes
-        .strip_suffix(b"\n")
-        .unwrap_or(&bytes)
-        .split(|byte| *byte == b'\n')
-        .enumerate()
-    {
-        if index >= MAX_HANDOFF_COUNT {
-            return Err(format!(
-                "handoff ledger contains more than {MAX_HANDOFF_COUNT} records"
-            ));
-        }
-        if line.len() > MAX_HANDOFF_RECORD_BYTES {
-            return Err(format!(
-                "handoff record exceeds {MAX_HANDOFF_RECORD_BYTES} bytes"
-            ));
-        }
-        let value: Value = serde_json::from_slice(line).map_err(|error| {
-            format!(
-                "malformed structured handoff at line {}: {error}",
-                index + 1
-            )
-        })?;
-        let schema_version = value
-            .get("schema_version")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| "handoff record is missing integer schema_version".to_owned())?;
-        if schema_version != u64::from(HANDOFF_SCHEMA_VERSION) {
-            return Err(format!(
-                "unsupported handoff schema_version {schema_version}; this Relay supports {HANDOFF_SCHEMA_VERSION}"
-            ));
-        }
-        let record: HandoffRecord = serde_json::from_value(value).map_err(|error| {
-            format!(
-                "malformed structured handoff at line {}: {error}",
-                index + 1
-            )
-        })?;
-        validate_record(&record)?;
-        if !ids.insert(record.id) {
-            return Err(format!("duplicate handoff id {}", record.id));
-        }
-        records.push(record);
-    }
-    records.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| right.id.cmp(&left.id))
-    });
-    Ok(records)
-}
-
-pub fn check_append_capacity(path: &Path, record: &HandoffRecord) -> Result<(), String> {
-    let existing_count = read_records(path)?.len();
-    if existing_count >= MAX_HANDOFF_COUNT {
-        return Err(format!(
-            "handoff store reached maximum of {MAX_HANDOFF_COUNT} records"
-        ));
-    }
-    let existing = match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !safe_regular_file(&metadata) {
-                return Err(format!(
-                    "handoff ledger is not a singly-linked regular file: {}",
-                    path.display()
-                ));
-            }
-            metadata.len()
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-        Err(error) => {
-            return Err(format!(
-                "could not inspect handoff ledger {}: {error}",
-                path.display()
-            ));
-        }
-    };
-    let record_bytes = serde_json::to_vec(record)
-        .map_err(|error| format!("handoff cannot be encoded: {error}"))?
-        .len() as u64
-        + 1;
-    if existing.saturating_add(record_bytes) > MAX_HANDOFF_LEDGER_BYTES {
-        return Err(format!(
-            "handoff ledger exceeds {MAX_HANDOFF_LEDGER_BYTES} bytes"
-        ));
-    }
-    Ok(())
+    decode_records(&bytes)
 }
 
 fn decode_records(bytes: &[u8]) -> Result<Vec<HandoffRecord>, String> {
@@ -414,10 +333,22 @@ pub fn append_record(path: &Path, record: &HandoffRecord) -> Result<(), String> 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create handoff ledger directory: {error}"))?;
+    let file_existed = match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "could not inspect handoff ledger {}: {error}",
+                path.display()
+            ));
+        }
+    };
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true).create(true).append(true);
     #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    options
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600);
     let mut file = options.open(path).map_err(|error| {
         format!(
             "could not securely open handoff ledger {}: {error}",
@@ -455,6 +386,12 @@ pub fn append_record(path: &Path, record: &HandoffRecord) -> Result<(), String> 
             "handoff store reached maximum of {MAX_HANDOFF_COUNT} records"
         ));
     }
+    if existing_records
+        .iter()
+        .any(|existing| existing.id == record.id)
+    {
+        return Err(format!("duplicate handoff id {}", record.id));
+    }
     let mut line = serde_json::to_vec(record)
         .map_err(|error| format!("handoff cannot be encoded: {error}"))?;
     line.push(b'\n');
@@ -471,7 +408,16 @@ pub fn append_record(path: &Path, record: &HandoffRecord) -> Result<(), String> 
                 "could not append handoff ledger {}: {error}",
                 path.display()
             )
-        })
+        })?;
+    if !file_existed {
+        storage::sync_directory(parent).map_err(|error| {
+            format!(
+                "could not sync handoff ledger directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 pub fn read_stored(
@@ -480,6 +426,12 @@ pub fn read_stored(
     directory: &Path,
 ) -> Result<Vec<StoredHandoff>, String> {
     let records = read_records(ledger_path)?;
+    for record in &records {
+        validate_live_run_references(project, record)?;
+        for checkpoint in &record.references.checkpoints {
+            validate_handoff_file(&project.join(&checkpoint.path))?;
+        }
+    }
     let mut entries = Vec::with_capacity(records.len());
     let mut generated_paths = HashSet::with_capacity(records.len());
     for record in records {
@@ -618,6 +570,7 @@ pub fn select<'a>(
             .first()
             .ok_or_else(|| "no Relay handoff records exist".to_owned());
     }
+    let display_selector = safe_inline(Path::new(""), selector);
     let selector = selector.to_ascii_lowercase();
     let matches = entries
         .iter()
@@ -625,9 +578,9 @@ pub fn select<'a>(
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [entry] => Ok(entry),
-        [] => Err(format!("no Relay handoff matches `{selector}`")),
+        [] => Err(format!("no Relay handoff matches `{display_selector}`")),
         _ => Err(format!(
-            "handoff selector `{selector}` is ambiguous; use more UUID characters"
+            "handoff selector `{display_selector}` is ambiguous; use more UUID characters"
         )),
     }
 }
@@ -643,19 +596,30 @@ pub fn build_record(
     let HandoffAction::Create { target } = action(args)? else {
         return Err("handoff inspection action cannot create a record".into());
     };
-    let mut target = target;
     if args.to.is_some() {
         validate_agent(&target, "target agent")?;
     } else {
-        target = legacy_agent(&target);
+        validate_display_agent(&target, "target agent")?;
     }
     if let Some(source_agent) = args.source_agent.as_deref() {
         validate_agent(source_agent, "source agent")?;
     }
-    let goal = args.goal.clone().or_else(|| Some(session.goal.clone()));
-    if let Some(goal) = goal.as_deref() {
-        validate_nonblank_bounded(goal, MAX_HANDOFF_GOAL_BYTES, "handoff goal")?;
-    }
+    let (session_goal, _) =
+        bound_historical_nonblank(&session.goal, MAX_HANDOFF_GOAL_BYTES, "session goal")?;
+    let goal = if let Some(goal) = args.goal.clone() {
+        validate_nonblank_bounded(&goal, MAX_HANDOFF_GOAL_BYTES, "handoff goal")?;
+        Some(goal)
+    } else {
+        Some(session_goal.clone())
+    };
+    let session_last_agent = session
+        .last_agent
+        .as_deref()
+        .map(|value| {
+            bound_historical_nonblank(value, MAX_HANDOFF_AGENT_BYTES, "session agent")
+                .map(|(value, _)| value)
+        })
+        .transpose()?;
     let supersedes = args
         .supersedes
         .as_deref()
@@ -665,7 +629,7 @@ pub fn build_record(
 
     let note_candidates = note_references(events, session.id)?;
     let selected_notes = select_notes(&note_candidates, &args.notes)?;
-    let checkpoint_candidates = checkpoint_references(events, session.id)?;
+    let checkpoint_candidates = checkpoint_references(project, events, session.id)?;
     let selected_checkpoints = select_checkpoints(&checkpoint_candidates, &args.checkpoints)?;
 
     let explicit_completed = explicit_entries(&args.completed_work, None)?;
@@ -741,11 +705,11 @@ pub fn build_record(
     );
     let source_session = Some(HandoffSessionSnapshot {
         id: session.id,
-        goal: session.goal.clone(),
+        goal: session_goal,
         state: session.state.clone(),
         started_at: session.started_at,
         completed_at: session.completed_at,
-        last_agent: session.last_agent.clone(),
+        last_agent: session_last_agent,
         resumed_from: session.resumed_from,
     });
     let mut unavailable = Vec::new();
@@ -847,7 +811,7 @@ fn note_references(
         let Some(text) = event.payload.get("text").and_then(Value::as_str) else {
             continue;
         };
-        let (text, truncated) = bound_text(text, MAX_HANDOFF_ENTRY_BYTES);
+        let (text, truncated) = bound_historical_text(text, MAX_HANDOFF_ENTRY_BYTES);
         notes.push(HandoffNoteReference {
             id: event.id,
             session_id,
@@ -861,6 +825,7 @@ fn note_references(
 }
 
 fn checkpoint_references(
+    project: &Path,
     events: &[Event],
     session_id: Uuid,
 ) -> Result<Vec<HandoffCheckpointReference>, String> {
@@ -892,10 +857,11 @@ fn checkpoint_references(
             .and_then(Value::as_str)
             .ok_or_else(|| format!("checkpoint event {} is missing its path", event.id))?;
         validate_relative_reference(path, CHECKPOINT_DIRECTORY)?;
+        validate_handoff_file(&project.join(path))?;
         let (message, truncated) = checkpoint
             .message
             .as_deref()
-            .map(|value| bound_text(value, MAX_HANDOFF_ENTRY_BYTES))
+            .map(|value| bound_historical_text(value, MAX_HANDOFF_ENTRY_BYTES))
             .map_or((None, false), |(value, truncated)| (Some(value), truncated));
         checkpoints.push(HandoffCheckpointReference {
             id: checkpoint.id,
@@ -1116,7 +1082,76 @@ fn output_reference(
     })
 }
 
+fn validate_live_run_references(project: &Path, record: &HandoffRecord) -> Result<(), String> {
+    for run in &record.references.runs {
+        let state = crate::orchestrate::read_handoff_run(&project.join(&run.state_path), project)
+            .map_err(|error| {
+            format!("handoff run {} is no longer valid: {error}", run.run_id)
+        })?;
+        if state.run_id != run.run_id {
+            return Err(format!(
+                "handoff run {} has mismatched aggregate identity",
+                run.run_id
+            ));
+        }
+        for output in record
+            .references
+            .outputs
+            .iter()
+            .filter(|output| output.run_id == run.run_id)
+        {
+            let current = state
+                .tasks
+                .iter()
+                .filter(|task| task.id == output.task)
+                .flat_map(|task| task.attempts.iter())
+                .filter(|attempt| {
+                    attempt.status == AttemptStatus::Succeeded
+                        && attempt.attempt == output.attempt
+                        && attempt.run_id == output.attempt_run_id
+                })
+                .flat_map(|attempt| attempt.outputs.iter().flatten())
+                .find(|candidate| candidate.name == output.output)
+                .ok_or_else(|| {
+                    format!(
+                        "handoff output {}/{} is no longer trusted",
+                        output.task, output.output
+                    )
+                })?;
+            let current_type = match current.output_type {
+                OutputType::Json => HandoffOutputType::Json,
+                OutputType::File => HandoffOutputType::File,
+            };
+            let current_path = relative_project_path(project, Path::new(&current.path))?;
+            if current_type != output.output_type
+                || current_path != output.path
+                || current.size_bytes != output.size_bytes
+                || current.sha256.as_deref() != Some(output.sha256.as_str())
+                || current.value != output.value
+            {
+                return Err(format!(
+                    "handoff output {}/{} is no longer trusted",
+                    output.task, output.output
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn bound_git(mut git: GitSnapshot) -> GitSnapshot {
+    for value in [
+        &mut git.repository_root,
+        &mut git.branch,
+        &mut git.commit,
+        &mut git.git_path_encoding,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let (bounded, _) = bound_text(value, MAX_HANDOFF_PATH_BYTES);
+        *value = bounded;
+    }
     if git.changed_files.len() > MAX_HANDOFF_CHANGED_FILES {
         let omitted = git.changed_files.len() - MAX_HANDOFF_CHANGED_FILES;
         git.changed_files.truncate(MAX_HANDOFF_CHANGED_FILES);
@@ -1147,7 +1182,7 @@ pub fn validate_record(record: &HandoffRecord) -> Result<(), String> {
         ));
     }
     validate_relative_reference(&record.artifact_path, &(HANDOFF_DIRECTORY.to_owned() + "/"))?;
-    validate_agent(&record.target_agent, "target agent")?;
+    validate_display_agent(&record.target_agent, "target agent")?;
     if let Some(source_agent) = record.source_agent.as_deref() {
         validate_agent(source_agent, "source agent")?;
     }
@@ -1157,7 +1192,7 @@ pub fn validate_record(record: &HandoffRecord) -> Result<(), String> {
     if let Some(session) = &record.source_session {
         validate_nonblank_bounded(&session.goal, MAX_HANDOFF_GOAL_BYTES, "session goal")?;
         if let Some(last_agent) = session.last_agent.as_deref() {
-            validate_agent(last_agent, "session agent")?;
+            validate_display_agent(last_agent, "session agent")?;
         }
         if session.state == SessionState::Active && session.completed_at.is_some()
             || session.state == SessionState::Completed && session.completed_at.is_none()
@@ -1437,6 +1472,16 @@ fn validate_git(git: &GitSnapshot) -> Result<(), String> {
             git.schema_version
         ));
     }
+    for (value, name) in [
+        (&git.repository_root, "Git repository root"),
+        (&git.branch, "Git branch"),
+        (&git.commit, "Git commit"),
+        (&git.git_path_encoding, "Git path encoding"),
+    ] {
+        if let Some(value) = value {
+            validate_text(value, MAX_HANDOFF_PATH_BYTES, name)?;
+        }
+    }
     if git.changed_files.len() > MAX_HANDOFF_CHANGED_FILES {
         return Err("handoff Git snapshot exceeds changed-file bound".into());
     }
@@ -1478,6 +1523,10 @@ fn validate_agent(value: &str, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_display_agent(value: &str, name: &str) -> Result<(), String> {
+    validate_nonblank_bounded(value, MAX_HANDOFF_AGENT_BYTES, name)
+}
+
 fn validate_nonblank_bounded(value: &str, maximum: usize, name: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("{name} must not be blank"));
@@ -1510,35 +1559,6 @@ fn validate_relative_reference(value: &str, prefix: &str) -> Result<(), String> 
         ));
     }
     Ok(())
-}
-
-fn legacy_agent(value: &str) -> String {
-    let mut result = String::with_capacity(value.len().min(MAX_HANDOFF_AGENT_BYTES));
-    let mut separator = false;
-    for character in value.chars() {
-        if character.is_ascii_alphanumeric()
-            || matches!(character, '.' | '_' | '-' | '+' | '@' | ':')
-        {
-            result.push(character);
-            separator = false;
-        } else if !separator && !result.is_empty() {
-            result.push('-');
-            separator = true;
-        }
-        if result.len() >= MAX_HANDOFF_AGENT_BYTES {
-            break;
-        }
-    }
-    while result.ends_with('-') {
-        result.pop();
-    }
-    if result.is_empty() {
-        "agent".into()
-    } else if result.as_bytes()[0].is_ascii_alphanumeric() {
-        result
-    } else {
-        format!("agent-{result}")
-    }
 }
 
 fn valid_uuid(value: &str) -> bool {
@@ -1598,6 +1618,24 @@ fn bound_text(value: &str, maximum: usize) -> (String, bool) {
     (value[..end].to_owned(), true)
 }
 
+fn bound_historical_text(value: &str, maximum: usize) -> (String, bool) {
+    if value.len() <= maximum {
+        return (value.to_owned(), false);
+    }
+    let (bounded, _) = bound_text(value.trim(), maximum);
+    (bounded, true)
+}
+
+fn bound_historical_nonblank(
+    value: &str,
+    maximum: usize,
+    name: &str,
+) -> Result<(String, bool), String> {
+    let (bounded, truncated) = bound_historical_text(value, maximum);
+    validate_nonblank_bounded(&bounded, maximum, name)?;
+    Ok((bounded, truncated))
+}
+
 fn relative_project_path(project: &Path, path: &Path) -> Result<String, String> {
     let project = fs::canonicalize(project)
         .map_err(|error| format!("could not resolve project root: {error}"))?;
@@ -1616,7 +1654,11 @@ fn relative_project_path(project: &Path, path: &Path) -> Result<String, String> 
     {
         return Err(format!("handoff reference is not relative: {relative:?}"));
     }
-    Ok(relative.to_owned())
+    #[cfg(windows)]
+    let relative = relative.replace('\\', "/");
+    #[cfg(not(windows))]
+    let relative = relative.to_owned();
+    Ok(relative)
 }
 
 fn legacy_timestamp(path: &Path) -> Option<DateTime<Utc>> {
@@ -1825,7 +1867,7 @@ fn safe_entry(project: &Path, entry: &HandoffEntry) -> String {
 
 fn safe_inline(project: &Path, value: &str) -> String {
     let project_root = project.to_string_lossy();
-    let value = if project_root.is_empty() {
+    let value = if project_root.is_empty() || project_root == "/" {
         value.to_owned()
     } else {
         value.replace(project_root.as_ref(), "[project root]")
@@ -1848,7 +1890,7 @@ fn safe_inline(project: &Path, value: &str) -> String {
 
 fn safe_markdown(project: &Path, value: &str) -> String {
     let project_root = project.to_string_lossy();
-    let value = if project_root.is_empty() {
+    let value = if project_root.is_empty() || project_root == "/" {
         value.to_owned()
     } else {
         value.replace(project_root.as_ref(), "[project root]")
@@ -1994,7 +2036,9 @@ mod tests {
         assert!(validate_record(&record).is_err());
 
         let mut record = minimal_record();
-        record.target_agent = "../outside".into();
+        record.target_agent = "agent / reviewer".into();
+        assert!(validate_record(&record).is_ok());
+        record.target_agent = "agent\0".into();
         assert!(validate_record(&record).is_err());
         record.target_agent = "agent-b".into();
         record.artifact_path = "../outside.md".into();
@@ -2070,6 +2114,18 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), bytes);
     }
     #[test]
+    fn append_rejects_duplicate_id_without_mutating_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("handoffs.jsonl");
+        let record = minimal_record();
+        append_record(&path, &record).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let error = append_record(&path, &record).unwrap_err();
+        assert!(error.contains("duplicate handoff id"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    #[test]
     fn append_rejects_the_129th_structured_record() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("handoffs.jsonl");
@@ -2100,5 +2156,19 @@ mod tests {
         let error = append_record(&ledger, &minimal_record()).unwrap_err();
         assert!(error.contains("securely open handoff ledger"));
         assert_eq!(fs::read(&target).unwrap(), sentinel);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn new_ledger_is_owner_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private").join("handoffs.jsonl");
+        append_record(&path, &minimal_record()).unwrap();
+
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

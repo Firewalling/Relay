@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 #[cfg(all(unix, not(target_os = "linux")))]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     env,
@@ -2288,7 +2288,7 @@ fn read_hashed_output(
     if !metadata.file_type().is_file() {
         return Err(format!("output is not a regular file: {}", path.display()));
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if metadata.nlink() != 1 {
         return Err(format!(
             "output has unsafe hardlink count: {}",
@@ -2329,7 +2329,7 @@ fn read_hashed_output(
     let after = file
         .metadata()
         .map_err(|error| format!("could not restat {}: {error}", path.display()))?;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if after.nlink() != 1 {
         return Err(format!(
             "output link count changed while it was read: {}",
@@ -3839,6 +3839,13 @@ fn read_handoff_state(path: &Path) -> Result<(PathBuf, Vec<u8>), RunError> {
     if !metadata.is_file() {
         return Err(RunError::State(format!(
             "handoff run state must be a regular file: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return Err(RunError::State(format!(
+            "handoff run state must be singly linked: {}",
             path.display()
         )));
     }

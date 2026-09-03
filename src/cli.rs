@@ -354,8 +354,8 @@ pub struct CheckpointArgs {
 #[derive(Debug, Args)]
 pub struct HandoffArgs {
     /// Existing target-agent form, or create/show/latest/list action.
-    #[arg(default_value = "__create__", value_parser = parse_handoff_subject)]
-    pub agent: String,
+    #[arg(value_parser = parse_handoff_subject)]
+    pub agent: Option<String>,
     /// Handoff UUID or prefix for the show action.
     pub selector: Option<String>,
     /// Agent receiving the handoff in explicit create form.
@@ -609,7 +609,7 @@ mod tests {
         let Command::Handoff(args) = cli.command else {
             panic!("expected handoff command");
         };
-        assert_eq!(args.agent, "omp");
+        assert_eq!(args.agent, Some("omp".into()));
         assert_eq!(args.completed_work, ["added models"]);
         assert_eq!(args.decision, ["use jsonl"]);
         assert_eq!(args.failure, ["none"]);
@@ -838,7 +838,7 @@ mod tests {
         let Command::Handoff(args) = cli.command else {
             panic!("expected handoff create");
         };
-        assert_eq!(args.agent, "create");
+        assert_eq!(args.agent, Some("create".into()));
         assert_eq!(args.selector, None);
         assert_eq!(args.to.as_deref(), Some("agent-b"));
         assert_eq!(args.source_agent.as_deref(), Some("agent-a"));
@@ -854,7 +854,7 @@ mod tests {
         else {
             panic!("expected handoff show");
         };
-        assert_eq!(args.agent, "show");
+        assert_eq!(args.agent, Some("show".into()));
         assert_eq!(args.selector.as_deref(), Some("1234"));
 
         let Command::Context(args) =
@@ -865,5 +865,15 @@ mod tests {
             panic!("expected context");
         };
         assert_eq!(args.handoff.as_deref(), Some("latest"));
+    }
+    #[test]
+    fn positional_handoff_subject_does_not_use_a_reserved_sentinel() {
+        let Command::Handoff(args) = Cli::try_parse_from(["relay", "handoff", "__create__"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected handoff command");
+        };
+        assert_eq!(args.agent.as_deref(), Some("__create__"));
     }
 }
