@@ -2946,6 +2946,99 @@ fn structured_handoff_round_trips_through_context_and_keeps_snapshot() {
         2
     );
 }
+#[test]
+fn checkpoint_snapshot_survives_creation_and_read_time_mutations() {
+    let directory = init_repository();
+    let project = directory.path();
+    assert_success(&relay(project, &["start", "checkpoint handoff"]));
+    let checkpoint = json_success_data(&relay(project, &["--json", "checkpoint", "boundary"]));
+    let checkpoint_path = project.join(checkpoint["path"].as_str().unwrap());
+    let original_checkpoint = fs::read(&checkpoint_path).unwrap();
+
+    fs::write(&checkpoint_path, b"tampered checkpoint").unwrap();
+    let rejected = relay(
+        project,
+        &[
+            "--json",
+            "handoff",
+            "create",
+            "--to",
+            "agent-b",
+            "--checkpoint",
+            "latest",
+        ],
+    );
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("is no longer trusted"));
+    assert!(!project.join(".relay/handoffs.jsonl").exists());
+    fs::write(&checkpoint_path, &original_checkpoint).unwrap();
+
+    let created = json_success_data(&relay(
+        project,
+        &[
+            "--json",
+            "handoff",
+            "create",
+            "--to",
+            "agent-b",
+            "--checkpoint",
+            "latest",
+        ],
+    ));
+    let record = created["handoff"].clone();
+    let id = record["id"].as_str().unwrap();
+    let ledger = project.join(".relay/handoffs.jsonl");
+    let ledger_before = fs::read(&ledger).unwrap();
+    let assert_snapshot = |args: &[&str]| {
+        let data = json_success_data(&relay(project, args));
+        assert_eq!(data["handoff"], record);
+    };
+
+    fs::write(&checkpoint_path, b"tampered checkpoint").unwrap();
+    for args in [
+        ["--json", "handoff", "--show", id],
+        ["--json", "context", "--handoff", id],
+    ] {
+        assert_snapshot(&args);
+    }
+    fs::remove_file(&checkpoint_path).unwrap();
+    for args in [
+        ["--json", "handoff", "--show", id],
+        ["--json", "context", "--handoff", id],
+    ] {
+        assert_snapshot(&args);
+    }
+    assert_eq!(fs::read(&ledger).unwrap(), ledger_before);
+}
+#[test]
+fn stale_unselected_checkpoint_does_not_block_new_handoff() {
+    let directory = init_repository();
+    let project = directory.path();
+    assert_success(&relay(project, &["start", "checkpoint selection"]));
+    let first = json_success_data(&relay(project, &["--json", "checkpoint", "first"]));
+    let first_path = project.join(first["path"].as_str().unwrap());
+    let second = json_success_data(&relay(project, &["--json", "checkpoint", "second"]));
+    let second_path = project.join(second["path"].as_str().unwrap());
+    fs::remove_file(first_path).unwrap();
+
+    let handoff = json_success_data(&relay(
+        project,
+        &[
+            "--json",
+            "handoff",
+            "create",
+            "--to",
+            "agent-b",
+            "--checkpoint",
+            "latest",
+        ],
+    ));
+    assert_eq!(
+        handoff["handoff"]["references"]["checkpoints"][0]["path"],
+        second["path"]
+    );
+    assert!(second_path.is_file());
+}
 
 #[test]
 fn legacy_handoff_is_read_without_destructive_migration() {
@@ -3165,6 +3258,15 @@ fn legacy_display_names_and_oversized_history_remain_compatible() {
     let controls = relay(project, &["handoff", control_agent]);
     assert_success(&controls);
     assert!(!stdout(&controls).contains('\u{1b}'));
+    let status = relay(project, &["status"]);
+    assert_success(&status);
+    assert!(!stdout(&status).contains('\u{1b}'));
+    assert!(stdout(&status).contains("Last agent: agent"));
+    let session_id = read_session(project).id.to_string();
+    let shown = relay(project, &["show", session_id.as_str()]);
+    assert_success(&shown);
+    assert!(!stdout(&shown).contains('\u{1b}'));
+    assert!(stdout(&shown).contains("Last agent: agent"));
 
     let identifier = relay(project, &["--json", "handoff", "codex"]);
     assert_eq!(
@@ -3203,6 +3305,43 @@ fn handoff_rejects_symlinked_and_hardlinked_checkpoint_artifacts() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn handoff_rejects_symlinked_checkpoint_ancestor() {
+    let directory = init_repository();
+    let project = directory.path();
+    assert_success(&relay(project, &["start", "checkpoint ancestor safety"]));
+    assert_success(&relay(project, &["checkpoint", "saved checkpoint"]));
+    let checkpoint = only_file(project.join(".relay/checkpoints"));
+    let checkpoint_bytes = fs::read(&checkpoint).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("checkpoint.json"), &checkpoint_bytes).unwrap();
+    let nested = project.join(".relay/checkpoints/nested");
+    fs::create_dir(&nested).unwrap();
+    std::os::unix::fs::symlink(outside.path(), nested.join("link")).unwrap();
+
+    let events_path = project.join(".relay/events.jsonl");
+    let mut events = read_events(project);
+    events.last_mut().unwrap().payload["path"] =
+        json!(".relay/checkpoints/nested/link/checkpoint.json");
+    let mut event_bytes = Vec::new();
+    for event in events {
+        event_bytes.extend_from_slice(&serde_json::to_vec(&event).unwrap());
+        event_bytes.push(b'\n');
+    }
+    fs::write(&events_path, event_bytes).unwrap();
+
+    let handoff = relay(project, &["--json", "handoff", "agent-b"]);
+    assert!(!handoff.status.success());
+    assert!(handoff.stdout.is_empty());
+    assert!(stderr(&handoff).contains("symlinked component"));
+    assert!(!project.join(".relay/handoffs.jsonl").exists());
+    assert_eq!(
+        fs::read(outside.path().join("checkpoint.json")).unwrap(),
+        checkpoint_bytes
+    );
+}
+
 #[test]
 fn every_nonblank_positional_agent_name_remains_a_target() {
     let directory = tempfile::tempdir().unwrap();
@@ -3216,5 +3355,20 @@ fn every_nonblank_positional_agent_name_remains_a_target() {
             target
         );
         assert_eq!(read_session(project).last_agent.as_deref(), Some(target));
+    }
+}
+
+#[test]
+fn invalid_handoff_inspection_does_not_mutate_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+    for args in [
+        &["handoff", "--list", "agent-b"][..],
+        &["handoff", "--show", "handoff-id", "--to", "agent-b"][..],
+        &["handoff", "--latest", "agent-b"][..],
+    ] {
+        let output = relay(project, args);
+        assert!(!output.status.success());
+        assert!(!project.join(".relay").exists());
     }
 }

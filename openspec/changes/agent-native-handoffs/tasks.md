@@ -9,7 +9,7 @@
 
 - [x] Capture session, notes, checkpoints, and Git snapshots.
 - [x] Select current-session state deterministically and boundedly.
-- [x] Validate project-local run and workflow references.
+- [x] At creation, validate project-local run and workflow references.
 - [x] Attach only trusted output and artifact provenance.
 
 ## 3. CLI and context

@@ -7,7 +7,7 @@ use crate::{
         HandoffSessionSnapshot, HandoffTaskSnapshot, HandoffUnavailable, HandoffWorkflowSnapshot,
         SCHEMA_VERSION, Session, SessionState,
     },
-    orchestrate::{AttemptStatus, OutputRecord, OutputType, RunState, TaskStatus},
+    orchestrate::{OutputRecord, OutputType, RunState, TaskStatus},
     storage,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -54,7 +54,36 @@ fn safe_regular_file(metadata: &fs::Metadata) -> bool {
 fn safe_regular_file(metadata: &fs::Metadata) -> bool {
     metadata.is_file()
 }
+fn reject_symlinked_components(path: &Path) -> Result<(), String> {
+    let mut current = PathBuf::new();
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        current.push(component.as_os_str());
+        if components.peek().is_none() {
+            break;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "handoff path contains symlinked component: {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect handoff path component {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn open_handoff_file(path: &Path) -> Result<fs::File, String> {
+    reject_symlinked_components(path)?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("could not inspect handoff file {}: {error}", path.display()))?;
     if metadata.file_type().is_symlink() {
@@ -89,10 +118,6 @@ fn open_handoff_file(path: &Path) -> Result<fs::File, String> {
         ));
     }
     Ok(file)
-}
-
-fn validate_handoff_file(path: &Path) -> Result<(), String> {
-    open_handoff_file(path).map(|_| ())
 }
 
 fn read_handoff_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
@@ -180,10 +205,7 @@ fn has_create_options(args: &HandoffArgs) -> bool {
 }
 
 pub fn is_mutating(args: &HandoffArgs) -> bool {
-    !matches!(
-        action(args),
-        Ok(HandoffAction::Show(_) | HandoffAction::Latest | HandoffAction::List)
-    )
+    matches!(action(args), Ok(HandoffAction::Create { .. }))
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +220,11 @@ pub enum StoredHandoff {
         markdown: String,
         created_at: Option<DateTime<Utc>>,
     },
+}
+#[derive(Debug, Clone)]
+struct CheckpointCandidate {
+    checkpoint: Checkpoint,
+    reference: HandoffCheckpointReference,
 }
 
 impl StoredHandoff {
@@ -318,6 +345,7 @@ fn decode_records(bytes: &[u8]) -> Result<Vec<HandoffRecord>, String> {
 
 pub fn append_record(path: &Path, record: &HandoffRecord) -> Result<(), String> {
     validate_record(record)?;
+    reject_symlinked_components(path)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create handoff ledger directory: {error}"))?;
@@ -413,17 +441,14 @@ pub fn read_stored(
     ledger_path: &Path,
     directory: &Path,
 ) -> Result<Vec<StoredHandoff>, String> {
+    // Structured records are historical snapshots. Live run, output, and
+    // checkpoint objects are validated only while creating a new record.
     let records = read_records(ledger_path)?;
-    for record in &records {
-        validate_live_run_references(project, record)?;
-        for checkpoint in &record.references.checkpoints {
-            validate_handoff_file(&project.join(&checkpoint.path))?;
-        }
-    }
     let mut entries = Vec::with_capacity(records.len());
     let mut generated_paths = HashSet::with_capacity(records.len());
     for record in records {
         let path = project.join(&record.artifact_path);
+        reject_symlinked_components(&path)?;
         generated_paths.insert(path.clone());
         match fs::symlink_metadata(&path) {
             Ok(metadata) => {
@@ -453,6 +478,7 @@ pub fn read_stored(
             path,
         });
     }
+    reject_symlinked_components(directory)?;
 
     let metadata = match fs::symlink_metadata(directory) {
         Ok(metadata) => metadata,
@@ -617,8 +643,16 @@ pub fn build_record(
 
     let note_candidates = note_references(events, session.id)?;
     let selected_notes = select_notes(&note_candidates, &args.notes)?;
-    let checkpoint_candidates = checkpoint_references(project, events, session.id)?;
-    let selected_checkpoints = select_checkpoints(&checkpoint_candidates, &args.checkpoints)?;
+    let checkpoint_candidates = checkpoint_references(events, session.id)?;
+    let selected_checkpoint_candidates =
+        select_checkpoints(&checkpoint_candidates, &args.checkpoints)?;
+    for candidate in &selected_checkpoint_candidates {
+        validate_checkpoint_for_handoff_creation(project, candidate)?;
+    }
+    let selected_checkpoints = selected_checkpoint_candidates
+        .into_iter()
+        .map(|candidate| candidate.reference)
+        .collect();
 
     let explicit_completed = explicit_entries(&args.completed_work, None)?;
     let explicit_decisions = explicit_entries(&args.decision, None)?;
@@ -813,10 +847,9 @@ fn note_references(
 }
 
 fn checkpoint_references(
-    project: &Path,
     events: &[Event],
     session_id: Uuid,
-) -> Result<Vec<HandoffCheckpointReference>, String> {
+) -> Result<Vec<CheckpointCandidate>, String> {
     let mut checkpoints = Vec::new();
     for event in events
         .iter()
@@ -845,20 +878,22 @@ fn checkpoint_references(
             .and_then(Value::as_str)
             .ok_or_else(|| format!("checkpoint event {} is missing its path", event.id))?;
         validate_relative_reference(path, CHECKPOINT_DIRECTORY)?;
-        validate_handoff_file(&project.join(path))?;
         let (message, truncated) = checkpoint
             .message
             .as_deref()
             .map(|value| bound_historical_text(value, MAX_HANDOFF_ENTRY_BYTES))
             .map_or((None, false), |(value, truncated)| (Some(value), truncated));
-        checkpoints.push(HandoffCheckpointReference {
-            id: checkpoint.id,
-            session_id,
-            timestamp: checkpoint.timestamp,
-            message,
-            path: path.to_owned(),
-            git: bound_git(checkpoint.git),
-            truncated,
+        checkpoints.push(CheckpointCandidate {
+            checkpoint: checkpoint.clone(),
+            reference: HandoffCheckpointReference {
+                id: checkpoint.id,
+                session_id,
+                timestamp: checkpoint.timestamp,
+                message,
+                path: path.to_owned(),
+                git: bound_git(checkpoint.git),
+                truncated,
+            },
         });
     }
     Ok(checkpoints)
@@ -874,15 +909,33 @@ fn select_notes(
 }
 
 fn select_checkpoints(
-    candidates: &[HandoffCheckpointReference],
+    candidates: &[CheckpointCandidate],
     selectors: &[String],
-) -> Result<Vec<HandoffCheckpointReference>, String> {
+) -> Result<Vec<CheckpointCandidate>, String> {
     select_references(
         candidates,
         selectors,
         MAX_HANDOFF_CHECKPOINT_REFERENCES,
-        |item| item.id,
+        |item| item.reference.id,
     )
+}
+
+fn validate_checkpoint_for_handoff_creation(
+    project: &Path,
+    candidate: &CheckpointCandidate,
+) -> Result<(), String> {
+    let path = project.join(&candidate.reference.path);
+    let bytes = read_handoff_bytes(&path, MAX_HANDOFF_LEDGER_BYTES)?;
+    let mut expected = serde_json::to_vec_pretty(&candidate.checkpoint)
+        .map_err(|error| format!("checkpoint cannot be encoded: {error}"))?;
+    expected.push(b'\n');
+    if bytes != expected {
+        return Err(format!(
+            "checkpoint {} is no longer trusted",
+            candidate.reference.id
+        ));
+    }
+    Ok(())
 }
 
 fn select_references<T: Clone>(
@@ -1071,63 +1124,6 @@ fn output_reference(
     })
 }
 
-fn validate_live_run_references(project: &Path, record: &HandoffRecord) -> Result<(), String> {
-    for run in &record.references.runs {
-        let state = crate::orchestrate::read_handoff_run(&project.join(&run.state_path), project)
-            .map_err(|error| {
-            format!("handoff run {} is no longer valid: {error}", run.run_id)
-        })?;
-        if state.run_id != run.run_id {
-            return Err(format!(
-                "handoff run {} has mismatched aggregate identity",
-                run.run_id
-            ));
-        }
-        for output in record
-            .references
-            .outputs
-            .iter()
-            .filter(|output| output.run_id == run.run_id)
-        {
-            let current = state
-                .tasks
-                .iter()
-                .filter(|task| task.id == output.task)
-                .flat_map(|task| task.attempts.iter())
-                .filter(|attempt| {
-                    attempt.status == AttemptStatus::Succeeded
-                        && attempt.attempt == output.attempt
-                        && attempt.run_id == output.attempt_run_id
-                })
-                .flat_map(|attempt| attempt.outputs.iter().flatten())
-                .find(|candidate| candidate.name == output.output)
-                .ok_or_else(|| {
-                    format!(
-                        "handoff output {}/{} is no longer trusted",
-                        output.task, output.output
-                    )
-                })?;
-            let current_type = match current.output_type {
-                OutputType::Json => HandoffOutputType::Json,
-                OutputType::File => HandoffOutputType::File,
-            };
-            let current_path = relative_project_path(project, Path::new(&current.path))?;
-            if current_type != output.output_type
-                || current_path != output.path
-                || current.size_bytes != output.size_bytes
-                || current.sha256.as_deref() != Some(output.sha256.as_str())
-                || current.value != output.value
-            {
-                return Err(format!(
-                    "handoff output {}/{} is no longer trusted",
-                    output.task, output.output
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn bound_git(mut git: GitSnapshot) -> GitSnapshot {
     for value in [
         &mut git.repository_root,
@@ -1214,7 +1210,11 @@ pub fn validate_record(record: &HandoffRecord) -> Result<(), String> {
         ));
     }
     validate_git(&record.git)?;
+    let mut checkpoint_ids = HashSet::new();
     for checkpoint in &record.references.checkpoints {
+        if !checkpoint_ids.insert(checkpoint.id) {
+            return Err(format!("duplicate checkpoint id {}", checkpoint.id));
+        }
         if checkpoint.session_id
             != record
                 .source_session
@@ -1236,7 +1236,11 @@ pub fn validate_record(record: &HandoffRecord) -> Result<(), String> {
         }
         validate_git(&checkpoint.git)?;
     }
+    let mut note_ids = HashSet::new();
     for note in &record.references.notes {
+        if !note_ids.insert(note.id) {
+            return Err(format!("duplicate note id {}", note.id));
+        }
         validate_text(&note.category, 32, "note category")?;
         validate_nonblank_bounded(&note.text, MAX_HANDOFF_ENTRY_BYTES, "note text")?;
         if !matches!(
@@ -2079,6 +2083,10 @@ mod tests {
         assert_eq!(record.git.changed_files, vec![path]);
         assert_eq!(original.changed_files, record.git.changed_files);
         assert!(validate_record(&record).is_ok());
+        record.git.changed_files = vec!["a".repeat(MAX_HANDOFF_GIT_PATH_BYTES)];
+        assert!(validate_record(&record).is_ok());
+        record.git.changed_files = vec!["a".repeat(MAX_HANDOFF_GIT_PATH_BYTES + 1)];
+        assert!(validate_record(&record).is_err());
     }
     #[test]
     fn rendering_escapes_terminal_controls_and_preserves_structure() {
@@ -2094,6 +2102,35 @@ mod tests {
         assert!(!rendered.contains('\u{1b}'));
         assert!(rendered.contains("## Goal"));
         assert!(rendered.contains("completed"));
+    }
+    #[test]
+    fn duplicate_reference_ids_are_rejected() {
+        let mut record = minimal_record();
+        let checkpoint = HandoffCheckpointReference {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            timestamp: DateTime::UNIX_EPOCH,
+            message: None,
+            truncated: false,
+            path: ".relay/checkpoints/checkpoint.json".into(),
+            git: GitSnapshot::unavailable(),
+        };
+        record.references.checkpoints = vec![checkpoint.clone(), checkpoint];
+        let error = validate_record(&record).unwrap_err();
+        assert!(error.contains("duplicate checkpoint id"));
+
+        let note = HandoffNoteReference {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            timestamp: DateTime::UNIX_EPOCH,
+            category: "decision".into(),
+            text: "note".into(),
+            truncated: false,
+        };
+        record.references.checkpoints.clear();
+        record.references.notes = vec![note.clone(), note];
+        let error = validate_record(&record).unwrap_err();
+        assert!(error.contains("duplicate note id"));
     }
 
     #[test]
@@ -2162,6 +2199,21 @@ mod tests {
         let error = append_record(&ledger, &minimal_record()).unwrap_err();
         assert!(error.contains("securely open handoff ledger"));
         assert_eq!(fs::read(&target).unwrap(), sentinel);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn handoff_files_reject_symlinked_ancestor_components() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("checkpoint.json");
+        fs::write(&outside_file, b"outside").unwrap();
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        std::os::unix::fs::symlink(outside.path(), nested.join("link")).unwrap();
+
+        let path = nested.join("link/checkpoint.json");
+        let error = read_handoff_bytes(&path, MAX_HANDOFF_LEDGER_BYTES).unwrap_err();
+        assert!(error.contains("symlinked component"));
     }
     #[cfg(unix)]
     #[test]

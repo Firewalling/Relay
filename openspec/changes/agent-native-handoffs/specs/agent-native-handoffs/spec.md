@@ -17,6 +17,13 @@ Relay MUST read existing Markdown-only handoff artifacts and render them without
 ### Requirement: Validate trusted references
 Relay MUST accept run references only from the selected project and MUST attach outputs only from successful trusted attempts with matching task, run, attempt, path, size, hash, type, and attempt-run provenance. It MUST not copy artifact contents into records.
 
+### Requirement: Preserve historical snapshots independently
+After a structured handoff is persisted, Relay MUST treat its ledger record as authoritative for the historical snapshot. Ordinary handoff and context reads MUST validate the ledger record and handoff-store safety without requiring referenced run state, output artifacts, checkpoints, workflow definitions, Git state, or other mutable external objects to remain present or unchanged. Consumers that require a current artifact MUST validate it separately.
+
+#### Scenario: Read after referenced state changes
+- **WHEN** a valid handoff's referenced run, output, checkpoint, workflow, or Git state is changed or deleted
+- **THEN** handoff --show, handoff --latest, handoff --list, and context --handoff still return the unchanged historical snapshot.
+
 ### Requirement: Consume handoffs through context
 `relay context --handoff latest` and exact handoff selection MUST return the immutable structured record in the existing JSON envelope or a concise deterministic Markdown rendering. Selection and output MUST remain bounded and deterministic.
 

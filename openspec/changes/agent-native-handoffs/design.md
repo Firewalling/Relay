@@ -22,11 +22,11 @@ Creation selects current-session notes and checkpoints in event order, with expl
 
 ### Run and output trust
 
-A referenced run path must be canonical, regular, singly linked, project-local under `.relay/runs`, and parse as a supported aggregate state. Rust reuses aggregate state and output validation. Run status, workflow name/schema/hash/inputs, task statuses, and state path are copied as a snapshot. Only outputs present on successful task attempts and matching existing `OutputRecord` provenance are copied. Output paths become project-relative presentation paths; hashes, run ID, task, output name, attempt, attempt-run ID, type, size, and bounded JSON values remain exact. Failed, cancelled, running, indeterminate, stale, superseded, tampered, or mismatched outputs are never trusted.
+A referenced run path must be canonical, regular, singly linked, project-local under .relay/runs, and parse as a supported aggregate state. During new handoff creation, Rust reuses aggregate state and output validation. Run status, workflow name/schema/hash/inputs, task statuses, and state path are copied as a snapshot. Only outputs present on successful task attempts and matching existing OutputRecord provenance are copied. Output paths become project-relative presentation paths; hashes, run ID, task, output name, attempt, attempt-run ID, type, size, and bounded JSON values remain exact. Failed, cancelled, running, indeterminate, stale, superseded, tampered, or mismatched outputs are never trusted.
 
 ### Immutability and migration
 
-Creation snapshots Git, session, notes, checkpoints, run metadata, and output provenance. Later Git changes, notes, workflow edits, or run transitions cannot mutate a prior record. Legacy Markdown is read-only compatibility input and is never rewritten on read. Unsupported structured versions and malformed JSONL fail clearly.
+Creation snapshots Git, session, notes, checkpoints, run metadata, and output provenance. Later Git changes, notes, workflow edits, run transitions, artifact changes, or deletion of referenced live files cannot mutate or invalidate a prior record. After persistence, read_records/read_stored validate only the immutable ledger record and handoff-store safety; they do not reopen referenced run, output, checkpoint, workflow, or Git state. Stored provenance means Relay validated the reference when the handoff was created, not that the live object remains valid. Consumers that need the current artifact revalidate it separately. Legacy Markdown is read-only compatibility input and is never rewritten on read. Unsupported structured versions and malformed JSONL fail clearly.
 
 ### Bounds and security
 

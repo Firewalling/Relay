@@ -826,14 +826,17 @@ fn status(project: &Path) -> Result<RunOutput, AppError> {
         .transpose()?;
     let latest = latest_checkpoint
         .map(|checkpoint| {
-            let message = checkpoint.message.as_deref().unwrap_or("(no message)");
+            let message = safe_markdown_value(
+                project,
+                checkpoint.message.as_deref().unwrap_or("(no message)"),
+            );
             format!("{} — {}", checkpoint.timestamp.to_rfc3339(), message)
         })
         .unwrap_or_else(|| "none".into());
 
     let human = format!(
         "Goal: {}\nSession: {}\nState: {}\nStarted: {}\nResumed from: {}\nProject: .\nGit branch: {}\nGit commit: {}\nGit clean: {}\nEvents: {}\nLatest checkpoint: {}\nLast agent: {}",
-        session.goal,
+        safe_markdown_value(project, &session.goal),
         session.id,
         state_name(&session.state),
         session.started_at.to_rfc3339(),
@@ -846,7 +849,7 @@ fn status(project: &Path) -> Result<RunOutput, AppError> {
         display_clean(&live_git),
         event_count,
         latest,
-        session.last_agent.as_deref().unwrap_or("unknown"),
+        safe_markdown_value(project, session.last_agent.as_deref().unwrap_or("unknown")),
     );
     let data = json!({
         "session": &session,
@@ -1260,7 +1263,7 @@ fn show(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError> {
     Ok(format!(
         "Session: {}\nGoal: {}\nState: {}\nStarted: {}\nCompleted: {}\nResumed from: {}\nLast agent: {}",
         session.id,
-        session.goal,
+        safe_markdown_value(project, &session.goal),
         state_name(&session.state),
         session.started_at.to_rfc3339(),
         session
@@ -1271,7 +1274,7 @@ fn show(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError> {
             .resumed_from
             .map(|id| id.to_string())
             .unwrap_or_else(|| "none".into()),
-        session.last_agent.as_deref().unwrap_or("unknown")
+        safe_markdown_value(project, session.last_agent.as_deref().unwrap_or("unknown"))
     ))
 }
 

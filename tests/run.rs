@@ -5758,6 +5758,8 @@ fn handoff_carries_trusted_run_outputs_without_copying_artifacts() {
         {"name":"summary","type":"json","path":"summary.json"},
         {"name":"report","type":"file","path":"report.txt"}
     ]);
+    producer["arguments"] = json!(["handoff-secret"]);
+    producer["redact_argument_indexes"] = json!([0]);
     let plan = harness.plan_v3("handoff-run", json!([producer]));
     let state = harness
         .directory
@@ -5796,6 +5798,9 @@ fn handoff_carries_trusted_run_outputs_without_copying_artifacts() {
     assert_eq!(record["source_agent"], "agent-a");
     assert_eq!(record["target_agent"], "agent-b");
     assert_eq!(record["references"]["runs"][0]["status"], "completed");
+    let record_json = serde_json::to_string(record).unwrap();
+    assert!(!record_json.contains("handoff-secret"));
+    assert!(!record_json.contains("<redacted>"));
     let outputs = record["references"]["outputs"].as_array().unwrap();
     assert_eq!(outputs.len(), 2);
     assert!(outputs.iter().all(|output| {
@@ -5820,17 +5825,99 @@ fn handoff_carries_trusted_run_outputs_without_copying_artifacts() {
         .directory
         .path()
         .join(outputs[0]["path"].as_str().unwrap());
-    fs::write(&output_path, b"tampered").unwrap();
     let id = record["id"].as_str().unwrap();
-    let reread = harness
+    let assert_snapshot = |args: &[&str]| {
+        let reread = harness.command().args(args).output().unwrap();
+        assert!(
+            reread.status.success(),
+            "historical handoff read failed: {}",
+            String::from_utf8_lossy(&reread.stderr)
+        );
+        let reread_document: Value = serde_json::from_slice(&reread.stdout).unwrap();
+        assert_eq!(&reread_document["data"]["handoff"], record);
+    };
+    for args in [
+        ["--json", "--scope", "current", "handoff", "--show", id],
+        ["--json", "--scope", "current", "context", "--handoff", id],
+    ] {
+        assert_snapshot(&args);
+    }
+    fs::write(&output_path, b"tampered").unwrap();
+    for args in [
+        ["--json", "--scope", "current", "handoff", "--show", id],
+        ["--json", "--scope", "current", "context", "--handoff", id],
+    ] {
+        assert_snapshot(&args);
+    }
+    fs::remove_file(&output_path).unwrap();
+    for args in [
+        ["--json", "--scope", "current", "handoff", "--show", id],
+        ["--json", "--scope", "current", "context", "--handoff", id],
+    ] {
+        assert_snapshot(&args);
+    }
+    fs::write(&state, b"changed live run state").unwrap();
+    for args in [
+        ["--json", "--scope", "current", "handoff", "--show", id],
+        ["--json", "--scope", "current", "context", "--handoff", id],
+    ] {
+        assert_snapshot(&args);
+    }
+    fs::remove_file(&state).unwrap();
+    for args in [
+        ["--json", "--scope", "current", "handoff", "--show", id],
+        ["--json", "--scope", "current", "context", "--handoff", id],
+    ] {
+        assert_snapshot(&args);
+    }
+    assert_eq!(fs::read(&ledger).unwrap(), ledger_before);
+
+    let second = harness
         .command()
-        .args(["--json", "--scope", "current", "context", "--handoff", id])
+        .args(["--json", "--scope", "current", "handoff", "agent-c"])
         .output()
         .unwrap();
-    assert!(!reread.status.success());
-    assert!(reread.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&reread.stderr).contains("changed after persistence"));
-    assert_eq!(fs::read(&ledger).unwrap(), ledger_before);
+    assert!(
+        second.status.success(),
+        "second handoff failed: {:?}",
+        second
+    );
+    let second_document: Value = serde_json::from_slice(&second.stdout).unwrap();
+    let second_id = second_document["data"]["handoff"]["id"].as_str().unwrap();
+    assert_ne!(id, second_id);
+
+    let listed = harness
+        .command()
+        .args(["--json", "--scope", "current", "handoff", "--list"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "listing stale handoff failed");
+    let listed_document: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(
+        listed_document["data"]["handoffs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let latest = harness
+        .command()
+        .args(["--json", "--scope", "current", "handoff", "--latest"])
+        .output()
+        .unwrap();
+    assert!(latest.status.success(), "latest stale handoff failed");
+    let latest_document: Value = serde_json::from_slice(&latest.stdout).unwrap();
+    assert_eq!(latest_document["data"]["handoff"]["id"], second_id);
+    let unrelated = harness
+        .command()
+        .args([
+            "--json", "--scope", "current", "handoff", "--show", second_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(unrelated.status.success(), "unrelated handoff show failed");
+    let unrelated_document: Value = serde_json::from_slice(&unrelated.stdout).unwrap();
+    assert_eq!(unrelated_document["data"]["handoff"]["id"], second_id);
 }
 #[test]
 fn handoff_reads_running_run_without_taking_aggregate_lock() {
