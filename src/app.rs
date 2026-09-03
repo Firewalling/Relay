@@ -3,10 +3,10 @@ use crate::{
         CheckpointArgs, Command, ContextArgs, DoctorArgs, HandoffArgs, HistoryArgs, NoteArgs,
         NoteCategory, SearchArgs, SessionSelectorArgs, StartArgs,
     },
-    git,
+    git, handoff,
     lock::{self, ProjectLock},
     model::{
-        Checkpoint, Diagnostic, DiagnosticSeverity, Event, GitSnapshot,
+        Checkpoint, Diagnostic, DiagnosticSeverity, Event, GitSnapshot, HandoffRecord,
         ORCHESTRATION_PROTOCOL_VERSION, OUTPUT_SCHEMA_VERSION, OperationEffect, OperationMarker,
         ProtocolComponent, ProtocolManifest, ProtocolOperation, ProtocolState, ProtocolStdin,
         ProtocolTransport, SCHEMA_VERSION, Session, SessionState,
@@ -15,6 +15,8 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::{
     collections::HashSet,
     fs,
@@ -219,15 +221,17 @@ impl IntoRunOutput for CheckpointResult {
 #[derive(Debug)]
 struct HandoffResult {
     session: Session,
+    record: HandoffRecord,
     markdown: String,
     path: String,
 }
 
 impl IntoRunOutput for HandoffResult {
     fn into_run_output(self) -> RunOutput {
-        let human = format!("{}\nSaved: {}", self.markdown, self.path);
+        let human = format!("{}{}Saved: {}", self.markdown, char::from(10), self.path);
         let data = json!({
             "session": &self.session,
+            "handoff": &self.record,
             "markdown": &self.markdown,
             "path": &self.path,
         });
@@ -387,7 +391,7 @@ pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
         Command::Status => status(project)?,
         Command::Checkpoint(args) => checkpoint(project, args)?.into_run_output(),
         Command::Finish => finish(project)?.into_run_output(),
-        Command::Handoff(args) => handoff(project, args)?.into_run_output(),
+        Command::Handoff(args) => handoff_command(project, args)?,
         Command::List => list_output(project)?,
         Command::Show(args) => show_output(project, args)?,
         Command::History(args) => history_output(project, args)?,
@@ -693,11 +697,13 @@ fn push_json_pointer_segment(pointer: &mut String, segment: &str) {
 }
 
 fn is_mutating(command: &Command) -> bool {
+    if let Command::Handoff(args) = command {
+        return handoff::is_mutating(args);
+    }
     matches!(
         command,
         Command::Start(_)
             | Command::Checkpoint(_)
-            | Command::Handoff(_)
             | Command::Finish
             | Command::Resume(_)
             | Command::Note(_)
@@ -820,14 +826,17 @@ fn status(project: &Path) -> Result<RunOutput, AppError> {
         .transpose()?;
     let latest = latest_checkpoint
         .map(|checkpoint| {
-            let message = checkpoint.message.as_deref().unwrap_or("(no message)");
+            let message = safe_markdown_value(
+                project,
+                checkpoint.message.as_deref().unwrap_or("(no message)"),
+            );
             format!("{} — {}", checkpoint.timestamp.to_rfc3339(), message)
         })
         .unwrap_or_else(|| "none".into());
 
     let human = format!(
         "Goal: {}\nSession: {}\nState: {}\nStarted: {}\nResumed from: {}\nProject: .\nGit branch: {}\nGit commit: {}\nGit clean: {}\nEvents: {}\nLatest checkpoint: {}\nLast agent: {}",
-        session.goal,
+        safe_markdown_value(project, &session.goal),
         session.id,
         state_name(&session.state),
         session.started_at.to_rfc3339(),
@@ -840,7 +849,7 @@ fn status(project: &Path) -> Result<RunOutput, AppError> {
         display_clean(&live_git),
         event_count,
         latest,
-        session.last_agent.as_deref().unwrap_or("unknown"),
+        safe_markdown_value(project, session.last_agent.as_deref().unwrap_or("unknown")),
     );
     let data = json!({
         "session": &session,
@@ -899,36 +908,67 @@ fn checkpoint(project: &Path, args: CheckpointArgs) -> Result<CheckpointResult, 
     })
 }
 
+fn handoff_command(project: &Path, args: HandoffArgs) -> Result<RunOutput, AppError> {
+    match handoff::action(&args).map_err(AppError::Lifecycle)? {
+        handoff::HandoffAction::Create { .. } => {
+            Ok(handoff_create(project, args)?.into_run_output())
+        }
+        handoff::HandoffAction::Show(selector) => handoff_view(project, &selector),
+        handoff::HandoffAction::Latest => handoff_view(project, "latest"),
+        handoff::HandoffAction::List => handoff_list(project),
+    }
+}
+#[cfg(test)]
 fn handoff(project: &Path, args: HandoffArgs) -> Result<HandoffResult, AppError> {
+    handoff_create(project, args)
+}
+
+fn handoff_create(project: &Path, args: HandoffArgs) -> Result<HandoffResult, AppError> {
     let paths = Paths::new(project);
     let mut session = require_active(&paths)?;
     let events = read_events(&paths.events)?;
     create_state_directories(&paths)?;
+    let existing_handoffs = handoff::read_stored(project, &paths.handoff_records, &paths.handoffs)
+        .map_err(AppError::Lifecycle)?;
+    if existing_handoffs.len() >= handoff::MAX_HANDOFF_COUNT {
+        return Err(AppError::Lifecycle(format!(
+            "handoff store reached maximum of {} records",
+            handoff::MAX_HANDOFF_COUNT
+        )));
+    }
+    if args.runs.len() > handoff::MAX_HANDOFF_RUN_REFERENCES {
+        return Err(AppError::Lifecycle(format!(
+            "handoff references more than {} runs",
+            handoff::MAX_HANDOFF_RUN_REFERENCES
+        )));
+    }
 
-    let timestamp = Utc::now();
     let live_git = git::capture(project)?;
-    let (checkpoints, _) = relevant_checkpoints(&events, session.id, 5)?;
-    let session_notes = recorded_notes(&events, session.id);
-    let markdown = render_handoff(
-        project,
-        &session,
-        &args,
-        &live_git,
-        &checkpoints,
-        &session_notes,
-    );
-    let filename = format!(
-        "{}-{}.md",
-        timestamp.format("%Y%m%dT%H%M%S%.3fZ"),
-        Uuid::new_v4()
-    );
-    let path = paths.handoffs.join(filename);
-    let relative = relative_to_project(project, &path);
+    let mut run_states = Vec::with_capacity(args.runs.len());
+    for requested in &args.runs {
+        let path = if requested.is_absolute() {
+            requested.clone()
+        } else {
+            project.join(requested)
+        };
+        let state = crate::orchestrate::read_handoff_run(&path, project)
+            .map_err(|error| AppError::Lifecycle(error.to_string()))?;
+        run_states.push((path, state));
+    }
+    let record = handoff::build_record(project, &args, &session, &events, live_git, &run_states)
+        .map_err(AppError::Lifecycle)?;
+    let markdown = handoff::render(&record, project);
+    let path = project.join(&record.artifact_path);
+    let relative = record.artifact_path.clone();
     let mut operation = Operation::begin(
         &paths,
         "handoff",
         Some(session.id),
         vec![
+            (
+                "record",
+                relative_to_project(project, &paths.handoff_records),
+            ),
             ("artifact", relative.clone()),
             ("event", relative_to_project(project, &paths.events)),
             (
@@ -942,27 +982,31 @@ fn handoff(project: &Path, args: HandoffArgs) -> Result<HandoffResult, AppError>
         ],
     )?;
 
-    // Keep the handoff recoverable before recording it, then record history
-    // before advancing mutable agent context.
+    handoff::append_record(&paths.handoff_records, &record).map_err(AppError::Lifecycle)?;
+    operation.advance("record")?;
     storage::write_markdown_atomic(&path, &markdown)?;
     operation.advance("artifact")?;
     append_event(
         &paths.events,
         &session,
-        timestamp,
+        record.created_at,
         "handoff.generated",
         json!({
-            "agent": args.agent,
+            "agent": record.target_agent.clone(),
             "completed_work": args.completed_work,
             "decisions": args.decision,
             "failures": args.failure,
             "next_action": args.next_action,
-            "git": live_git,
-            "path": relative,
+            "next_actions": args.next_actions,
+            "git": record.git.clone(),
+            "path": relative.clone(),
+            "handoff_id": record.id,
+            "record_path": relative_to_project(project, &paths.handoff_records),
+            "handoff_schema_version": record.schema_version,
         }),
     )?;
     operation.advance("event")?;
-    session.last_agent = Some(args.agent);
+    session.last_agent = Some(record.target_agent.clone());
     storage::write_json_atomic(&paths.session_record(session.id), &session)?;
     operation.advance("session_record")?;
     storage::write_json_atomic(&paths.session, &session)?;
@@ -971,11 +1015,75 @@ fn handoff(project: &Path, args: HandoffArgs) -> Result<HandoffResult, AppError>
 
     Ok(HandoffResult {
         session,
+        record,
         markdown,
         path: relative,
     })
 }
 
+fn handoff_view(project: &Path, selector: &str) -> Result<RunOutput, AppError> {
+    let paths = Paths::new(project);
+    let entries = handoff::read_stored(project, &paths.handoff_records, &paths.handoffs)
+        .map_err(AppError::Lifecycle)?;
+    let entry = handoff::select(&entries, selector).map_err(AppError::Lifecycle)?;
+    let markdown = entry.render(project);
+    let path = relative_to_project(project, entry.path());
+    let data = if let Some(record) = entry.record() {
+        json!({"handoff": record, "markdown": markdown, "path": path, "legacy": false})
+    } else {
+        json!({"handoff": Value::Null, "markdown": markdown, "path": path, "legacy": true})
+    };
+    Ok(RunOutput {
+        human: data["markdown"].as_str().unwrap_or_default().into(),
+        data,
+    })
+}
+
+fn handoff_list(project: &Path) -> Result<RunOutput, AppError> {
+    let paths = Paths::new(project);
+    let entries = handoff::read_stored(project, &paths.handoff_records, &paths.handoffs)
+        .map_err(AppError::Lifecycle)?;
+    let summaries = entries
+        .iter()
+        .map(|entry| {
+            let (target, legacy) = entry
+                .record()
+                .map(|record| (Some(record.target_agent.clone()), false))
+                .unwrap_or((None, true));
+            json!({
+                "id": entry.id(),
+                "created_at": entry.created_at(),
+                "target_agent": target,
+                "path": relative_to_project(project, entry.path()),
+                "legacy": legacy,
+            })
+        })
+        .collect::<Vec<_>>();
+    let human = if entries.is_empty() {
+        "No Relay handoffs recorded".into()
+    } else {
+        entries
+            .iter()
+            .map(|entry| {
+                let target = entry
+                    .record()
+                    .map(|record| record.target_agent.as_str())
+                    .unwrap_or("legacy");
+                format!(
+                    "{}  {}  {}",
+                    safe_markdown_value(project, &entry.id()),
+                    safe_markdown_value(project, target),
+                    safe_markdown_value(project, &relative_to_project(project, entry.path()))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(char::from(10).encode_utf8(&mut [0; 4]))
+    };
+    Ok(RunOutput {
+        human,
+        data: json!({"handoffs": summaries}),
+    })
+}
 fn relevant_checkpoints(
     events: &[Event],
     session_id: Uuid,
@@ -1004,91 +1112,6 @@ fn relevant_checkpoints(
         checkpoints.push(checkpoint);
     }
     Ok((checkpoints, omitted))
-}
-
-fn render_handoff(
-    project: &Path,
-    session: &Session,
-    args: &HandoffArgs,
-    git: &GitSnapshot,
-    checkpoints: &[Checkpoint],
-    recorded: &[(NoteCategory, String, DateTime<Utc>)],
-) -> String {
-    let notes = |values: &[String], category: NoteCategory| {
-        let mut combined = recorded
-            .iter()
-            .filter(|(candidate, _, _)| *candidate == category)
-            .map(|(_, text, _)| text.as_str())
-            .collect::<Vec<_>>();
-        combined.extend(values.iter().map(String::as_str));
-        if combined.is_empty() {
-            "Not recorded".into()
-        } else {
-            combined
-                .iter()
-                .map(|value| format!("- {}", safe_markdown_value(project, value)))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-    };
-    let next_values = args.next_action.iter().cloned().collect::<Vec<_>>();
-    let next_action = notes(&next_values, NoteCategory::NextAction);
-    let changed_files = if !git.available {
-        "Unavailable (not a Git repository)".into()
-    } else if git.changed_files.is_empty() {
-        "None".into()
-    } else {
-        git.changed_files
-            .iter()
-            .map(|path| format!("- {}", safe_markdown_value(project, path)))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let checkpoint_context = if checkpoints.is_empty() {
-        "Not recorded".into()
-    } else {
-        checkpoints
-            .iter()
-            .map(|checkpoint| {
-                let message = checkpoint
-                    .message
-                    .as_deref()
-                    .map(|value| safe_markdown_value(project, value))
-                    .unwrap_or_else(|| "(no message)".into());
-                format!("- {} — {message}", checkpoint.timestamp.to_rfc3339())
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    format!(
-        "## Goal\n\n{}\n\n\
-         ## Completed work\n\n{}\n\n\
-         ## Important decisions\n\n{}\n\n\
-         ## Failures or blocked work\n\n{}\n\n\
-         ## Current Git state\n\n- Branch: {}\n- Commit: {}\n- Clean: {}\n\n\
-         ## Changed files\n\n{}\n\n\
-         ## Relevant checkpoints\n\n{}\n\n\
-         ## Suggested next action\n\n{}\n\n\
-         ## Target agent\n\n{}\n",
-        safe_markdown_value(project, &session.goal),
-        notes(&args.completed_work, NoteCategory::Progress),
-        notes(&args.decision, NoteCategory::Decision),
-        notes(&args.failure, NoteCategory::Blocker),
-        safe_markdown_value(
-            project,
-            display_option(git.branch.as_deref(), git.available)
-        ),
-        safe_markdown_value(
-            project,
-            display_option(git.commit.as_deref(), git.available)
-        ),
-        display_clean(git),
-        changed_files,
-        checkpoint_context,
-        next_action,
-        safe_markdown_value(project, &args.agent),
-    )
 }
 
 fn safe_markdown_value(project: &Path, value: &str) -> String {
@@ -1240,7 +1263,7 @@ fn show(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError> {
     Ok(format!(
         "Session: {}\nGoal: {}\nState: {}\nStarted: {}\nCompleted: {}\nResumed from: {}\nLast agent: {}",
         session.id,
-        session.goal,
+        safe_markdown_value(project, &session.goal),
         state_name(&session.state),
         session.started_at.to_rfc3339(),
         session
@@ -1251,7 +1274,7 @@ fn show(project: &Path, args: SessionSelectorArgs) -> Result<String, AppError> {
             .resumed_from
             .map(|id| id.to_string())
             .unwrap_or_else(|| "none".into()),
-        session.last_agent.as_deref().unwrap_or("unknown")
+        safe_markdown_value(project, session.last_agent.as_deref().unwrap_or("unknown"))
     ))
 }
 
@@ -1714,11 +1737,62 @@ fn budget_context(
     (markdown, budget_omitted, budget_truncated)
 }
 
+fn handoff_context(
+    project: &Path,
+    selector: &str,
+    max_chars: usize,
+) -> Result<RunOutput, AppError> {
+    let paths = Paths::new(project);
+    let entries = handoff::read_stored(project, &paths.handoff_records, &paths.handoffs)
+        .map_err(AppError::Lifecycle)?;
+    let entry = handoff::select(&entries, selector).map_err(AppError::Lifecycle)?;
+    let (human, truncated) =
+        handoff::render_context_bounded(entry, project, max_chars.saturating_sub(1));
+    let path = relative_to_project(project, entry.path());
+    let data = if let Some(record) = entry.record() {
+        json!({
+            "handoff": record,
+            "session": record.source_session,
+            "git": record.git,
+            "completed": record.completed,
+            "decisions": record.decisions,
+            "blockers": record.blockers,
+            "next_actions": record.next_actions,
+            "checkpoints": record.references.checkpoints,
+            "notes": record.references.notes,
+            "runs": record.references.runs,
+            "outputs": record.references.outputs,
+            "unavailable": record.unavailable,
+            "path": path,
+            "legacy": false,
+            "truncated": truncated,
+            "max_chars": max_chars,
+        })
+    } else {
+        json!({
+            "handoff": Value::Null,
+            "path": path,
+            "legacy": true,
+            "truncated": truncated,
+            "max_chars": max_chars,
+        })
+    };
+    Ok(RunOutput { human, data })
+}
+
 fn context(project: &Path, args: ContextArgs) -> Result<RunOutput, AppError> {
     if args.max_chars < 64 {
         return Err(AppError::Lifecycle(
             "--max-chars must be at least 64".into(),
         ));
+    }
+    if let Some(selector) = args.handoff.as_deref() {
+        if args.session.is_some() {
+            return Err(AppError::Lifecycle(
+                "--session and --handoff are mutually exclusive".into(),
+            ));
+        }
+        return handoff_context(project, selector, args.max_chars);
     }
     let paths = Paths::new(project);
     let sessions = read_all_sessions(&paths)?;
@@ -1970,6 +2044,20 @@ fn inspect_state(project: &Path, paths: &Paths) -> Vec<Diagnostic> {
             ".relay/events.jsonl",
             "event log is missing",
             "Restore it from backup; Relay will not invent history.",
+            false,
+        );
+    }
+
+    if paths.handoff_records.exists()
+        && let Err(error) = handoff::read_records(&paths.handoff_records)
+    {
+        push_diagnostic(
+            &mut diagnostics,
+            "handoff_ledger_invalid",
+            DiagnosticSeverity::Error,
+            ".relay/handoffs.jsonl",
+            &error,
+            "Restore or repair the structured handoff ledger manually; Relay will not discard records.",
             false,
         );
     }
@@ -2228,39 +2316,138 @@ fn operation_is_provably_complete(
     marker: &OperationMarker,
     events: &[Event],
 ) -> bool {
-    let paths_safe = marker.effects.iter().all(|effect| {
-        let path = Path::new(&effect.path);
-        effect.completed
-            && !path.is_absolute()
-            && path.components().all(|component| {
-                matches!(
-                    component,
-                    std::path::Component::Normal(_) | std::path::Component::CurDir
-                )
-            })
-            && effect.path.starts_with(".relay/")
-            && project.join(path).exists()
-    });
-    if !paths_safe {
-        return false;
-    }
-    let expected_event = match marker.command.as_str() {
-        "start" => Some("session.started"),
-        "resume" => Some("session.resumed"),
-        "checkpoint" => Some("checkpoint.created"),
-        "handoff" => Some("handoff.generated"),
-        "finish" => Some("session.finished"),
-        "note" => Some("note.recorded"),
-        "history.materialize" => None,
+    let (expected_effects, expected_event) = match marker.command.as_str() {
+        "start" => (
+            &["session_record", "current_session", "event"][..],
+            Some("session.started"),
+        ),
+        "resume" => (
+            &["session_record", "current_session", "event"][..],
+            Some("session.resumed"),
+        ),
+        "checkpoint" => (&["artifact", "event"][..], Some("checkpoint.created")),
+        "handoff" => (
+            &[
+                "record",
+                "artifact",
+                "event",
+                "session_record",
+                "current_session",
+            ][..],
+            Some("handoff.generated"),
+        ),
+        "finish" => (
+            &["artifact", "event", "session_record", "current_session"][..],
+            Some("session.finished"),
+        ),
+        "note" => (&["event"][..], Some("note.recorded")),
+        "history.materialize" => (&["session_record"][..], None),
         _ => return false,
     };
+    if marker.effects.len() != expected_effects.len()
+        || marker
+            .effects
+            .iter()
+            .zip(expected_effects)
+            .any(|(effect, expected)| effect.kind != *expected)
+    {
+        return false;
+    }
+    if marker
+        .effects
+        .iter()
+        .any(|effect| !effect.completed || !operation_effect_is_safe(project, marker, effect))
+    {
+        return false;
+    }
     expected_event.is_none_or(|kind| {
         marker.session_id.is_some_and(|session_id| {
-            events
-                .iter()
-                .any(|event| event.session_id == session_id && event.event_type == kind)
+            events.iter().any(|event| {
+                event.session_id == session_id
+                    && event.event_type == kind
+                    && operation_event_matches(marker, event)
+            })
         })
     })
+}
+
+fn operation_effect_is_safe(
+    project: &Path,
+    marker: &OperationMarker,
+    effect: &OperationEffect,
+) -> bool {
+    let path = Path::new(&effect.path);
+    if path.is_absolute()
+        || !path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+        || !effect.path.starts_with(".relay/")
+    {
+        return false;
+    }
+    let path_matches = match effect.kind.as_str() {
+        "event" => effect.path == ".relay/events.jsonl",
+        "record" => effect.path == ".relay/handoffs.jsonl",
+        "current_session" => effect.path == ".relay/session.json",
+        "session_record" => marker
+            .session_id
+            .is_some_and(|id| effect.path == format!(".relay/sessions/{id}.json")),
+        "artifact" => match marker.command.as_str() {
+            "checkpoint" => {
+                effect.path.starts_with(".relay/checkpoints/")
+                    && path.extension() == Some(std::ffi::OsStr::new("json"))
+            }
+            "handoff" => {
+                effect.path.starts_with(".relay/handoffs/")
+                    && path.extension() == Some(std::ffi::OsStr::new("md"))
+            }
+            "finish" => marker
+                .session_id
+                .is_some_and(|id| effect.path == format!(".relay/summary-{id}.md")),
+            _ => false,
+        },
+        _ => false,
+    };
+    path_matches && operation_effect_file_is_safe(project, path)
+}
+
+fn operation_effect_file_is_safe(project: &Path, path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(project.join(path)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        metadata.is_file() && metadata.nlink() == 1
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
+fn operation_event_matches(marker: &OperationMarker, event: &Event) -> bool {
+    let artifact = marker
+        .effects
+        .iter()
+        .find(|effect| effect.kind == "artifact")
+        .map(|effect| effect.path.as_str());
+    match marker.command.as_str() {
+        "checkpoint" => event.payload["path"].as_str() == artifact,
+        "handoff" => {
+            event.payload["path"].as_str() == artifact
+                && event.payload["record_path"].as_str()
+                    == marker
+                        .effects
+                        .iter()
+                        .find(|effect| effect.kind == "record")
+                        .map(|effect| effect.path.as_str())
+        }
+        "finish" => event.payload["summary_path"].as_str() == artifact,
+        _ => true,
+    }
 }
 
 fn inspect_artifacts(
@@ -2665,10 +2852,21 @@ fn create_state_directories(paths: &Paths) -> Result<(), AppError> {
         &paths.sessions,
         &paths.operations,
     ] {
+        #[cfg(unix)]
+        let existed = fs::symlink_metadata(path).is_ok();
         fs::create_dir_all(path).map_err(|source| AppError::Io {
             path: path.to_owned(),
             source,
         })?;
+        #[cfg(unix)]
+        if path == &paths.handoffs && !existed {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+                AppError::Io {
+                    path: path.to_owned(),
+                    source,
+                }
+            })?;
+        }
     }
     Ok(())
 }
@@ -2680,6 +2878,7 @@ fn validate_state_paths(paths: &Paths) -> Result<(), AppError> {
         &paths.events,
         &paths.checkpoints,
         &paths.handoffs,
+        &paths.handoff_records,
         &paths.sessions,
         &paths.operations,
         &paths.lock,
@@ -2704,10 +2903,19 @@ fn validate_state_paths(paths: &Paths) -> Result<(), AppError> {
 }
 
 fn relative_to_project(project: &Path, path: &Path) -> String {
-    path.strip_prefix(project)
+    let relative = path
+        .strip_prefix(project)
         .unwrap_or(path)
         .to_string_lossy()
-        .into_owned()
+        .into_owned();
+    #[cfg(windows)]
+    {
+        relative.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        relative
+    }
 }
 
 fn state_name(state: &SessionState) -> &'static str {
@@ -2761,6 +2969,7 @@ struct Paths {
     events: PathBuf,
     checkpoints: PathBuf,
     handoffs: PathBuf,
+    handoff_records: PathBuf,
     sessions: PathBuf,
     operations: PathBuf,
     lock: PathBuf,
@@ -2774,6 +2983,7 @@ impl Paths {
             events: relay.join("events.jsonl"),
             checkpoints: relay.join("checkpoints"),
             handoffs: relay.join("handoffs"),
+            handoff_records: relay.join("handoffs.jsonl"),
             sessions: relay.join("sessions"),
             operations: relay.join("operations"),
             lock: relay.join("lock"),
@@ -2792,7 +3002,18 @@ mod tests {
 
     fn handoff_args(agent: &str) -> HandoffArgs {
         HandoffArgs {
-            agent: agent.into(),
+            agent: Some(agent.into()),
+            show: None,
+            latest: false,
+            list: false,
+            to: None,
+            source_agent: None,
+            goal: None,
+            next_actions: Vec::new(),
+            runs: Vec::new(),
+            checkpoints: Vec::new(),
+            notes: Vec::new(),
+            supersedes: None,
             completed_work: Vec::new(),
             decision: Vec::new(),
             failure: Vec::new(),
@@ -2960,7 +3181,18 @@ mod tests {
         )
         .unwrap();
         let args = HandoffArgs {
-            agent: "codex".into(),
+            agent: Some("codex".into()),
+            show: None,
+            latest: false,
+            list: false,
+            to: None,
+            source_agent: None,
+            goal: None,
+            next_actions: Vec::new(),
+            runs: Vec::new(),
+            checkpoints: Vec::new(),
+            notes: Vec::new(),
+            supersedes: None,
             completed_work: vec!["implemented flow".into(), "ran tests".into()],
             decision: vec!["keep JSONL".into()],
             failure: vec!["network unavailable".into()],

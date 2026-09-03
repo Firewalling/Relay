@@ -1,6 +1,7 @@
 pub mod app;
 pub mod cli;
 pub mod git;
+pub mod handoff;
 pub mod lock;
 pub mod model;
 pub mod orchestrate;

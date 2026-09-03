@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 #[cfg(all(unix, not(target_os = "linux")))]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     env,
@@ -443,7 +443,7 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
             Self::Completed => "completed",
@@ -467,7 +467,7 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
@@ -1501,6 +1501,16 @@ pub fn run_workflow_resume(
         }),
     )
 }
+pub fn read_handoff_run(path: &Path, project_root: &Path) -> Result<RunState, RunError> {
+    validate_handoff_state_path(path, project_root)?;
+    let (canonical_path, bytes) = read_handoff_state(path)?;
+    let state = decode_run_state(&bytes, &canonical_path)?;
+    let plan = state.plan.clone();
+    validate_encoded_plan_size(&plan)?;
+    validate_plan(&plan, project_root)?;
+    validate_resume_state(&state, &plan, &canonical_path, project_root, false)?;
+    Ok(state)
+}
 
 struct WorkflowResumeRequest {
     name: String,
@@ -1617,7 +1627,7 @@ fn run_plan(
             project_root,
         )?;
         let sanitized_plan = sanitize_plan(&plan);
-        validate_resume_state(&state, &sanitized_plan, store.path(), project_root)?;
+        validate_resume_state(&state, &sanitized_plan, store.path(), project_root, true)?;
         if let Some(request) = workflow_resume.as_ref()
             && let Some(current) = request.current_definition_sha256.as_deref()
             && state
@@ -2278,7 +2288,7 @@ fn read_hashed_output(
     if !metadata.file_type().is_file() {
         return Err(format!("output is not a regular file: {}", path.display()));
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if metadata.nlink() != 1 {
         return Err(format!(
             "output has unsafe hardlink count: {}",
@@ -2319,7 +2329,7 @@ fn read_hashed_output(
     let after = file
         .metadata()
         .map_err(|error| format!("could not restat {}: {error}", path.display()))?;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if after.nlink() != 1 {
         return Err(format!(
             "output link count changed while it was read: {}",
@@ -3057,6 +3067,40 @@ fn validate_state_path(path: &Path, project_root: &Path) -> Result<(), RunError>
     Ok(())
 }
 
+fn validate_handoff_state_path(path: &Path, project_root: &Path) -> Result<(), RunError> {
+    validate_state_path(path, project_root)?;
+    let normalized_path = normalize_absolute(path)?;
+    let runs = project_root.join(".relay").join("runs");
+    let normalized_runs = normalize_absolute(&runs)?;
+    if normalized_path == normalized_runs || !normalized_path.starts_with(&normalized_runs) {
+        return Err(RunError::State(format!(
+            "handoff run path must be under {}: {}",
+            runs.display(),
+            path.display()
+        )));
+    }
+    let canonical_path = fs::canonicalize(path).map_err(|error| {
+        RunError::State(format!(
+            "could not resolve run path {}: {error}",
+            path.display()
+        ))
+    })?;
+    let canonical_runs = fs::canonicalize(&runs).map_err(|error| {
+        RunError::State(format!(
+            "could not resolve run directory {}: {error}",
+            runs.display()
+        ))
+    })?;
+    if canonical_path == canonical_runs || !canonical_path.starts_with(&canonical_runs) {
+        return Err(RunError::State(format!(
+            "handoff run path resolves outside {}: {}",
+            runs.display(),
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn reject_symlinked_components(path: &Path) -> Result<(), RunError> {
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -3738,6 +3782,80 @@ fn read_bounded_file(file: File, maximum: u64) -> io::Result<Vec<u8>> {
 fn read_bounded(path: &Path, maximum: u64) -> io::Result<Vec<u8>> {
     read_bounded_file(File::open(path)?, maximum)
 }
+#[cfg(target_os = "linux")]
+fn read_handoff_state(path: &Path) -> Result<(PathBuf, Vec<u8>), RunError> {
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| RunError::State("handoff run path has no parent".into()))?;
+    let parent = open_parent_nofollow(parent_path)?;
+    let canonical_parent = fs::canonicalize(parent_path).map_err(|error| {
+        RunError::State(format!(
+            "could not canonicalize {}: {error}",
+            parent_path.display()
+        ))
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| RunError::State("handoff run path must name a file".into()))?;
+    let name = c_name(file_name, "handoff run filename")?;
+    let file = openat(
+        &parent,
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
+    .map_err(|error| {
+        RunError::State(format!(
+            "could not securely open {}: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        RunError::State(format!("could not inspect {}: {error}", path.display()))
+    })?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(RunError::State(format!(
+            "handoff run state must be a singly-linked regular file: {}",
+            path.display()
+        )));
+    }
+    let canonical_path = canonical_parent.join(file_name);
+    let bytes = read_bounded_file(file, MAX_STATE_BYTES)
+        .map_err(|error| RunError::State(format!("could not read {}: {error}", path.display())))?;
+    Ok((canonical_path, bytes))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_handoff_state(path: &Path) -> Result<(PathBuf, Vec<u8>), RunError> {
+    let canonical_path = fs::canonicalize(path).map_err(|error| {
+        RunError::State(format!(
+            "could not resolve run path {}: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        RunError::State(format!("could not inspect {}: {error}", path.display()))
+    })?;
+    if !metadata.is_file() {
+        return Err(RunError::State(format!(
+            "handoff run state must be a regular file: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        return Err(RunError::State(format!(
+            "handoff run state must be singly linked: {}",
+            path.display()
+        )));
+    }
+    let file = File::open(&canonical_path)
+        .map_err(|error| RunError::State(format!("could not open {}: {error}", path.display())))?;
+    let bytes = read_bounded_file(file, MAX_STATE_BYTES)
+        .map_err(|error| RunError::State(format!("could not read {}: {error}", path.display())))?;
+    Ok((canonical_path, bytes))
+}
+
 fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
     let wire: RunStateWire = serde_json::from_slice(bytes).map_err(|error| {
         RunError::State(format!("could not decode {}: {error}", path.display()))
@@ -4124,6 +4242,7 @@ fn validate_resume_state(
     plan: &Plan,
     state_path: &Path,
     project_root: &Path,
+    reject_redacted: bool,
 ) -> Result<(), RunError> {
     if state.schema_version != RUN_STATE_SCHEMA_VERSION {
         return Err(RunError::State(format!(
@@ -4142,7 +4261,9 @@ fn validate_resume_state(
             state.state_path
         )));
     }
-    reject_redacted_resume(&state.plan)?;
+    if reject_redacted {
+        reject_redacted_resume(&state.plan)?;
+    }
     if &state.plan != plan {
         return Err(RunError::State(
             "resume plan does not match persisted sanitized plan".into(),
@@ -5065,6 +5186,7 @@ mod tests {
             &state.plan,
             Path::new(&state.state_path),
             Path::new("/tmp"),
+            true,
         )
         .unwrap();
         let encoded = encode_state(&state).unwrap();

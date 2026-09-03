@@ -907,3 +907,16 @@ violates its contract. Standalone `relay supervise` permits `timeout_ms: 0`,
 so its requested child may run indefinitely; every built-in `relay run` task
 instead requires a finite timeout of at most 24 hours. Go's internal
 termination and drain windows remain bounded once cleanup begins.
+## Agent-native handoffs
+
+Agent-native handoffs are a Rust-owned continuity surface adjacent to protocol v1. They do not change Rust/Go execution transport, add an external orchestrator, or create an agent runtime.
+
+Creation keeps existing relay handoff AGENT syntax and also supports relay handoff create --to AGENT. Optional --source-agent records an explicit sender statement; Relay does not authenticate or infer agent identity. Existing session goal, categorized notes, checkpoints, and scoped Git are captured as bounded snapshots. Explicit entries and imported note entries carry separate provenance. Missing information is null, empty, or named in unavailable; Relay never fabricates state.
+
+Structured records use handoff schema version 2 and UUID identity. They append to .relay/handoffs.jsonl. Generated Markdown under .relay/handoffs/ is a deterministic view of that record, not a second editable source. Legacy Markdown-only files remain readable and are not migrated on read. `relay handoff --show ID`, `--latest`, and `--list` are read-only; `relay context --handoff latest` or `--handoff ID` returns the same structured record through output-schema-v1 framing.
+
+A handoff may reference an aggregate run with --run PATH. During creation, PATH must resolve to a canonical regular singly-linked state file under the selected project's .relay/runs/. Rust reads that live state with nofollow file access without taking the coordinator's exclusive lock, validates the aggregate and output trust rules, and stores only a snapshot. Workflow metadata includes name, schema, definition hash, and resolved scalar inputs. A running run can be referenced, but only successful terminal task outputs are attached. Later handoff and context reads use the persisted record only; they do not reopen the run, outputs, checkpoints, workflow definition, or Git state.
+
+Trusted output references retain aggregate run ID, task, output, attempt, attempt run ID, output type, project-relative path, size, SHA-256, and bounded JSON value. File artifacts are referenced, never embedded. Failed, cancelled, running, indeterminate, stale, superseded, mismatched, or tampered outputs cannot become trusted handoff outputs. Later run, workflow, Git, note, or artifact changes do not rewrite historical records.
+
+Handoff and context reads enforce bounded record count, record/ledger size, field sizes, entry/reference counts, changed-file count, and rendered character limits. Traversal, symlink, hardlink, cross-project, malformed, duplicate, unsupported, and control-character hazards are rejected or escaped. Persisted free text and workflow inputs are untrusted data; redacted argv values are not reconstructed. No provider API, model call, network, daemon, worker, remote artifact store, prompt generator, or automatic next-action execution exists.

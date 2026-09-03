@@ -5743,3 +5743,504 @@ fn real_go_reusable_workflow_runs_repeats_and_resumes_original_plan() {
         }
     }
 }
+#[test]
+fn handoff_carries_trusted_run_outputs_without_copying_artifacts() {
+    let harness = Harness::new();
+    let start = harness
+        .command()
+        .args(["--scope", "current", "start", "handoff run"])
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "start failed: {:?}", start);
+
+    let mut producer = task("produce", &[]);
+    producer["outputs"] = json!([
+        {"name":"summary","type":"json","path":"summary.json"},
+        {"name":"report","type":"file","path":"report.txt"}
+    ]);
+    producer["arguments"] = json!(["handoff-secret"]);
+    producer["redact_argument_indexes"] = json!([0]);
+    let plan = harness.plan_v3("handoff-run", json!([producer]));
+    let state = harness
+        .directory
+        .path()
+        .join(".relay/runs/handoff-run.json");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    let run = harness.run_json(&plan, &state);
+    let run_document = run_document(&run);
+    assert_eq!(run_document["data"]["run"]["status"], "completed");
+
+    let handoff = harness
+        .command()
+        .args([
+            "--json",
+            "--scope",
+            "current",
+            "handoff",
+            "create",
+            "--to",
+            "agent-b",
+            "--source-agent",
+            "agent-a",
+            "--run",
+            state.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        handoff.status.success(),
+        "handoff failed: {}",
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+    let document: Value = serde_json::from_slice(&handoff.stdout).unwrap();
+    let record = &document["data"]["handoff"];
+    assert_eq!(record["schema_version"], 2);
+    assert_eq!(record["source_agent"], "agent-a");
+    assert_eq!(record["target_agent"], "agent-b");
+    assert_eq!(record["references"]["runs"][0]["status"], "completed");
+    let record_json = serde_json::to_string(record).unwrap();
+    assert!(!record_json.contains("handoff-secret"));
+    assert!(!record_json.contains("<redacted>"));
+    let outputs = record["references"]["outputs"].as_array().unwrap();
+    assert_eq!(outputs.len(), 2);
+    assert!(outputs.iter().all(|output| {
+        output["run_id"] == run_document["data"]["run"]["run_id"]
+            && output["attempt"] == 1
+            && output["attempt_run_id"].is_string()
+            && output["sha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
+            && output["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with(".relay/runs/outputs/"))
+    }));
+    assert!(
+        !fs::read_to_string(harness.directory.path().join(".relay/handoffs.jsonl"))
+            .unwrap()
+            .contains("fake report")
+    );
+    let ledger = harness.directory.path().join(".relay/handoffs.jsonl");
+    let ledger_before = fs::read(&ledger).unwrap();
+    let output_path = harness
+        .directory
+        .path()
+        .join(outputs[0]["path"].as_str().unwrap());
+    let id = record["id"].as_str().unwrap();
+    let assert_snapshot = |args: &[&str]| {
+        let reread = harness.command().args(args).output().unwrap();
+        assert!(
+            reread.status.success(),
+            "historical handoff read failed: {}",
+            String::from_utf8_lossy(&reread.stderr)
+        );
+        let reread_document: Value = serde_json::from_slice(&reread.stdout).unwrap();
+        assert_eq!(&reread_document["data"]["handoff"], record);
+    };
+    for args in [
+        ["--json", "--scope", "current", "handoff", "--show", id],
+        ["--json", "--scope", "current", "context", "--handoff", id],
+    ] {
+        assert_snapshot(&args);
+    }
+    fs::write(&output_path, b"tampered").unwrap();
+    for args in [
+        ["--json", "--scope", "current", "handoff", "--show", id],
+        ["--json", "--scope", "current", "context", "--handoff", id],
+    ] {
+        assert_snapshot(&args);
+    }
+    fs::remove_file(&output_path).unwrap();
+    for args in [
+        ["--json", "--scope", "current", "handoff", "--show", id],
+        ["--json", "--scope", "current", "context", "--handoff", id],
+    ] {
+        assert_snapshot(&args);
+    }
+    fs::write(&state, b"changed live run state").unwrap();
+    for args in [
+        ["--json", "--scope", "current", "handoff", "--show", id],
+        ["--json", "--scope", "current", "context", "--handoff", id],
+    ] {
+        assert_snapshot(&args);
+    }
+    fs::remove_file(&state).unwrap();
+    for args in [
+        ["--json", "--scope", "current", "handoff", "--show", id],
+        ["--json", "--scope", "current", "context", "--handoff", id],
+    ] {
+        assert_snapshot(&args);
+    }
+    assert_eq!(fs::read(&ledger).unwrap(), ledger_before);
+
+    let second = harness
+        .command()
+        .args(["--json", "--scope", "current", "handoff", "agent-c"])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "second handoff failed: {:?}",
+        second
+    );
+    let second_document: Value = serde_json::from_slice(&second.stdout).unwrap();
+    let second_id = second_document["data"]["handoff"]["id"].as_str().unwrap();
+    assert_ne!(id, second_id);
+
+    let listed = harness
+        .command()
+        .args(["--json", "--scope", "current", "handoff", "--list"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "listing stale handoff failed");
+    let listed_document: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(
+        listed_document["data"]["handoffs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let latest = harness
+        .command()
+        .args(["--json", "--scope", "current", "handoff", "--latest"])
+        .output()
+        .unwrap();
+    assert!(latest.status.success(), "latest stale handoff failed");
+    let latest_document: Value = serde_json::from_slice(&latest.stdout).unwrap();
+    assert_eq!(latest_document["data"]["handoff"]["id"], second_id);
+    let unrelated = harness
+        .command()
+        .args([
+            "--json", "--scope", "current", "handoff", "--show", second_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(unrelated.status.success(), "unrelated handoff show failed");
+    let unrelated_document: Value = serde_json::from_slice(&unrelated.stdout).unwrap();
+    assert_eq!(unrelated_document["data"]["handoff"]["id"], second_id);
+}
+#[test]
+fn handoff_reads_running_run_without_taking_aggregate_lock() {
+    let harness = Harness::new();
+    let start = harness
+        .command()
+        .args(["--scope", "current", "start", "running handoff"])
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "start failed: {:?}", start);
+
+    let plan = harness.plan_v3("running-handoff", json!([task("holding", &[])]));
+    let state = harness
+        .directory
+        .path()
+        .join(".relay/runs/running-handoff.json");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    let marker = harness.directory.path().join("running.marker");
+    let release = harness.directory.path().join("running.release");
+    let mut child = harness
+        .command()
+        .env("RELAY_TEST_RUN_PAUSE", "before_supervisor_launch")
+        .env("RELAY_TEST_RUN_MARKER", &marker)
+        .env("RELAY_TEST_RUN_RELEASE", &release)
+        .args([
+            "--json",
+            "run",
+            "--supervisor",
+            harness.supervisor.to_str().unwrap(),
+            "--state-path",
+            state.to_str().unwrap(),
+            plan.to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+    wait_for_path(&marker);
+
+    let handoff = harness
+        .command()
+        .args([
+            "--json",
+            "--scope",
+            "current",
+            "handoff",
+            "create",
+            "--to",
+            "agent-b",
+            "--run",
+            state.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(handoff.status.success(), "handoff failed: {:?}", handoff);
+    let document: Value = serde_json::from_slice(&handoff.stdout).unwrap();
+    assert_eq!(
+        document["data"]["handoff"]["references"]["runs"][0]["status"],
+        "running"
+    );
+    assert!(
+        document["data"]["handoff"]["references"]["outputs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    fs::write(&release, b"release").unwrap();
+    assert!(child.wait().unwrap().success());
+}
+#[test]
+fn failed_cancelled_and_indeterminate_runs_never_publish_handoff_outputs() {
+    for (label, mode, expected_status) in [
+        ("failed", "nonzero", "failed"),
+        ("cancelled", "cancelled", "cancelled"),
+        ("indeterminate", "malformed_output", "indeterminate"),
+    ] {
+        let harness = Harness::new();
+        let start = harness
+            .command()
+            .args(["--scope", "current", "start", label])
+            .output()
+            .unwrap();
+        assert!(start.status.success(), "start failed: {:?}", start);
+        let task_id = format!("{label}-task");
+        harness.configure(&[(task_id.as_str(), mode)]);
+        let mut producer = task(&task_id, &[]);
+        producer["outputs"] = json!([
+            {"name":"summary","type":"json","path":"summary.json"},
+            {"name":"report","type":"file","path":"report.txt"}
+        ]);
+        let plan = harness.plan_v3(label, json!([producer]));
+        let state = harness
+            .directory
+            .path()
+            .join(format!(".relay/runs/{label}.json"));
+        fs::create_dir_all(state.parent().unwrap()).unwrap();
+        let run = run_document(&harness.run_json(&plan, &state));
+        assert_eq!(run["data"]["run"]["status"], expected_status);
+
+        let handoff = harness
+            .command()
+            .args([
+                "--json",
+                "--scope",
+                "current",
+                "handoff",
+                "create",
+                "--to",
+                "agent-b",
+                "--run",
+                state.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(handoff.status.success(), "handoff failed: {:?}", handoff);
+        let document: Value = serde_json::from_slice(&handoff.stdout).unwrap();
+        assert_eq!(
+            document["data"]["handoff"]["references"]["runs"][0]["status"],
+            expected_status
+        );
+        assert!(
+            document["data"]["handoff"]["references"]["outputs"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+#[test]
+fn stale_run_output_is_rejected_before_handoff_creation() {
+    let harness = Harness::new();
+    let start = harness
+        .command()
+        .args(["--scope", "current", "start", "stale output"])
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "start failed: {:?}", start);
+    let mut producer = task("produce", &[]);
+    producer["outputs"] = json!([{"name":"report","type":"file","path":"report.txt"}]);
+    let plan = harness.plan_v3("stale-output", json!([producer]));
+    let state = harness
+        .directory
+        .path()
+        .join(".relay/runs/stale-output.json");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    let run = run_document(&harness.run_json(&plan, &state));
+    assert_eq!(run["data"]["run"]["status"], "completed");
+    let output_path = PathBuf::from(
+        record(&read_state(&state), "produce")["outputs"][0]["path"]
+            .as_str()
+            .unwrap(),
+    );
+    fs::write(&output_path, b"tampered").unwrap();
+
+    let handoff = harness
+        .command()
+        .args([
+            "--json",
+            "--scope",
+            "current",
+            "handoff",
+            "create",
+            "--to",
+            "agent-b",
+            "--run",
+            state.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!handoff.status.success());
+    assert!(handoff.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&handoff.stderr).contains("changed after persistence"));
+    assert!(
+        !harness
+            .directory
+            .path()
+            .join(".relay/handoffs.jsonl")
+            .exists()
+    );
+}
+#[test]
+fn handoff_uses_latest_successful_retry_provenance() {
+    let harness = Harness::new();
+    let start = harness
+        .command()
+        .args(["--scope", "current", "start", "retry handoff"])
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "start failed: {:?}", start);
+    harness.configure_sequences(&[("produce", &["nonzero", "success"])]);
+    let mut producer = task("produce", &[]);
+    producer["retry"] = json!({"max_attempts":2,"delay_ms":0});
+    producer["outputs"] = json!([{"name":"report","type":"file","path":"report.txt"}]);
+    let plan = harness.plan_v3("retry-handoff", json!([producer]));
+    let state = harness
+        .directory
+        .path()
+        .join(".relay/runs/retry-handoff.json");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    let run = run_document(&harness.run_json(&plan, &state));
+    assert_eq!(run["data"]["run"]["status"], "completed");
+    let persisted = read_state(&state);
+    assert_eq!(attempts(&persisted, "produce").len(), 2);
+    assert_eq!(record(&persisted, "produce")["outputs"][0]["attempt"], 2);
+
+    let handoff = harness
+        .command()
+        .args([
+            "--json",
+            "--scope",
+            "current",
+            "handoff",
+            "create",
+            "--to",
+            "agent-b",
+            "--run",
+            state.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(handoff.status.success(), "handoff failed: {:?}", handoff);
+    let document: Value = serde_json::from_slice(&handoff.stdout).unwrap();
+    let output = &document["data"]["handoff"]["references"]["outputs"][0];
+    assert_eq!(output["attempt"], 2);
+    assert_eq!(
+        output["attempt_run_id"],
+        attempts(&persisted, "produce")[1]["run_id"]
+    );
+}
+#[test]
+fn forged_output_declaration_is_rejected_before_outside_reads() {
+    let harness = Harness::new();
+    let start = harness
+        .command()
+        .args(["--scope", "current", "start", "forged plan"])
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "start failed: {:?}", start);
+    let mut producer = task("produce", &[]);
+    producer["outputs"] = json!([{"name":"report","type":"file","path":"report.txt"}]);
+    let plan = harness.plan_v3("forged-plan", json!([producer]));
+    let state = harness
+        .directory
+        .path()
+        .join(".relay/runs/forged-plan.json");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    run_document(&harness.run_json(&plan, &state));
+
+    let outside = harness
+        .directory
+        .path()
+        .parent()
+        .unwrap()
+        .join("forged-outside.txt");
+    fs::write(&outside, b"sentinel").unwrap();
+    let mut persisted = read_state(&state);
+    persisted["plan"]["tasks"][0]["outputs"][0]["path"] = json!("../../../../forged-outside.txt");
+    fs::write(&state, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+    let handoff = harness
+        .command()
+        .args([
+            "--json",
+            "--scope",
+            "current",
+            "handoff",
+            "create",
+            "--to",
+            "agent-b",
+            "--run",
+            state.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!handoff.status.success());
+    assert!(handoff.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&handoff.stderr).contains("output path must be a relative path")
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"sentinel");
+    assert!(
+        !harness
+            .directory
+            .path()
+            .join(".relay/handoffs.jsonl")
+            .exists()
+    );
+}
+#[test]
+fn missing_and_cross_project_run_references_are_rejected() {
+    let harness = Harness::new();
+    let start = harness
+        .command()
+        .args(["--scope", "current", "start", "run references"])
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "start failed: {:?}", start);
+    let missing = harness.directory.path().join(".relay/runs/missing.json");
+    fs::create_dir_all(missing.parent().unwrap()).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    for requested in [missing, outside.path().join("outside.json")] {
+        let handoff = harness
+            .command()
+            .args([
+                "--json",
+                "--scope",
+                "current",
+                "handoff",
+                "create",
+                "--to",
+                "agent-b",
+                "--run",
+                requested.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!handoff.status.success());
+        assert!(handoff.stdout.is_empty());
+    }
+    assert!(
+        !harness
+            .directory
+            .path()
+            .join(".relay/handoffs.jsonl")
+            .exists()
+    );
+}

@@ -461,3 +461,17 @@ integrations remain deliberately deferred.
 10. The schema has no expressions, branching, loops, imports, functions, or dynamic task generation.
 11. Direct relay run remains covered by the existing full Rust and real Go suites.
 12. Small workflow definitions remove repeated plan boilerplate while retaining explicit task configuration.
+## 15. Agent-native handoff milestone
+
+This milestone adds immutable schema-version-2 handoff records without adding an agent runtime. Relay remains local, deterministic, bounded, and Rust-owned for lifecycle, storage, Git, aggregate run state, workflow metadata, and trusted output validation.
+
+Structured records append to .relay/handoffs.jsonl and receive UUIDs. Generated Markdown remains under .relay/handoffs/ as a deterministic human view. The old `relay handoff AGENT` form still creates records; `relay handoff create --to AGENT` adds explicit target syntax. `relay handoff --show ID`, `--latest`, `--list`, and `context --handoff` consume records without transcript access or read-time migration. Legacy Markdown-only artifacts remain byte-preserved and readable.
+
+Records snapshot goal, source/target statements, typed explicit and recorded-note entries, checkpoints, notes, scoped Git branch/commit/cleanliness/changed files, and optional aggregate run/workflow state. During creation, run references use project-local nofollow state access without taking a live coordinator's exclusive lock; aggregate schema and output provenance are checked before recording. Handoff ledger capacity validation and append retain their no-follow file protections under the project lock. Outputs are attached only when existing Rust validation proves successful task and attempt provenance; structured JSON stays bounded and file artifact bytes are not copied. After persistence, ordinary handoff and context reads use the immutable record and do not reopen referenced live state.
+
+Agent A to Agent B was re-run in a temporary Git repository with the real relay-supervisor. Agent A created a handoff containing a trusted file output and checkpoint; a fresh Agent B process read the same record after the output, aggregate run state, and checkpoint were each changed and then deleted. Both context and show returned the original record, and the ledger bytes stayed unchanged.
+
+Security coverage rejects project escapes, traversal, symlinked or hardlinked handoff/run files, malformed or unsupported records, duplicate IDs, oversized state, stale/tampered run outputs, and invalid provenance. Human rendering escapes terminal controls. Persisted free text, workflow inputs, and structured values remain user-visible data; Relay does not reconstruct secrets or redacted argv values.
+Hardening verification passed: cargo fmt --check, strict Cargo Clippy, all Rust targets (252 tests), gofmt, git diff --check, go vet, race-enabled Go tests, real Go supervisor build, the configured Rust-to-Go supervisor integration test (1), and the configured Rust-to-Go DAG/reconciliation suite (15).
+
+Deferred remain provider APIs, prompt generation, agent spawning, autonomous loops, daemons, networking, remote handoffs, authentication, uploads, embeddings, semantic ranking, workflow control flow, scripting, and UI/TUI.
