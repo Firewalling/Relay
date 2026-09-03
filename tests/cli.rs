@@ -2991,6 +2991,11 @@ fn handoff_rejects_invalid_references_and_unsafe_legacy_files() {
     assert!(!invalid_source.status.success());
     assert!(stderr(&invalid_source).contains("source agent must match"));
 
+    let control_selector = "missing\u{1b}[31m";
+    let invalid_note = relay(project, &["handoff", "agent-b", "--note", control_selector]);
+    assert!(!invalid_note.status.success());
+    assert!(!stderr(&invalid_note).contains('\u{1b}'));
+
     #[cfg(unix)]
     {
         let outside = tempfile::tempdir().unwrap();

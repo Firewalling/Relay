@@ -900,6 +900,7 @@ fn select_references<T: Clone>(
     }
     let mut selected = HashSet::new();
     for selector in selectors {
+        let display_selector = safe_inline(Path::new(""), selector);
         let matches = if selector.eq_ignore_ascii_case("latest") {
             candidates.last().into_iter().collect::<Vec<_>>()
         } else {
@@ -913,10 +914,10 @@ fn select_references<T: Clone>(
             [candidate] => {
                 selected.insert(id(candidate));
             }
-            [] => return Err(format!("no handoff reference matches `{selector}`")),
+            [] => return Err(format!("no handoff reference matches `{display_selector}`")),
             _ => {
                 return Err(format!(
-                    "handoff reference selector `{selector}` is ambiguous"
+                    "handoff reference selector `{display_selector}` is ambiguous"
                 ));
             }
         }

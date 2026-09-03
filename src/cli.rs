@@ -899,4 +899,12 @@ mod tests {
         };
         assert_eq!(args.agent.as_deref(), Some("__create__"));
     }
+    #[test]
+    fn rejects_extra_handoff_positionals_before_mutation() {
+        assert!(Cli::try_parse_from(["relay", "handoff", "agent-a", "selector"]).is_err());
+        assert!(
+            Cli::try_parse_from(["relay", "handoff", "create", "--to", "agent-b", "selector"])
+                .is_err()
+        );
+    }
 }
