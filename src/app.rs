@@ -3000,7 +3000,9 @@ mod tests {
     fn handoff_args(agent: &str) -> HandoffArgs {
         HandoffArgs {
             agent: Some(agent.into()),
-            selector: None,
+            show: None,
+            latest: false,
+            list: false,
             to: None,
             source_agent: None,
             goal: None,
@@ -3177,7 +3179,9 @@ mod tests {
         .unwrap();
         let args = HandoffArgs {
             agent: Some("codex".into()),
-            selector: None,
+            show: None,
+            latest: false,
+            list: false,
             to: None,
             source_agent: None,
             goal: None,

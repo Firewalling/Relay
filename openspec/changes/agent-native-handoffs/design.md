@@ -14,7 +14,7 @@ Structured records append to `.relay/handoffs.jsonl`. Each record gets one gener
 
 ### CLI
 
-`relay handoff <agent>` remains a simple compatible create form. `relay handoff create --to <agent>` is the explicit form. `relay handoff show <id>`, `relay handoff latest`, and `relay handoff list` inspect records. Create accepts existing explicit fields, optional source agent/goal, repeated run paths, and optional supersession. `relay context --handoff latest|<id>` consumes one immutable snapshot. Global `--json` continues to provide the existing output-schema-v1 envelope.
+`relay handoff <agent>` remains a simple compatible create form. `relay handoff create --to <agent>` is the explicit form. `relay handoff --show <id>`, `--latest`, and `--list` inspect records without colliding with any positional agent name. Create accepts existing explicit fields, optional source agent/goal, repeated run paths, and optional supersession. `relay context --handoff latest|<id>` consumes one immutable snapshot. Global `--json` continues to provide the existing output-schema-v1 envelope.
 
 ### Relevance
 

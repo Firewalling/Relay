@@ -353,11 +353,18 @@ pub struct CheckpointArgs {
 
 #[derive(Debug, Args)]
 pub struct HandoffArgs {
-    /// Existing target-agent form, or create/show/latest/list action.
+    /// Existing target-agent form, or explicit handoff action.
     #[arg(value_parser = parse_handoff_subject)]
     pub agent: Option<String>,
-    /// Handoff UUID or prefix for the show action.
-    pub selector: Option<String>,
+    /// Inspect one handoff by UUID or unambiguous prefix.
+    #[arg(long = "show", value_name = "HANDOFF_ID", conflicts_with_all = ["latest", "list"])]
+    pub show: Option<String>,
+    /// Inspect the latest handoff.
+    #[arg(long, conflicts_with_all = ["show", "list"])]
+    pub latest: bool,
+    /// List all handoffs.
+    #[arg(long, conflicts_with_all = ["show", "latest"])]
+    pub list: bool,
     /// Agent receiving the handoff in explicit create form.
     #[arg(long, alias = "target", value_parser = parse_agent)]
     pub to: Option<String>,
@@ -839,7 +846,6 @@ mod tests {
             panic!("expected handoff create");
         };
         assert_eq!(args.agent, Some("create".into()));
-        assert_eq!(args.selector, None);
         assert_eq!(args.to.as_deref(), Some("agent-b"));
         assert_eq!(args.source_agent.as_deref(), Some("agent-a"));
         assert_eq!(args.next_actions, ["review"]);
@@ -848,15 +854,32 @@ mod tests {
             [std::path::PathBuf::from(".relay/runs/run.json")]
         );
 
-        let Command::Handoff(args) = Cli::try_parse_from(["relay", "handoff", "show", "1234"])
+        let Command::Handoff(args) = Cli::try_parse_from(["relay", "handoff", "--show", "1234"])
             .unwrap()
             .command
         else {
             panic!("expected handoff show");
         };
-        assert_eq!(args.agent, Some("show".into()));
-        assert_eq!(args.selector.as_deref(), Some("1234"));
+        assert_eq!(args.agent, None);
+        assert_eq!(args.show.as_deref(), Some("1234"));
+        assert!(!args.latest);
+        assert!(!args.list);
 
+        let Command::Handoff(args) = Cli::try_parse_from(["relay", "handoff", "--latest"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected handoff latest");
+        };
+        assert!(args.latest);
+
+        let Command::Handoff(args) = Cli::try_parse_from(["relay", "handoff", "--list"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected handoff list");
+        };
+        assert!(args.list);
         let Command::Context(args) =
             Cli::try_parse_from(["relay", "context", "--handoff", "latest"])
                 .unwrap()

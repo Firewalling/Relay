@@ -37,6 +37,7 @@ pub const MAX_HANDOFF_TASKS_PER_RUN: usize = 64;
 pub const MAX_HANDOFF_LEGACY_BYTES: u64 = 256 * 1024;
 pub const MAX_HANDOFF_CHANGED_FILES: usize = 256;
 pub const MAX_HANDOFF_PATH_BYTES: usize = 512;
+pub const MAX_HANDOFF_GIT_PATH_BYTES: usize = 4 * 1024;
 pub const MAX_HANDOFF_STATUS_BYTES: usize = 256;
 
 const HANDOFF_DIRECTORY: &str = ".relay/handoffs";
@@ -127,52 +128,39 @@ pub enum HandoffAction {
 }
 
 pub fn action(args: &HandoffArgs) -> Result<HandoffAction, String> {
+    if let Some(selector) = args.show.as_deref() {
+        if args.agent.is_some() || has_create_options(args) {
+            return Err("handoff --show accepts one id and no create options".into());
+        }
+        return Ok(HandoffAction::Show(selector.to_owned()));
+    }
+    if args.latest {
+        if args.agent.is_some() || has_create_options(args) {
+            return Err("handoff --latest accepts no selector or create options".into());
+        }
+        return Ok(HandoffAction::Latest);
+    }
+    if args.list {
+        if args.agent.is_some() || has_create_options(args) {
+            return Err("handoff --list accepts no selector or create options".into());
+        }
+        return Ok(HandoffAction::List);
+    }
     match args.agent.as_deref() {
         None => {
-            if args.selector.is_some() {
-                return Err("handoff create does not accept a selector".into());
-            }
             let target = args
                 .to
                 .clone()
                 .ok_or_else(|| "handoff create requires --to <agent>".to_owned())?;
             Ok(HandoffAction::Create { target })
         }
-        Some("show") => {
-            if args.selector.is_none() || has_create_options(args) {
-                return Err("handoff show requires one id and no create options".into());
-            }
-            Ok(HandoffAction::Show(args.selector.clone().unwrap()))
-        }
-        Some("latest") => {
-            if args.selector.is_some() || has_create_options(args) {
-                return Err("handoff latest accepts no selector or create options".into());
-            }
-            Ok(HandoffAction::Latest)
-        }
-        Some("list") => {
-            if args.selector.is_some() || has_create_options(args) {
-                return Err("handoff list accepts no selector or create options".into());
-            }
-            Ok(HandoffAction::List)
-        }
-        Some("create") if args.to.is_some() => {
-            if args.selector.is_some() {
-                return Err("handoff create does not accept a selector".into());
-            }
-            Ok(HandoffAction::Create {
-                target: args.to.clone().unwrap(),
-            })
-        }
-        Some("create") => Err("handoff create requires --to <agent>".into()),
-        Some(subject) => {
-            if args.selector.is_some() || args.to.is_some() {
-                return Err("target options require handoff create".into());
-            }
-            Ok(HandoffAction::Create {
-                target: subject.to_owned(),
-            })
-        }
+        Some("create") if args.to.is_some() => Ok(HandoffAction::Create {
+            target: args.to.clone().unwrap(),
+        }),
+        Some(subject) if args.to.is_none() => Ok(HandoffAction::Create {
+            target: subject.to_owned(),
+        }),
+        Some(_) => Err("target options require handoff create".into()),
     }
 }
 
@@ -1495,7 +1483,7 @@ fn validate_git(git: &GitSnapshot) -> Result<(), String> {
 }
 
 fn validate_git_changed_path(value: &str) -> Result<(), String> {
-    validate_text(value, MAX_HANDOFF_PATH_BYTES, "changed file")?;
+    validate_text(value, MAX_HANDOFF_GIT_PATH_BYTES, "changed file")?;
     if value.is_empty() || value.starts_with('/') {
         return Err("changed file must be project-relative".into());
     }
@@ -2074,6 +2062,23 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
+    #[test]
+    fn long_git_paths_keep_historical_snapshots_compatible() {
+        let path = format!("{}/{}", "a".repeat(300), "b".repeat(300));
+        let mut record = minimal_record();
+        record.git = GitSnapshot {
+            schema_version: SCHEMA_VERSION,
+            available: true,
+            changed_files: vec![path.clone()],
+            ..GitSnapshot::unavailable()
+        };
+        let original = record.git.clone();
+        record.git = bound_git(record.git.clone());
+
+        assert_eq!(record.git.changed_files, vec![path]);
+        assert_eq!(original.changed_files, record.git.changed_files);
+        assert!(validate_record(&record).is_ok());
+    }
     #[test]
     fn rendering_escapes_terminal_controls_and_preserves_structure() {
         let mut record = minimal_record();

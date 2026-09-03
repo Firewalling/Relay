@@ -2898,9 +2898,9 @@ fn structured_handoff_round_trips_through_context_and_keeps_snapshot() {
     let ledger_before = fs::read(project.join(".relay/handoffs.jsonl")).unwrap();
     let id = record["id"].as_str().unwrap().to_owned();
 
-    let show = relay(project, &["--json", "handoff", "show", id.as_str()]);
+    let show = relay(project, &["--json", "handoff", "--show", id.as_str()]);
     assert_eq!(json_success_data(&show)["handoff"], record);
-    let latest = relay(project, &["--json", "handoff", "latest"]);
+    let latest = relay(project, &["--json", "handoff", "--latest"]);
     assert_eq!(json_success_data(&latest)["handoff"], record);
     let context = relay(project, &["--json", "context", "--handoff", id.as_str()]);
     let context_data = json_success_data(&context);
@@ -2937,7 +2937,7 @@ fn structured_handoff_round_trips_through_context_and_keeps_snapshot() {
         .unwrap()
         .to_owned();
     assert_ne!(id, second_id);
-    let listed = relay(project, &["--json", "handoff", "list"]);
+    let listed = relay(project, &["--json", "handoff", "--list"]);
     assert_eq!(
         json_success_data(&listed)["handoffs"]
             .as_array()
@@ -2957,10 +2957,10 @@ fn legacy_handoff_is_read_without_destructive_migration() {
     let bytes = b"legacy handoff";
     fs::write(&path, bytes).unwrap();
 
-    let show = relay(project, &["handoff", "show", "legacy-handoff"]);
+    let show = relay(project, &["handoff", "--show", "legacy-handoff"]);
     assert_success(&show);
     assert!(stdout(&show).contains("legacy handoff"));
-    let json_show = relay(project, &["--json", "handoff", "show", "legacy-handoff"]);
+    let json_show = relay(project, &["--json", "handoff", "--show", "legacy-handoff"]);
     let data = json_success_data(&json_show);
     assert_eq!(data["legacy"], true);
     assert_eq!(data["handoff"], serde_json::Value::Null);
@@ -2998,7 +2998,7 @@ fn handoff_rejects_invalid_references_and_unsafe_legacy_files() {
         fs::write(&outside_file, b"outside").unwrap();
         let unsafe_file = project.join(".relay/handoffs/unsafe.md");
         std::os::unix::fs::symlink(&outside_file, &unsafe_file).unwrap();
-        let listed = relay(project, &["handoff", "list"]);
+        let listed = relay(project, &["handoff", "--list"]);
         assert!(!listed.status.success());
         assert!(stderr(&listed).contains("handoff file must not be symlinked"));
         assert_eq!(fs::read(&outside_file).unwrap(), b"outside");
@@ -3010,7 +3010,7 @@ fn handoff_rejects_invalid_references_and_unsafe_legacy_files() {
     let mut invalid_json_line = invalid_json;
     invalid_json_line.push(10);
     fs::write(&ledger, &invalid_json_line).unwrap();
-    let unsupported = relay(project, &["handoff", "list"]);
+    let unsupported = relay(project, &["handoff", "--list"]);
     assert!(!unsupported.status.success());
     assert!(stderr(&unsupported).contains("unsupported handoff schema_version 99"));
     assert_eq!(fs::read(&ledger).unwrap(), invalid_json_line);
@@ -3199,13 +3199,13 @@ fn handoff_rejects_symlinked_and_hardlinked_checkpoint_artifacts() {
 }
 
 #[test]
-fn reserved_legacy_agent_names_use_explicit_target_escape() {
+fn every_nonblank_positional_agent_name_remains_a_target() {
     let directory = tempfile::tempdir().unwrap();
     let project = directory.path();
     assert_success(&relay(project, &["start", "reserved names"]));
 
-    for target in ["show", "latest", "list", "create"] {
-        let output = relay(project, &["--json", "handoff", "--target", target]);
+    for target in ["show", "latest", "list", "create", "__create__"] {
+        let output = relay(project, &["--json", "handoff", target]);
         assert_eq!(
             json_success_data(&output)["handoff"]["target_agent"],
             target
