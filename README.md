@@ -655,7 +655,7 @@ back up `.relay/`, and resolve such damage manually.
 
 Structured handoffs are immutable Relay snapshots for passing recorded state from one terminal agent to another. They do not inspect transcripts, summarize source, execute next actions, or start agents.
 
-The existing positional form remains valid:
+The existing positional form remains valid and preserves the target text exactly. The action words `show`, `latest`, `list`, and `create` are reserved for inspection or explicit creation; use `relay handoff --target <name>` when an older positional target has one of those names:
 
     relay handoff codex --completed-work "implemented parser" --decision "keep JSONL" --failure "review pending" --next-action "run integration"
 

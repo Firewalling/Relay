@@ -3197,3 +3197,19 @@ fn handoff_rejects_symlinked_and_hardlinked_checkpoint_artifacts() {
         assert_eq!(fs::read(&outside_file).unwrap(), outside_bytes);
     }
 }
+
+#[test]
+fn reserved_legacy_agent_names_use_explicit_target_escape() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path();
+    assert_success(&relay(project, &["start", "reserved names"]));
+
+    for target in ["show", "latest", "list", "create"] {
+        let output = relay(project, &["--json", "handoff", "--target", target]);
+        assert_eq!(
+            json_success_data(&output)["handoff"]["target_agent"],
+            target
+        );
+        assert_eq!(read_session(project).last_agent.as_deref(), Some(target));
+    }
+}
