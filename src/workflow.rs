@@ -483,8 +483,6 @@ struct ExpansionContext<'a> {
     hash_instances: Vec<CompositionHashInstance>,
     instances_by_workflow: HashMap<String, usize>,
     total_instances: usize,
-    dependency_count: usize,
-    source_dependency_count: usize,
     output_count: usize,
     export_count: usize,
 }
@@ -519,8 +517,6 @@ impl<'a> WorkflowResolver<'a> {
             hash_instances: Vec::new(),
             instances_by_workflow: HashMap::new(),
             total_instances: 0,
-            dependency_count: 0,
-            source_dependency_count: 0,
             output_count: 0,
             export_count: 0,
         };
@@ -666,7 +662,6 @@ impl<'a> ExpansionContext<'a> {
                         )));
                     }
                     self.tasks.push(ExpandedTask { task, arguments });
-                    self.account_source_dependencies(source.depends_on.len(), scope)?;
                     groups.push((
                         source.id.clone(),
                         NodeGroup {
@@ -736,7 +731,6 @@ impl<'a> ExpansionContext<'a> {
                         Some(&child_path),
                         depth + 1,
                     )?;
-                    self.account_source_dependencies(instance.depends_on.len(), scope)?;
                     groups.push((
                         instance.id.clone(),
                         NodeGroup {
@@ -907,27 +901,6 @@ impl<'a> ExpansionContext<'a> {
             })
     }
 
-    fn account_source_dependencies(
-        &mut self,
-        count: usize,
-        scope: &str,
-    ) -> Result<(), WorkflowError> {
-        self.source_dependency_count =
-            self.source_dependency_count
-                .checked_add(count)
-                .ok_or_else(|| {
-                    WorkflowError::Definition(format!(
-                        "workflow {scope}: dependency count overflow"
-                    ))
-                })?;
-        if self.source_dependency_count > MAX_COMPOSITION_DEPENDENCIES {
-            return Err(WorkflowError::Definition(format!(
-                "workflow composition exceeds {MAX_COMPOSITION_DEPENDENCIES} dependencies"
-            )));
-        }
-        Ok(())
-    }
-
     fn add_dependency(
         &mut self,
         task_id: &str,
@@ -951,17 +924,23 @@ impl<'a> ExpansionContext<'a> {
                 .task
                 .depends_on
                 .push(dependency.to_owned());
-            self.dependency_count += 1;
-            if self.dependency_count > MAX_COMPOSITION_DEPENDENCIES {
-                return Err(WorkflowError::Definition(format!(
-                    "workflow composition exceeds {MAX_COMPOSITION_DEPENDENCIES} dependencies"
-                )));
-            }
         }
         Ok(())
     }
 
     fn plan_value(&self) -> Result<Value, WorkflowError> {
+        let dependency_count = self.tasks.iter().try_fold(0usize, |total, task| {
+            total
+                .checked_add(task.task.depends_on.len())
+                .ok_or_else(|| {
+                    WorkflowError::Definition("expanded dependency count overflow".into())
+                })
+        })?;
+        if dependency_count > MAX_COMPOSITION_DEPENDENCIES {
+            return Err(WorkflowError::Definition(format!(
+                "workflow composition exceeds {MAX_COMPOSITION_DEPENDENCIES} dependencies"
+            )));
+        }
         let tasks = self
             .tasks
             .iter()
