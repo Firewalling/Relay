@@ -484,6 +484,7 @@ struct ExpansionContext<'a> {
     instances_by_workflow: HashMap<String, usize>,
     total_instances: usize,
     dependency_count: usize,
+    source_dependency_count: usize,
     output_count: usize,
     export_count: usize,
 }
@@ -519,6 +520,7 @@ impl<'a> WorkflowResolver<'a> {
             instances_by_workflow: HashMap::new(),
             total_instances: 0,
             dependency_count: 0,
+            source_dependency_count: 0,
             output_count: 0,
             export_count: 0,
         };
@@ -664,6 +666,7 @@ impl<'a> ExpansionContext<'a> {
                         )));
                     }
                     self.tasks.push(ExpandedTask { task, arguments });
+                    self.account_source_dependencies(source.depends_on.len(), scope)?;
                     groups.push((
                         source.id.clone(),
                         NodeGroup {
@@ -733,6 +736,7 @@ impl<'a> ExpansionContext<'a> {
                         Some(&child_path),
                         depth + 1,
                     )?;
+                    self.account_source_dependencies(instance.depends_on.len(), scope)?;
                     groups.push((
                         instance.id.clone(),
                         NodeGroup {
@@ -901,6 +905,27 @@ impl<'a> ExpansionContext<'a> {
             .ok_or_else(|| {
                 WorkflowError::Definition(format!("workflow {scope}: task {:?} is missing", id))
             })
+    }
+
+    fn account_source_dependencies(
+        &mut self,
+        count: usize,
+        scope: &str,
+    ) -> Result<(), WorkflowError> {
+        self.source_dependency_count =
+            self.source_dependency_count
+                .checked_add(count)
+                .ok_or_else(|| {
+                    WorkflowError::Definition(format!(
+                        "workflow {scope}: dependency count overflow"
+                    ))
+                })?;
+        if self.source_dependency_count > MAX_COMPOSITION_DEPENDENCIES {
+            return Err(WorkflowError::Definition(format!(
+                "workflow composition exceeds {MAX_COMPOSITION_DEPENDENCIES} dependencies"
+            )));
+        }
+        Ok(())
     }
 
     fn add_dependency(
