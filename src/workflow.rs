@@ -371,7 +371,13 @@ fn run_workflow(
                     .into(),
             ));
         }
-        let current_definition_sha256 = current_definition_hash(project_root, &args.name);
+        let persisted_inputs = args
+            .resume
+            .as_deref()
+            .and_then(|path| orchestrate::read_workflow_resume_metadata(path, project_root).ok())
+            .map(|metadata| metadata.inputs);
+        let current_definition_sha256 =
+            current_definition_hash(project_root, &args.name, persisted_inputs.as_ref());
         return Ok(WorkflowResult::Run(orchestrate::run_workflow_resume(
             run_args,
             invocation_directory,
@@ -452,12 +458,14 @@ struct CompositionHashInstance {
     instance: String,
     workflow: String,
     definition_sha256: String,
+    resolved_inputs: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct CompositionHashSource {
     root_workflow: String,
     root_definition_sha256: String,
+    root_inputs: BTreeMap<String, Value>,
     instances: Vec<CompositionHashInstance>,
 }
 
@@ -553,6 +561,7 @@ impl<'a> WorkflowResolver<'a> {
             let source = CompositionHashSource {
                 root_workflow: root_name.to_owned(),
                 root_definition_sha256,
+                root_inputs: inputs.clone(),
                 instances: context.hash_instances,
             };
             let canonical = serde_json::to_vec(&source).map_err(|error| {
@@ -724,6 +733,7 @@ impl<'a> ExpansionContext<'a> {
                         instance: child_path.clone(),
                         workflow: child.definition.name.clone(),
                         definition_sha256: child.definition_sha256.clone(),
+                        resolved_inputs: child_inputs.clone(),
                     });
                     let child_group = self.expand(
                         &child.definition.name,
@@ -1204,12 +1214,18 @@ fn find_workflow(project_root: &Path, name: &str) -> Result<LoadedWorkflow, Work
         })
 }
 
-fn current_definition_hash(project_root: &Path, name: &str) -> Option<String> {
+fn current_definition_hash(
+    project_root: &Path,
+    name: &str,
+    persisted_inputs: Option<&BTreeMap<String, Value>>,
+) -> Option<String> {
     let workflows = load_all(project_root).ok()?;
     let workflow = workflows
         .iter()
         .find(|workflow| workflow.definition.name == name)?;
-    let inputs = placeholder_inputs(&workflow.definition);
+    let inputs = persisted_inputs
+        .cloned()
+        .unwrap_or_else(|| placeholder_inputs(&workflow.definition));
     WorkflowResolver::new(&workflows)
         .resolve(name, &inputs, project_root)
         .ok()
@@ -2341,5 +2357,48 @@ mod tests {
             .resolve("w0", &BTreeMap::new(), above_limit.path())
             .unwrap_err();
         assert!(error.to_string().contains("maximum depth"));
+    }
+    #[test]
+    fn resolved_inputs_change_composition_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let child = json!({
+            "schema_version": 2,
+            "name": "child",
+            "inputs": {"profile": {"type":"string", "required":true}},
+            "tasks": [{"id":"task","program":"/bin/true","arguments":[{"workflow_input":"profile"}]}]
+        });
+        let root = json!({
+            "schema_version": 2,
+            "name": "root",
+            "inputs": {"profile": {"type":"string", "required":true}},
+            "tasks": [{"id":"child","workflow":"child","inputs":{"profile":{"workflow_input":"profile"}}}]
+        });
+        write_workflow(
+            &workflows,
+            "child.json",
+            &serde_json::to_string(&child).unwrap(),
+        );
+        write_workflow(
+            &workflows,
+            "root.json",
+            &serde_json::to_string(&root).unwrap(),
+        );
+        let catalog = load_all(directory.path()).unwrap();
+        let first_inputs =
+            BTreeMap::from([(String::from("profile"), Value::String(String::from("dev")))]);
+        let second_inputs = BTreeMap::from([(
+            String::from("profile"),
+            Value::String(String::from("release")),
+        )]);
+        let first = WorkflowResolver::new(&catalog)
+            .resolve("root", &first_inputs, directory.path())
+            .unwrap();
+        let second = WorkflowResolver::new(&catalog)
+            .resolve("root", &second_inputs, directory.path())
+            .unwrap();
+        assert_ne!(first.definition_sha256, second.definition_sha256);
+        assert_ne!(first.resolved_plan_sha256, second.resolved_plan_sha256);
     }
 }

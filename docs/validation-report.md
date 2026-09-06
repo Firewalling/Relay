@@ -436,11 +436,11 @@ and explicit output exports, and produces one ordinary plan-v3 DAG. No child
 Relay process, nested scheduler, Lua runtime, expression language, or dynamic
 graph mutation is involved.
 
-The persisted workflow metadata records the root identity, source-graph hash,
-expanded instance paths, referenced definition hashes, resolved child inputs,
-schema versions, and resolved-plan hash. Existing aggregate state persists the
-sanitized expanded plan. Resume therefore does not read or expand live root or
-child definitions.
+The persisted workflow metadata records the root identity, source-graph hash
+(including resolved root/child inputs), expanded instance paths, referenced
+definition hashes, resolved child inputs, schema versions, and resolved-plan
+hash. Existing aggregate state persists the sanitized expanded plan. Resume
+therefore does not read or expand live root or child definitions.
 
 ### Observed verification
 

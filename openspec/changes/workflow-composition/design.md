@@ -14,7 +14,7 @@ The resolver loads each discovered definition securely once, caches its parsed c
 
 ### Identity and resume
 
-A composed source hash covers the root canonical definition hash, every referenced definition hash, and deterministic instance paths. Persisted composition metadata records root identity, referenced workflow/schema/hash, instance path, resolved inputs, and the resolved-plan hash. Resume uses only the persisted sanitized plan and optional metadata; live source files are consulted only for a non-blocking changed-definition notice.
+A composed source hash covers the root canonical definition hash, canonical resolved root and child inputs, every referenced definition hash, and deterministic instance paths. Persisted composition metadata records root identity, referenced workflow/schema/hash, instance path, resolved inputs, and the resolved-plan hash. Resume uses only the persisted sanitized plan and optional metadata; live source files are consulted only for a non-blocking changed-definition notice.
 
 ### Bounds and security
 

@@ -1524,6 +1524,20 @@ pub fn run_workflow_resume(
         }),
     )
 }
+pub fn read_workflow_resume_metadata(
+    path: &Path,
+    project_root: &Path,
+) -> Result<WorkflowRunMetadata, RunError> {
+    validate_state_path(path, project_root)?;
+    let mut store = StateStore::open(path, true)?;
+    let state = store.read()?;
+    let metadata = state
+        .workflow
+        .ok_or_else(|| RunError::State("aggregate state is not a workflow run".into()))?;
+    validate_workflow_metadata(&metadata)?;
+    Ok(metadata)
+}
+
 pub fn read_handoff_run(path: &Path, project_root: &Path) -> Result<RunState, RunError> {
     validate_handoff_state_path(path, project_root)?;
     let (canonical_path, bytes) = read_handoff_state(path)?;

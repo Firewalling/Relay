@@ -394,9 +394,9 @@ relay workflow run release --jobs 2 --input profile=release
 ~~~
 
 Expansion produces a canonical source-graph SHA-256 containing the root and
-transitive child definition hashes and instance paths. Aggregate workflow
-metadata additionally records each instance, resolved scalar inputs, schema
-version, and a resolved-plan hash. The sanitized expanded plan and metadata
+transitive child definition hashes, resolved root/child inputs, and instance
+paths. Aggregate workflow metadata additionally records each instance, resolved
+scalar inputs, schema version, and a resolved-plan hash.
 are persisted before execution. Resume reads only that persisted plan; editing,
 deleting, or corrupting live root/child definitions cannot change it. A valid
 changed definition may produce a notice for a new resume invocation.

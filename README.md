@@ -226,9 +226,9 @@ exports, the existing 64-task plan limit, the existing 1 MiB plan limit, and
 remote references, traversal, symlinks, imports, and cross-project lookup are
 not supported. Cycles fail with a deterministic path such as A -> B -> A.
 
-Canonical source hashes include the root and transitive child definition hashes
-and instance paths. Composed metadata also records resolved child inputs and a
-resolved-plan hash. Aggregate state persists this immutable identity and the
+Canonical source hashes include the root and transitive child definition hashes,
+resolved root/child inputs, and instance paths. Composed metadata also records
+resolved child inputs and a resolved-plan hash. Aggregate state persists this immutable identity and the
 sanitized expanded plan. Resume never re-expands live files, so editing,
 deleting, or corrupting root or child definitions cannot change an existing run.
 
