@@ -1277,7 +1277,7 @@ pub fn validate_record(record: &HandoffRecord) -> Result<(), String> {
             return Err(format!("unsupported handoff run status {:?}", run.status));
         }
         if let Some(workflow) = &run.workflow {
-            if workflow.schema_version != 1
+            if !matches!(workflow.schema_version, 1 | 2)
                 || !valid_workflow_name(&workflow.name)
                 || !valid_sha256(&workflow.definition_sha256)
             {

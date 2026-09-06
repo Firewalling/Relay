@@ -426,41 +426,59 @@ keep decision is the durable session/context/handoff plus crash-safe run state;
 the strongest simplify/deprecate decisions are verbose DAG authoring and the
 unconsumed future protocol advertisement.
 
-## 14. Reusable workflows milestone
+## 14. Workflow composition milestone
 
-This section supersedes the historical recommendation above for the current
-workflow milestone. Workflow definitions live in version-controlled
-relay-workflows/ JSON files. The Rust resolver validates bounded scalar inputs,
-explicit argv references, task DAGs, retries, task outputs, and artifact inputs,
-then calls the existing plan-v3 coordinator.
+This milestone adds schema-v2 compile-time workflow composition. A workflow
+instance names one project-local reusable definition. Rust loads and validates
+the complete source graph once, resolves typed scalar mappings and defaults,
+detects cycles, namespaces instance-path task IDs, rewrites group dependencies
+and explicit output exports, and produces one ordinary plan-v3 DAG. No child
+Relay process, nested scheduler, Lua runtime, expression language, or dynamic
+graph mutation is involved.
 
-Real Go integration used a locally built relay-supervisor and an isolated
-project with actual local task programs. Workflow verify ran inspect, format, test, and report
-tasks with a required profile input, structured JSON outputs, file artifacts,
-and downstream output consumption. It completed twice as fresh runs. An
-interrupted run was resumed after changing its workflow file; persisted plan
-arguments and exact output attempt provenance remained unchanged, with no
-duplicate successful inspect attempt. The same resume path also passed after
-definition deletion and malformed replacement in the Rust integration suite.
+The persisted workflow metadata records the root identity, source-graph hash,
+expanded instance paths, referenced definition hashes, resolved child inputs,
+schema versions, and resolved-plan hash. Existing aggregate state persists the
+sanitized expanded plan. Resume therefore does not read or expand live root or
+child definitions.
 
-Workflow-level output aliases, composition, imports, Lua, scripting, dynamic
-control flow, remote execution, daemon mode, secret management, and provider
-integrations remain deliberately deferred.
+### Observed verification
+
+The resolver unit suite covers v1 compatibility, nested and repeated instances,
+root/terminal dependency wiring, explicit exports, typed parent-to-child inputs,
+cycle paths, missing references, namespaced-ID rejection, and child-sensitive
+canonical hashes. The real Go scenario uses relay-workflows/verify.json,
+package.json, and release.json. It verifies a parent profile input, parallel
+verify roots, a one-attempt retry, JSON and file outputs, parent consumption of
+an exported child artifact, output attempt provenance, and one aggregate run.
+
+The crash scenario interrupts the composed run after a supervisor result, then
+changes verify.json to malformed content and deletes package.json before resume.
+The persisted expanded plan completes without duplicate successful work. Output
+records retain the expanded producer task, aggregate run ID, attempt number,
+attempt run ID, and artifact hash. Actual supervisor execution uses the Go
+relay-supervisor binary; the configured Rust-to-Go integration test exercises
+this path when RELAY_SUPERVISOR_E2E_BIN is set.
 
 ### Review answers
 
-1. Resolution is deterministic: sorted JSON files, BTreeMap inputs, ordered tasks, and canonical serialization.
-2. Malformed definitions and inputs launch zero child processes; validation precedes preflight.
-3. String inputs stay single literal argv elements; no shell or interpolation exists.
-4. Workflow execution calls existing plan-v3 DAG machinery; no second scheduler exists.
-5. A changed definition cannot alter an existing interrupted run; persisted plan wins.
-6. Deleting or malforming live definition does not block safe workflow resume.
-7. State stores workflow name, schema version, SHA-256, resolved inputs, and sanitized plan.
-8. Output and artifact trust checks remain in existing Rust finalization and consumption paths.
-9. File, count, name, input, task, parser-depth, metadata, plan, output, and aggregate bounds are enforced.
-10. The schema has no expressions, branching, loops, imports, functions, or dynamic task generation.
-11. Direct relay run remains covered by the existing full Rust and real Go suites.
-12. Small workflow definitions remove repeated plan boilerplate while retaining explicit task configuration.
+1. Composition produces one ordinary validated plan-v3 DAG.
+2. No composed workflow can spawn a Relay scheduler; Go receives one task request at a time.
+3. Every reachable source definition, mapping, export, dependency, and output is validated before preflight.
+4. Cycle detection returns a deterministic source path before recursion can exhaust the stack.
+5. Instance-path namespacing plus the existing plan ID validator rejects collisions and overlong IDs.
+6. Parent tasks can consume only explicitly exported child outputs.
+7. Existing successful-attempt output validation remains authoritative for trust and hashes.
+8. A changed child changes a new source-graph identity; persisted resume identity is unchanged.
+9. Live edits, deletion, and malformed child definitions cannot alter persisted resume execution.
+10. Expansion bounds and the existing plan/task/output limits apply before scheduling.
+11. Direct relay run plans and schema-v1 workflows remain unchanged.
+12. Hostile input stays a literal typed argv value; no shell interpretation exists.
+13. No programming language, Lua runtime, expressions, loops, conditionals, or dynamic mutation were added.
+
+Deferred remain remote imports and registries, workflow control flow, matrices,
+scripting, dynamic task generation, and UI/TUI.
+
 ## 15. Agent-native handoff milestone
 
 This milestone adds immutable schema-version-2 handoff records without adding an agent runtime. Relay remains local, deterministic, bounded, and Rust-owned for lifecycle, storage, Git, aggregate run state, workflow metadata, and trusted output validation.

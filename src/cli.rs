@@ -136,6 +136,9 @@ pub enum WorkflowCommand {
 
 #[derive(Debug, Args)]
 pub struct WorkflowNameArgs {
+    /// Include the fully expanded execution plan.
+    #[arg(long)]
+    pub resolved: bool,
     /// Workflow name.
     pub name: String,
 }

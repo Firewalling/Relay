@@ -5070,7 +5070,12 @@ fn workflow_document(output: &Output) -> Value {
         "workflow envelope unexpectedly wrote stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "workflow stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     let document: Value = serde_json::from_slice(&output.stdout).expect("workflow JSON envelope");
     assert_eq!(document["output_schema_version"], 1);
     assert_eq!(document["ok"], true);
@@ -5333,6 +5338,22 @@ fn invalid_workflow_launches_no_child_process() {
     let invalid_name = harness.workflow_run_json("../escape", &harness.state("invalid-name"), &[]);
     assert_eq!(invalid_name.status.code(), Some(1));
     assert!(harness.requests().is_empty());
+    let composed = Harness::new();
+    composed.workflow_file(
+        "release",
+        &json!({
+            "schema_version": 2,
+            "name": "release",
+            "tasks": [{"id":"verify","workflow":"missing"}]
+        }),
+    );
+    let composed_state = composed.state("invalid-composition");
+    let composed_output = composed.workflow_run_json("release", &composed_state, &[]);
+    assert_eq!(composed_output.status.code(), Some(1));
+    assert!(composed_output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&composed_output.stderr).contains("missing workflow"));
+    assert!(!composed_state.exists());
+    assert!(composed.requests().is_empty());
 }
 #[test]
 fn tampered_workflow_metadata_is_rejected_on_resume() {
@@ -5606,6 +5627,307 @@ with open(paths["final"],"w") as f: f.write("final report\n")
     })
 }
 
+fn real_composed_verify_definition(counter: &Path, retry_flag: &Path) -> Value {
+    let counter = counter.to_str().unwrap();
+    let retry_flag = retry_flag.to_str().unwrap();
+    let inspect = r#"import json,os,sys
+counter,profile=sys.argv[1],sys.argv[2]
+assert profile == "release"
+with open(counter,"a") as f: f.write("inspect\\n")
+paths=json.loads(os.environ["RELAY_OUTPUT_MANIFEST"])
+with open(paths["summary"],"w") as f: json.dump({"kind":"inspect","profile":profile},f)
+with open(paths["report"],"w") as f: f.write("inspect report\\n")
+"#;
+    let format = r#"import os,sys
+if not os.path.exists(sys.argv[1]):
+    open(sys.argv[1],"w").close()
+    sys.exit(17)
+with open(sys.argv[2],"a") as f: f.write("format\\n")
+"#;
+    let test = r#"import json,os,sys
+assert sys.argv[2] == "release"
+assert sys.argv[3] == "--summary"
+assert json.loads(sys.argv[4])["kind"] == "inspect"
+assert sys.argv[5] == "--report" and os.path.isfile(sys.argv[6])
+with open(sys.argv[1],"a") as f: f.write("test\\n")
+paths=json.loads(os.environ["RELAY_OUTPUT_MANIFEST"])
+with open(paths["summary"],"w") as f: json.dump({"kind":"test"},f)
+with open(paths["report"],"w") as f: f.write("test report\\n")
+"#;
+    json!({
+        "schema_version": 2,
+        "name": "verify",
+        "inputs": {"profile": {"type":"string", "required":true}},
+        "tasks": [
+            {"id":"inspect", "program":"/usr/bin/python3", "arguments":["-c", inspect, counter, {"workflow_input":"profile"}],
+             "outputs":[{"name":"summary","type":"json","path":"summary.json"},{"name":"report","type":"file","path":"inspect.txt"}]},
+            {"id":"format", "program":"/usr/bin/python3", "arguments":["-c", format, retry_flag, counter], "retry":{"max_attempts":2,"delay_ms":0}},
+            {"id":"test", "depends_on":["inspect","format"], "program":"/usr/bin/python3", "arguments":["-c", test, counter, {"workflow_input":"profile"}],
+             "outputs":[{"name":"summary","type":"json","path":"test.json"},{"name":"report","type":"file","path":"test.txt"}],
+             "inputs":[{"from_task":"inspect","output":"summary","as":"--summary"},{"from_task":"inspect","output":"report","as":"--report"}]}
+        ],
+        "exports":{"report":{"from_task":"test","output":"report"}}
+    })
+}
+
+fn real_composed_package_definition(counter: &Path) -> Value {
+    let counter = counter.to_str().unwrap();
+    let package = r#"import json,os,sys
+with open(sys.argv[1],"a") as f: f.write("package\\n")
+paths=json.loads(os.environ["RELAY_OUTPUT_MANIFEST"])
+with open(paths["package"],"w") as f: f.write("package\\n")
+"#;
+    json!({
+        "schema_version": 1,
+        "name": "package",
+        "tasks": [{"id":"package","program":"/usr/bin/python3","arguments":["-c",package,counter],"outputs":[{"name":"package","type":"file","path":"package.txt"}]}]
+    })
+}
+
+fn real_composed_release_definition(counter: &Path) -> Value {
+    let counter = counter.to_str().unwrap();
+    let publish = r#"import json,os,sys
+assert sys.argv[2] == "--report" and os.path.isfile(sys.argv[3])
+with open(sys.argv[1],"a") as f: f.write("publish\\n")
+paths=json.loads(os.environ["RELAY_OUTPUT_MANIFEST"])
+with open(paths["final"],"w") as f: f.write("published\\n")
+"#;
+    json!({
+        "schema_version": 2,
+        "name": "release",
+        "inputs": {"profile": {"type":"string", "required":true}},
+        "tasks": [
+            {"id":"verify-instance","workflow":"verify","inputs":{"profile":{"workflow_input":"profile"}}},
+            {"id":"package-instance","workflow":"package","depends_on":["verify-instance"]},
+            {"id":"publish","depends_on":["verify-instance","package-instance"],"program":"/usr/bin/python3",
+             "arguments":["-c",publish,counter],"inputs":[{"from_task":"verify-instance","output":"report","as":"--report"}],
+             "outputs":[{"name":"final","type":"file","path":"final.txt"}]}
+        ]
+    })
+}
+
+fn real_composed_workflow_command(
+    supervisor: &Path,
+    directory: &Path,
+    temporary_root: &Path,
+    state: &Path,
+    resume: bool,
+) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_relay"));
+    command
+        .current_dir(directory)
+        .env("TMPDIR", temporary_root)
+        .args([
+            "--json",
+            "--scope",
+            "current",
+            "workflow",
+            "run",
+            "release",
+            "--jobs",
+            "2",
+            "--supervisor",
+        ])
+        .arg(supervisor);
+    if resume {
+        command.args(["--resume", state.to_str().unwrap()]);
+    } else {
+        command.args([
+            "--state-path",
+            state.to_str().unwrap(),
+            "--input",
+            "profile=release",
+        ]);
+    }
+    command
+}
+
+fn real_composed_workflow_run(
+    supervisor: &Path,
+    directory: &Path,
+    temporary_root: &Path,
+    state: &Path,
+) -> Output {
+    real_composed_workflow_command(supervisor, directory, temporary_root, state, false)
+        .output()
+        .expect("run real composed workflow")
+}
+
+fn real_composed_workflow_resume(
+    supervisor: &Path,
+    directory: &Path,
+    temporary_root: &Path,
+    state: &Path,
+) -> Output {
+    real_composed_workflow_command(supervisor, directory, temporary_root, state, true)
+        .output()
+        .expect("resume real composed workflow")
+}
+
+fn spawn_real_composed_workflow_crash(
+    supervisor: &Path,
+    directory: &Path,
+    temporary_root: &Path,
+    state: &Path,
+    marker: &Path,
+) -> Child {
+    let release = marker.with_extension("release");
+    real_composed_workflow_command(supervisor, directory, temporary_root, state, false)
+        .env("RELAY_TEST_RUN_PAUSE", "after_supervisor_result")
+        .env("RELAY_TEST_RUN_MARKER", marker)
+        .env("RELAY_TEST_RUN_RELEASE", release)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn real composed workflow")
+}
+
+#[test]
+fn real_go_composed_workflow_expands_retries_and_resumes_immutably() {
+    let Some(supervisor) = real_supervisor_path() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create composed workflow directory");
+    let temporary_root = directory.path().join("tmp");
+    fs::create_dir(&temporary_root).unwrap();
+    let workflows = directory.path().join("relay-workflows");
+    fs::create_dir(&workflows).unwrap();
+    let counter = directory.path().join("counter");
+    let retry_flag = directory.path().join("retry.flag");
+    let verify = real_composed_verify_definition(&counter, &retry_flag);
+    fs::write(
+        workflows.join("verify.json"),
+        serde_json::to_vec_pretty(&verify).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        workflows.join("package.json"),
+        serde_json::to_vec_pretty(&real_composed_package_definition(&counter)).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        workflows.join("release.json"),
+        serde_json::to_vec_pretty(&real_composed_release_definition(&counter)).unwrap(),
+    )
+    .unwrap();
+
+    let state = directory.path().join("release.state.json");
+    let output = workflow_document(&real_composed_workflow_run(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &state,
+    ));
+    assert_eq!(output["data"]["run"]["status"], "completed");
+    let persisted = read_state(&state);
+    assert_eq!(persisted["jobs"], 2);
+    assert_eq!(
+        record(&persisted, "verify-instance.format")["attempts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        record(&persisted, "verify-instance.inspect")["outputs"][0]["producer_task"],
+        "verify-instance.inspect"
+    );
+    assert_eq!(
+        record(&persisted, "publish")["outputs"][0]["producer_task"],
+        "publish"
+    );
+    let inspect = &record(&persisted, "verify-instance.inspect")["attempts"][0]["summary"];
+    let format = &record(&persisted, "verify-instance.format")["attempts"][0]["summary"];
+    assert!(
+        inspect["started_at"].as_str().unwrap() < format["completed_at"].as_str().unwrap()
+            && format["started_at"].as_str().unwrap() < inspect["completed_at"].as_str().unwrap()
+    );
+    let counter_text = fs::read_to_string(&counter).unwrap();
+    assert!(counter_text.contains("inspect"));
+    assert_eq!(counter_text.matches("format").count(), 1);
+    assert!(counter_text.contains("test"));
+    assert!(counter_text.contains("package"));
+    assert!(counter_text.contains("publish"));
+
+    let resume_counter = directory.path().join("resume-counter");
+    let resume_retry = directory.path().join("resume.retry.flag");
+    fs::write(
+        workflows.join("verify.json"),
+        serde_json::to_vec_pretty(&real_composed_verify_definition(
+            &resume_counter,
+            &resume_retry,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        workflows.join("package.json"),
+        serde_json::to_vec_pretty(&real_composed_package_definition(&resume_counter)).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        workflows.join("release.json"),
+        serde_json::to_vec_pretty(&real_composed_release_definition(&resume_counter)).unwrap(),
+    )
+    .unwrap();
+    let resume_state = directory.path().join("resume.state.json");
+    let marker = directory.path().join("resume.marker");
+    let mut child = spawn_real_composed_workflow_crash(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &resume_state,
+        &marker,
+    );
+    wait_for_path(&marker);
+    let interrupted = read_state(&resume_state);
+    let original_definition_hash = interrupted["workflow"]["definition_sha256"].clone();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+    fs::write(workflows.join("verify.json"), b"{\"schema_version\":2,").unwrap();
+    fs::remove_file(workflows.join("package.json")).unwrap();
+    let resumed = workflow_document(&real_composed_workflow_resume(
+        &supervisor,
+        directory.path(),
+        &temporary_root,
+        &resume_state,
+    ));
+    assert_eq!(resumed["data"]["run"]["status"], "completed");
+    assert_eq!(
+        resumed["data"]["run"]["workflow"]["definition_sha256"],
+        original_definition_hash
+    );
+    let final_state = read_state(&resume_state);
+    assert_eq!(
+        record(&final_state, "verify-instance.inspect")["attempts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        record(&final_state, "package-instance.package")["attempts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    for task in [
+        "verify-instance.inspect",
+        "verify-instance.test",
+        "package-instance.package",
+        "publish",
+    ] {
+        assert_eq!(record(&final_state, task)["status"], "succeeded");
+        for output in record(&final_state, task)["outputs"].as_array().unwrap() {
+            assert_eq!(output["producer_task"], task);
+            let latest = attempts(&final_state, task).last().unwrap();
+            assert_eq!(output["attempt_run_id"], latest["run_id"]);
+            assert_eq!(output["run_id"], final_state["run_id"]);
+        }
+    }
+}
 #[test]
 fn real_go_reusable_workflow_runs_repeats_and_resumes_original_plan() {
     let Some(supervisor) = real_supervisor_path() else {
