@@ -611,16 +611,18 @@ cargo test --all-targets --all-features                   PASS (68 tests)
 ## Current architecture note — reusable workflows
 
 The historical cycle log above predates the reusable-workflows milestone. Relay
-now also supports version-controlled JSON definitions in
-relay-workflows/, typed scalar inputs, explicit argv references, and
-workflow list/show/validate/run commands. Rust resolves each definition into
-the existing plan-v3 scheduler; no Lua or workflow runtime was added.
+now supports version-controlled JSON definitions in relay-workflows/, typed
+scalar inputs, explicit argv references, workflow list/show/validate/run, and
+schema-v2 compile-time composition. Rust loads the bounded source graph once,
+expands instance paths and explicit exports into the existing plan-v3 scheduler,
+and adds no Lua or workflow runtime.
 
 Aggregate run-state schema v5 optionally stores workflow name, workflow schema
-version, canonical definition SHA-256, resolved inputs, and the sanitized
-resolved plan. Workflow resume uses that persisted plan after live definition
-changes, deletion, or malformed contents. Existing direct plan runs and older
-aggregate state schemas remain supported through explicit migration.
+version, canonical source-graph SHA-256, resolved inputs, bounded composition
+instances, resolved-plan identity, and the sanitized expanded plan. Workflow
+resume uses that persisted plan after live root or child definition changes,
+deletion, or malformed contents. Existing direct plan runs, schema-v1 workflows,
+handoff snapshots, and older aggregate state schemas remain supported.
 ## Cycle 9 — agent-native handoffs
 
 This cycle extends Relay continuity with schema-versioned handoff snapshots. Relay remains a synchronous local Rust coordinator and does not become an agent runtime.

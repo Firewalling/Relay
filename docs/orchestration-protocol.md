@@ -341,69 +341,75 @@ boundary when those guarantees are required.
 ## Reusable workflow definitions
 
 Reusable workflows are a Rust-owned CLI layer above plan decoding. Definitions
-are version-controlled JSON files in `<project>/relay-workflows/`. Discovery is
+are version-controlled JSON files in <project>/relay-workflows/. Discovery is
 non-recursive, project-scoped, deterministic, capped at 64 files, and rejects
-symlinked directories or files. Workflow names use `[A-Za-z0-9][A-Za-z0-9._-]{0,47}`; definitions use `schema_version` 1 and closed
-objects. The definition name is the identity; JSON filenames only need a `.json`
-extension.
+symlinked directories or files. Workflow names use the existing bounded safe
+identifier rule. Schema v1 remains the simple closed workflow format; schema v2
+adds only static workflow-instance nodes and explicit top-level exports.
 
-The schema supports up to 16 scalar inputs (string, integer, boolean) with
-required/default fields and up to 64 tasks. Task configuration, retries,
-declared JSON/file outputs, and typed downstream output inputs reuse plan-v3
-semantics. Arguments are literal strings or explicit objects such as
-{"workflow_input":"profile"}. Input values become literal argv elements;
-there is no interpolation, shell evaluation, expression parser, environment
-lookup, command substitution, workflow import, or nested workflow call.
-Omitted task timeout defaults to 60,000 ms; remaining task defaults match
-plan-v3. Programs and explicit working directories remain absolute paths.
+Schema v2 does not introduce runtime workflow calls, a nested scheduler, or a
+language. A workflow instance names a project-local workflow, has a validated
+instance ID, optional dependencies, and a map of child inputs. A child input is
+either a scalar literal or an explicit parent workflow_input reference. Child
+defaults resolve during expansion. A child output is parent-visible only when
+the child definition names an export mapping from a task output.
 
 ~~~json
 {
-  "schema_version": 1,
-  "name": "verify",
-  "inputs": {"profile": {"type": "string", "default": "dev"}},
+  "schema_version": 2,
+  "name": "release",
+  "inputs": {"profile": {"type": "string", "required": true}},
   "tasks": [
-    {"id": "inspect", "program": "/usr/bin/cargo", "arguments": ["metadata"]},
-    {"id": "test", "depends_on": ["inspect"], "program": "/usr/bin/cargo",
-     "arguments": ["test", "--profile", {"workflow_input": "profile"}]}
+    {"id": "verify", "workflow": "verify",
+     "inputs": {"profile": {"workflow_input": "profile"}}},
+    {"id": "package", "depends_on": ["verify"], "program": "/usr/bin/package",
+     "inputs": [{"from_task": "verify", "output": "report", "as": "--report"}]}
   ]
 }
 ~~~
 
-Use stable commands to enumerate, inspect, validate, and execute:
+Resolution loads and validates the complete source graph once, detects direct
+and indirect cycles, then expands it into one ordinary plan-v3 DAG before any
+preflight or child launch. Child IDs use deterministic instance-path
+namespacing, for example verify.test and verify.unit.test. Incoming
+dependencies attach to child roots; outgoing dependencies attach to child
+terminals. Parent output inputs are rewritten to the exact expanded producer;
+there is no fake workflow task and no runtime lookup.
+
+The resolver is bounded by depth 8, 64 definitions, 64 instances, 16 direct
+instances per workflow, 512 dependencies, 256 outputs, 64 exports, the existing
+64-task and 1 MiB plan limits, and the existing 16 KiB workflow metadata limit.
+Names stay project-local; traversal, symlinked source, remote URLs, registries,
+cross-project references, and file swapping outside the one cached load are
+rejected or never consulted.
+
+Use these commands for source and resolved inspection:
 
 ~~~text
 relay workflow list
-relay workflow show verify
-relay workflow validate verify --input profile=release
-relay workflow run verify --input profile=release
-relay workflow run verify --resume /absolute/path/to/run.json
+relay workflow show release
+relay workflow show release --resolved
+relay workflow validate release --input profile=release
+relay workflow run release --jobs 2 --input profile=release
 ~~~
 
-Validation reads and resolves only; malformed definitions, duplicate JSON keys,
-unknown fields, invalid names, bad types/defaults/references, cycles, unsafe
-paths, and bounds fail before preflight or child launch. Workflow resolution
-produces the existing sanitized plan model, so the existing Rust scheduler,
-bounded parallelism, retry, cancellation, structured-output, artifact, and
-reconciliation rules remain authoritative. Workflow-level output aliases and
-composition are intentionally absent.
+Expansion produces a canonical source-graph SHA-256 containing the root and
+transitive child definition hashes, resolved root/child inputs, and instance
+paths. Aggregate workflow metadata additionally records each instance, resolved
+scalar inputs, schema version, and a resolved-plan hash.
+are persisted before execution. Resume reads only that persisted plan; editing,
+deleting, or corrupting live root/child definitions cannot change it. A valid
+changed definition may produce a notice for a new resume invocation.
 
-Fresh workflow aggregate state is schema v5 and includes optional metadata:
-workflow name, workflow schema version, canonical definition SHA-256, resolved
-scalar inputs, and the resolved sanitized plan. Resume reads that persisted plan
-without reparsing the live definition. A valid changed definition may produce a
-notice but never changes execution; deleted, malformed, or symlinked definitions
-do not prevent safe resume. Passing new --input values during resume is rejected;
-persisted inputs remain authoritative and are not a secret store.
-Workflow definitions execute user-selected local commands and are not a sandbox or trust boundary. The definition hash identifies normalized content; it is not protection against a malicious local user.
+The resulting run uses the existing Rust scheduler, bounded parallelism,
+retry/cancellation, structured output and artifact trust, one-child Go
+supervisor, and crash reconciliation. Direct relay run plans and schema-v1
+workflows remain unchanged. Protocol-v1 transport and the Go manifest do not
+change because composition is resolved entirely in Rust.
 
-Workflow files are capped at 1 MiB, names and input names at 48 bytes, input
-strings at 4 KiB, and persisted workflow metadata at 16 KiB. The workflow layer
-adds no Lua, scripting, conditionals, loops, matrices, functions, dynamic task
-generation, schedules, triggers, daemon, remote executor, network service,
-registry, secret manager, UI/TUI, cache, or model/provider integration.
-
-Resolved plan encoding remains capped at 1 MiB after input expansion and working-directory resolution.
+Workflow-level expressions, shell/environment interpolation, conditionals,
+loops, matrices, scripting, Lua, dynamic DAG mutation, remote execution,
+daemon mode, registries, and UI/TUI remain out of scope.
 
 ## Go one-child supervisor
 
@@ -915,7 +921,7 @@ Creation keeps existing relay handoff AGENT syntax and also supports relay hando
 
 Structured records use handoff schema version 2 and UUID identity. They append to .relay/handoffs.jsonl. Generated Markdown under .relay/handoffs/ is a deterministic view of that record, not a second editable source. Legacy Markdown-only files remain readable and are not migrated on read. `relay handoff --show ID`, `--latest`, and `--list` are read-only; `relay context --handoff latest` or `--handoff ID` returns the same structured record through output-schema-v1 framing.
 
-A handoff may reference an aggregate run with --run PATH. During creation, PATH must resolve to a canonical regular singly-linked state file under the selected project's .relay/runs/. Rust reads that live state with nofollow file access without taking the coordinator's exclusive lock, validates the aggregate and output trust rules, and stores only a snapshot. Workflow metadata includes name, schema, definition hash, and resolved scalar inputs. A running run can be referenced, but only successful terminal task outputs are attached. Later handoff and context reads use the persisted record only; they do not reopen the run, outputs, checkpoints, workflow definition, or Git state.
+A handoff may reference an aggregate run with --run PATH. During creation, PATH must resolve to a canonical regular singly-linked state file under the selected project's .relay/runs/. Rust reads that live state with nofollow file access without taking the coordinator's exclusive lock, validates the aggregate and output trust rules, and stores only a snapshot. The workflow snapshot retains root name, schema, source-graph definition hash, and resolved scalar inputs; composed instance metadata remains in aggregate state, while expanded task IDs and output producer_task fields retain instance-path provenance. A running run can be referenced, but only successful terminal task outputs are attached. Later handoff and context reads use the persisted record only; they do not reopen the run, outputs, checkpoints, workflow definitions, or Git state.
 
 Trusted output references retain aggregate run ID, task, output, attempt, attempt run ID, output type, project-relative path, size, SHA-256, and bounded JSON value. File artifacts are referenced, never embedded. Failed, cancelled, running, indeterminate, stale, superseded, mismatched, or tampered outputs cannot become trusted handoff outputs. Later run, workflow, Git, note, or artifact changes do not rewrite historical records.
 

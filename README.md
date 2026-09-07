@@ -158,61 +158,85 @@ expressions, or shell interpolation.
 ## Reusable workflows
 
 Store version-controlled workflow definitions as JSON files in
-relay-workflows/. Each file defines one named, closed DAG. Inputs are only
-scalar string, integer, or boolean values. Task arguments use literal strings
-or explicit typed references; Relay never evaluates shell syntax or performs
-environment expansion.
-Workflow task timeout defaults to 60,000 ms; remaining task defaults match
-plan-v3. Programs and explicit working directories remain absolute paths.
+relay-workflows/. Schema v1 is the unchanged simple workflow format. Schema v2
+adds static workflow-instance nodes and explicit top-level exports; it does not
+add a language, runtime nesting, or a second scheduler. Inputs remain scalar
+strings, integers, and booleans. Arguments and input mappings are structural
+values only: Relay never evaluates shell syntax, environment expansion, or
+expressions.
 
 ~~~json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "verify",
-  "inputs": {
-    "profile": {"type": "string", "default": "dev"}
-  },
+  "inputs": {"profile": {"type": "string", "required": true}},
   "tasks": [
-    {
-      "id": "inspect",
-      "program": "/usr/bin/cargo",
-      "arguments": ["metadata", "--format-version", "1"]
-    },
-    {
-      "id": "test",
-      "depends_on": ["inspect"],
-      "program": "/usr/bin/cargo",
-      "arguments": ["test", "--profile", {"workflow_input": "profile"}]
-    }
+    {"id": "inspect", "program": "/usr/bin/cargo"},
+    {"id": "test", "depends_on": ["inspect"], "program": "/usr/bin/cargo",
+     "outputs": [{"name": "report", "type": "file", "path": "report.txt"}]}
+  ],
+  "exports": {"report": {"from_task": "test", "output": "report"}}
+}
+~~~
+
+A parent composes that workflow with a node in its ordered tasks list:
+
+~~~json
+{
+  "schema_version": 2,
+  "name": "release",
+  "inputs": {"profile": {"type": "string", "required": true}},
+  "tasks": [
+    {"id": "verify", "workflow": "verify",
+     "inputs": {"profile": {"workflow_input": "profile"}}},
+    {"id": "package", "depends_on": ["verify"], "program": "/usr/bin/package",
+     "inputs": [{"from_task": "verify", "output": "report", "as": "--report"}]}
   ]
 }
 ~~~
 
-Inspect or validate before execution, then run repeatedly:
+Resolution loads the complete project-local source graph once, validates every
+definition and mapping, expands workflow instances before scheduling, and feeds
+one ordinary plan-v3 DAG to the existing coordinator. Child task IDs are
+namespaced by instance path (verify.test); roots receive incoming dependencies
+and downstream nodes depend on child terminals. The same child may be used more
+than once, producing distinct paths such as backend.test and frontend.test.
+
+Child input mappings accept only literal scalar values or a parent workflow_input
+reference. Child defaults resolve at expansion time and are persisted. A child
+output is visible to its parent only when named in exports; parent references
+are rewritten to the original expanded producer task, so OutputRecord remains
+the sole output and provenance authority.
+
+Inspect, validate, and run:
 
 ~~~sh
 relay workflow list
-relay workflow show verify
-relay workflow validate verify --input profile=release
-relay workflow run verify --input profile=release
-relay workflow run verify --resume /absolute/path/to/run.json
+relay workflow show release
+relay workflow show release --resolved
+relay workflow validate release --input profile=release
+relay workflow run release --jobs 2 --input profile=release
+relay workflow run release --resume /absolute/path/to/run.json
 ~~~
 
-Workflow resolution compiles into the existing plan-v3 model, so DAG
-scheduling, bounded parallelism, retries, cancellation, structured outputs,
-artifacts, and crash reconciliation remain unchanged. Fresh workflow runs
-persist definition SHA-256, resolved inputs, and sanitized resolved plan in
-aggregate state. Resume uses that persisted plan even if live definition is
-changed, deleted, or malformed; a valid changed definition is reported without
-changing execution. Persisted inputs are not a secret store.
-Workflow definitions execute local commands and are not a sandbox or trust boundary. The definition hash identifies normalized content; it is not protection against a malicious local user.
+Composition is bounded by depth 8, 64 source definitions, 64 total instances,
+16 direct instances per workflow, 512 expanded dependencies, 256 outputs, 64
+exports, the existing 64-task plan limit, the existing 1 MiB plan limit, and
+16 KiB workflow metadata. Child names are simple validated project-local names;
+remote references, traversal, symlinks, imports, and cross-project lookup are
+not supported. Cycles fail with a deterministic path such as A -> B -> A.
 
-Workflow limits are 1 MiB per file, 64 definitions per project, 48-byte names,
-16 inputs, 4 KiB per input string, 64 tasks, and 16 KiB persisted metadata.
-Resolved plan encoding remains capped at 1 MiB after input expansion and working-directory resolution.
-Workflow-level output aliases, imports, composition, expressions, conditionals,
-loops, scripting, remote execution, daemon mode, and model/provider integrations
-are not supported.
+Canonical source hashes include the root and transitive child definition hashes,
+resolved root/child inputs, and instance paths. Composed metadata also records
+resolved child inputs and a resolved-plan hash. Aggregate state persists this immutable identity and the
+sanitized expanded plan. Resume never re-expands live files, so editing,
+deleting, or corrupting root or child definitions cannot change an existing run.
+
+Existing v1 workflows, direct relay run plans, retries, cancellation, output and
+artifact validation, crash reconciliation, and handoff snapshots remain on the
+existing Rust/Go paths. Composition adds no Lua, scripting, expressions,
+conditionals, loops, matrices, dynamic DAG mutation, remote execution, or UI.
+
 
 Rust atomically owns aggregate record. Its default path is
 `<project>/.relay/runs/<run-uuid>.json`, where `<project>` is selected by

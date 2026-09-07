@@ -561,11 +561,34 @@ pub struct OutputRecord {
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct WorkflowCompositionMetadata {
+    pub root_workflow: String,
+    pub root_definition_sha256: String,
+    pub instances: Vec<WorkflowCompositionInstance>,
+    pub resolved_plan_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCompositionInstance {
+    pub instance: String,
+    pub workflow: String,
+    pub schema_version: u32,
+    pub definition_sha256: String,
+    pub resolved_inputs: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowRunMetadata {
     pub name: String,
     pub schema_version: u32,
     pub definition_sha256: String,
     pub inputs: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition: Option<WorkflowCompositionMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_plan_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1501,6 +1524,20 @@ pub fn run_workflow_resume(
         }),
     )
 }
+pub fn read_workflow_resume_metadata(
+    path: &Path,
+    project_root: &Path,
+) -> Result<WorkflowRunMetadata, RunError> {
+    validate_state_path(path, project_root)?;
+    let mut store = StateStore::open(path, true)?;
+    let state = store.read()?;
+    let metadata = state
+        .workflow
+        .ok_or_else(|| RunError::State("aggregate state is not a workflow run".into()))?;
+    validate_workflow_metadata(&metadata)?;
+    Ok(metadata)
+}
+
 pub fn read_handoff_run(path: &Path, project_root: &Path) -> Result<RunState, RunError> {
     validate_handoff_state_path(path, project_root)?;
     let (canonical_path, bytes) = read_handoff_state(path)?;
@@ -4017,7 +4054,7 @@ fn validate_workflow_metadata(workflow: &WorkflowRunMetadata) -> Result<(), RunE
             workflow.name
         )));
     }
-    if workflow.schema_version != 1 {
+    if !matches!(workflow.schema_version, 1 | 2) {
         return Err(RunError::State(format!(
             "unsupported persisted workflow schema_version {}",
             workflow.schema_version
@@ -4052,6 +4089,70 @@ fn validate_workflow_metadata(workflow: &WorkflowRunMetadata) -> Result<(), RunE
             }
         }
     }
+    if let Some(composition) = workflow.composition.as_ref() {
+        if workflow.schema_version != 2 {
+            return Err(RunError::State(
+                "composition metadata requires workflow schema_version 2".into(),
+            ));
+        }
+        if composition.root_workflow != workflow.name {
+            return Err(RunError::State(
+                "composition root does not match workflow name".into(),
+            ));
+        }
+        if !valid_workflow_name(&composition.root_workflow)
+            || !valid_sha256(&composition.root_definition_sha256)
+            || !valid_sha256(&composition.resolved_plan_sha256)
+        {
+            return Err(RunError::State(
+                "composition metadata identity is invalid".into(),
+            ));
+        }
+        if composition.instances.len() > 64 {
+            return Err(RunError::State(
+                "composition metadata exceeds instance bound".into(),
+            ));
+        }
+        let mut instance_paths = HashSet::new();
+        for instance in &composition.instances {
+            if !instance_paths.insert(instance.instance.as_str())
+                || !valid_task_id(&instance.instance)
+                || !valid_workflow_name(&instance.workflow)
+                || !matches!(instance.schema_version, 1 | 2)
+                || !valid_sha256(&instance.definition_sha256)
+                || instance.resolved_inputs.len() > MAX_WORKFLOW_INPUTS
+            {
+                return Err(RunError::State(
+                    "composition instance metadata is invalid".into(),
+                ));
+            }
+            for (name, value) in &instance.resolved_inputs {
+                if !valid_workflow_input_name(name) || !valid_workflow_scalar(value) {
+                    return Err(RunError::State(
+                        "composition input metadata is invalid".into(),
+                    ));
+                }
+            }
+        }
+        if workflow.resolved_plan_sha256.as_deref()
+            != Some(composition.resolved_plan_sha256.as_str())
+        {
+            return Err(RunError::State(
+                "resolved plan identity does not match composition metadata".into(),
+            ));
+        }
+    } else if workflow.schema_version == 2 {
+        return Err(RunError::State(
+            "schema_version 2 workflow metadata lacks composition".into(),
+        ));
+    }
+    if let Some(hash) = workflow.resolved_plan_sha256.as_deref()
+        && !valid_sha256(hash)
+    {
+        return Err(RunError::State(
+            "persisted resolved plan hash is invalid".into(),
+        ));
+    }
     if serde_json::to_vec(workflow)
         .map_err(|error| RunError::State(format!("workflow metadata cannot be encoded: {error}")))?
         .len()
@@ -4063,7 +4164,6 @@ fn validate_workflow_metadata(workflow: &WorkflowRunMetadata) -> Result<(), RunE
     }
     Ok(())
 }
-
 fn valid_workflow_name(value: &str) -> bool {
     let bytes = value.as_bytes();
     !bytes.is_empty()
@@ -4082,6 +4182,14 @@ fn valid_workflow_input_name(value: &str) -> bool {
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+fn valid_workflow_scalar(value: &Value) -> bool {
+    match value {
+        Value::String(value) => value.len() <= MAX_WORKFLOW_INPUT_STRING_BYTES,
+        Value::Bool(_) => true,
+        Value::Number(value) => value.as_i64().is_some(),
+        Value::Null | Value::Array(_) | Value::Object(_) => false,
+    }
 }
 
 fn validate_attempt_outputs(

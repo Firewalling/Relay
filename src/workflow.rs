@@ -10,7 +10,7 @@ use sha2::Digest;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read},
@@ -19,13 +19,21 @@ use std::{
 use thiserror::Error;
 
 pub const WORKFLOW_DIRECTORY: &str = "relay-workflows";
-const WORKFLOW_SCHEMA_VERSION: u32 = 1;
+const WORKFLOW_SCHEMA_VERSION_V1: u32 = 1;
+const WORKFLOW_SCHEMA_VERSION_V2: u32 = 2;
 const MAX_WORKFLOW_BYTES: u64 = 1 << 20;
 const MAX_WORKFLOWS: usize = 64;
 const MAX_WORKFLOW_NAME_BYTES: usize = 48;
 const MAX_WORKFLOW_INPUTS: usize = 16;
 const MAX_WORKFLOW_INPUT_NAME_BYTES: usize = 48;
 const MAX_WORKFLOW_INPUT_STRING_BYTES: usize = 4 * 1024;
+const MAX_COMPOSITION_DEPTH: usize = 8;
+const MAX_COMPOSITION_INSTANCES_PER_WORKFLOW: usize = 16;
+const MAX_COMPOSITION_INSTANCES: usize = 64;
+const MAX_COMPOSITION_DEFINITIONS: usize = 64;
+const MAX_COMPOSITION_DEPENDENCIES: usize = 512;
+const MAX_COMPOSITION_OUTPUTS: usize = 256;
+const MAX_COMPOSITION_EXPORTS: usize = 64;
 const DEFAULT_WORKFLOW_TIMEOUT_MS: i64 = 60_000;
 
 #[derive(Debug, Error)]
@@ -48,7 +56,47 @@ struct WorkflowDefinition {
     name: String,
     #[serde(default)]
     inputs: BTreeMap<String, InputDefinition>,
-    tasks: Vec<WorkflowTask>,
+    tasks: Vec<WorkflowNode>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    exports: BTreeMap<String, WorkflowExport>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        rename = "outputs"
+    )]
+    workflow_outputs: BTreeMap<String, WorkflowExport>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum WorkflowNode {
+    Task(WorkflowTask),
+    Workflow(WorkflowInstance),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowInstance {
+    id: String,
+    workflow: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    inputs: BTreeMap<String, WorkflowInputBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum WorkflowInputBinding {
+    Parent(WorkflowInputReference),
+    Literal(Value),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowExport {
+    from_task: String,
+    output: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -160,7 +208,7 @@ struct OutputInput {
     argument: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct LoadedWorkflow {
     definition: WorkflowDefinition,
     definition_sha256: String,
@@ -219,41 +267,46 @@ fn show(project_root: &Path, args: WorkflowNameArgs) -> Result<WorkflowResult, W
         }
     }
     human.push_str("\nTasks:");
-    for task in &definition.tasks {
-        human.push_str(&format!("\n  {}", task.id));
-        if !task.depends_on.is_empty() {
-            human.push_str(&format!(" <- {}", task.depends_on.join(", ")));
-        }
-        if !task.outputs.is_empty() {
-            human.push_str("\n    outputs:");
-            for output in &task.outputs {
-                human.push_str(&format!(
-                    "\n      {} ({})",
-                    output.name,
-                    output.output_type.as_str()
-                ));
+    for node in &definition.tasks {
+        match node {
+            WorkflowNode::Task(task) => {
+                human.push_str(&format!("\n  {}", task.id));
+                if !task.depends_on.is_empty() {
+                    human.push_str(&format!(" <- {}", task.depends_on.join(", ")));
+                }
             }
-        }
-        if !task.inputs.is_empty() {
-            human.push_str("\n    consumes:");
-            for input in &task.inputs {
+            WorkflowNode::Workflow(instance) => {
                 human.push_str(&format!(
-                    "\n      {}.{} -> {}",
-                    input.from_task, input.output, input.argument
+                    "\n  {} -> workflow {}",
+                    instance.id, instance.workflow
                 ));
+                if !instance.depends_on.is_empty() {
+                    human.push_str(&format!(" <- {}", instance.depends_on.join(", ")));
+                }
             }
         }
     }
-    let data = serde_json::to_value(definition).map_err(|error| {
+    let source = serde_json::to_value(definition).map_err(|error| {
         WorkflowError::Definition(format!("workflow cannot be encoded: {error}"))
     })?;
-    Ok(WorkflowResult::Inspection(RunOutput {
-        human,
-        data: json!({
-            "workflow": data,
-            "definition_sha256": workflow.definition_sha256.clone(),
-        }),
-    }))
+    let mut data = json!({
+        "workflow": source,
+        "definition_sha256": workflow.definition_sha256,
+    });
+    if args.resolved {
+        let workflows = load_all(project_root)?;
+        let inputs = placeholder_inputs(definition);
+        let resolved =
+            WorkflowResolver::new(&workflows).resolve(&definition.name, &inputs, project_root)?;
+        data["resolved"] = json!({
+            "plan": resolved.plan,
+            "definition_sha256": resolved.definition_sha256,
+            "resolved_plan_sha256": resolved.resolved_plan_sha256,
+            "composition": resolved.composition,
+        });
+        human.push_str("\nResolved plan: available");
+    }
+    Ok(WorkflowResult::Inspection(RunOutput { human, data }))
 }
 
 fn validate(
@@ -261,28 +314,45 @@ fn validate(
     invocation_directory: &Path,
     args: WorkflowValidateArgs,
 ) -> Result<WorkflowResult, WorkflowError> {
-    let workflow = find_workflow(project_root, &args.name)?;
+    let workflows = load_all(project_root)?;
+    let workflow = workflows
+        .iter()
+        .find(|workflow| workflow.definition.name == args.name)
+        .cloned()
+        .ok_or_else(|| WorkflowError::Definition(format!("workflow {:?} not found", args.name)))?;
     let inputs = resolve_inputs(&workflow.definition, &args.inputs)?;
-    let plan = compile_plan(&workflow.definition, &inputs, invocation_directory)?;
+    let resolved = WorkflowResolver::new(&workflows).resolve(
+        &workflow.definition.name,
+        &inputs,
+        invocation_directory,
+    )?;
     let metadata = WorkflowRunMetadata {
         name: workflow.definition.name.clone(),
         schema_version: workflow.definition.schema_version,
-        definition_sha256: workflow.definition_sha256.clone(),
+        definition_sha256: resolved.definition_sha256.clone(),
         inputs: inputs.clone(),
+        composition: resolved.composition.clone(),
+        resolved_plan_sha256: resolved
+            .composition
+            .as_ref()
+            .map(|_| resolved.resolved_plan_sha256.clone()),
     };
+    let task_count = resolved.plan["tasks"].as_array().map_or(0, Vec::len);
     let human = format!(
         "Workflow {} is valid\nTasks: {}\nDefinition: {}",
         workflow.definition.name,
-        workflow.definition.tasks.len(),
-        short_hash(&workflow.definition_sha256)
+        task_count,
+        short_hash(&resolved.definition_sha256)
     );
     Ok(WorkflowResult::Inspection(RunOutput {
         human,
         data: json!({
             "workflow": workflow.definition,
-            "definition_sha256": workflow.definition_sha256.clone(),
+            "definition_sha256": metadata.definition_sha256,
             "inputs": metadata.inputs,
-            "plan": plan,
+            "composition": metadata.composition,
+            "resolved_plan_sha256": metadata.resolved_plan_sha256,
+            "plan": resolved.plan,
         }),
     }))
 }
@@ -301,7 +371,13 @@ fn run_workflow(
                     .into(),
             ));
         }
-        let current_definition_sha256 = current_definition_hash(project_root, &args.name);
+        let persisted_inputs = args
+            .resume
+            .as_deref()
+            .and_then(|path| orchestrate::read_workflow_resume_metadata(path, project_root).ok())
+            .map(|metadata| metadata.inputs);
+        let current_definition_sha256 =
+            current_definition_hash(project_root, &args.name, persisted_inputs.as_ref());
         return Ok(WorkflowResult::Run(orchestrate::run_workflow_resume(
             run_args,
             invocation_directory,
@@ -311,20 +387,34 @@ fn run_workflow(
         )?));
     }
 
-    let workflow = find_workflow(project_root, &args.name)?;
+    let workflows = load_all(project_root)?;
+    let workflow = workflows
+        .iter()
+        .find(|workflow| workflow.definition.name == args.name)
+        .cloned()
+        .ok_or_else(|| WorkflowError::Definition(format!("workflow {:?} not found", args.name)))?;
     let inputs = resolve_inputs(&workflow.definition, &args.inputs)?;
-    let plan = compile_plan(&workflow.definition, &inputs, invocation_directory)?;
+    let resolved = WorkflowResolver::new(&workflows).resolve(
+        &workflow.definition.name,
+        &inputs,
+        invocation_directory,
+    )?;
     let metadata = WorkflowRunMetadata {
         name: workflow.definition.name,
         schema_version: workflow.definition.schema_version,
-        definition_sha256: workflow.definition_sha256,
+        definition_sha256: resolved.definition_sha256.clone(),
         inputs,
+        composition: resolved.composition.clone(),
+        resolved_plan_sha256: resolved
+            .composition
+            .as_ref()
+            .map(|_| resolved.resolved_plan_sha256.clone()),
     };
     Ok(WorkflowResult::Run(orchestrate::run_resolved(
         run_args,
         invocation_directory,
         project_root,
-        plan,
+        resolved.plan,
         metadata,
     )?))
 }
@@ -342,6 +432,752 @@ impl WorkflowRunArgs {
         }
     }
 }
+#[derive(Clone, Debug)]
+struct ExpandedTask {
+    task: WorkflowTask,
+    arguments: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedOutput {
+    producer_task: String,
+    output: String,
+}
+
+#[derive(Clone, Debug)]
+struct NodeGroup {
+    roots: Vec<String>,
+    terminals: Vec<String>,
+    task_ids: Vec<String>,
+    exports: BTreeMap<String, ResolvedOutput>,
+    composed: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CompositionHashInstance {
+    instance: String,
+    workflow: String,
+    definition_sha256: String,
+    resolved_inputs: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CompositionHashSource {
+    root_workflow: String,
+    root_definition_sha256: String,
+    root_inputs: BTreeMap<String, Value>,
+    instances: Vec<CompositionHashInstance>,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedWorkflow {
+    plan: Value,
+    definition_sha256: String,
+    composition: Option<orchestrate::WorkflowCompositionMetadata>,
+    resolved_plan_sha256: String,
+}
+
+struct WorkflowResolver<'a> {
+    workflows: &'a [LoadedWorkflow],
+}
+
+struct ExpansionContext<'a> {
+    workflows: &'a [LoadedWorkflow],
+    invocation_directory: &'a Path,
+    tasks: Vec<ExpandedTask>,
+    stack: Vec<String>,
+    definitions: HashSet<String>,
+    instances: Vec<orchestrate::WorkflowCompositionInstance>,
+    hash_instances: Vec<CompositionHashInstance>,
+    instances_by_workflow: HashMap<String, usize>,
+    total_instances: usize,
+    output_count: usize,
+    export_count: usize,
+}
+
+impl<'a> WorkflowResolver<'a> {
+    fn new(workflows: &'a [LoadedWorkflow]) -> Self {
+        Self { workflows }
+    }
+
+    fn resolve(
+        &self,
+        root_name: &str,
+        inputs: &BTreeMap<String, Value>,
+        invocation_directory: &Path,
+    ) -> Result<ResolvedWorkflow, WorkflowError> {
+        let root = self
+            .workflows
+            .iter()
+            .find(|workflow| workflow.definition.name == root_name)
+            .ok_or_else(|| {
+                WorkflowError::Definition(format!("workflow {:?} not found", root_name))
+            })?;
+        let root_definition_sha256 = root.definition_sha256.clone();
+        let root_schema_version = root.definition.schema_version;
+        let mut context = ExpansionContext {
+            workflows: self.workflows,
+            invocation_directory,
+            tasks: Vec::new(),
+            stack: Vec::new(),
+            definitions: HashSet::new(),
+            instances: Vec::new(),
+            hash_instances: Vec::new(),
+            instances_by_workflow: HashMap::new(),
+            total_instances: 0,
+            output_count: 0,
+            export_count: 0,
+        };
+        let _ = context.expand(root_name, inputs, None, 0)?;
+        let plan = context.plan_value()?;
+        let encoded_plan = serde_json::to_vec(&plan).map_err(|error| {
+            WorkflowError::Definition(format!("resolved workflow plan cannot be encoded: {error}"))
+        })?;
+        let resolved_plan_sha256 = orchestrate::hex_digest(sha2::Sha256::digest(&encoded_plan));
+        let composition =
+            if root_schema_version == WORKFLOW_SCHEMA_VERSION_V2 || !context.instances.is_empty() {
+                Some(orchestrate::WorkflowCompositionMetadata {
+                    root_workflow: root_name.to_owned(),
+                    root_definition_sha256: root_definition_sha256.clone(),
+                    instances: context.instances,
+                    resolved_plan_sha256: resolved_plan_sha256.clone(),
+                })
+            } else {
+                None
+            };
+        if let Some(metadata) = composition.as_ref() {
+            let bytes = serde_json::to_vec(metadata).map_err(|error| {
+                WorkflowError::Definition(format!(
+                    "composition metadata cannot be encoded: {error}"
+                ))
+            })?;
+            if bytes.len() > 16 * 1024 {
+                return Err(WorkflowError::Definition(
+                    "composition metadata exceeds 16384 bytes".into(),
+                ));
+            }
+        }
+        let definition_sha256 = if composition.is_some() {
+            let source = CompositionHashSource {
+                root_workflow: root_name.to_owned(),
+                root_definition_sha256,
+                root_inputs: inputs.clone(),
+                instances: context.hash_instances,
+            };
+            let canonical = serde_json::to_vec(&source).map_err(|error| {
+                WorkflowError::Definition(format!("composition cannot be canonicalized: {error}"))
+            })?;
+            orchestrate::hex_digest(sha2::Sha256::digest(&canonical))
+        } else {
+            root_definition_sha256
+        };
+        Ok(ResolvedWorkflow {
+            plan,
+            definition_sha256,
+            composition,
+            resolved_plan_sha256,
+        })
+    }
+}
+
+impl<'a> ExpansionContext<'a> {
+    fn workflow(&self, name: &str, scope: &str) -> Result<LoadedWorkflow, WorkflowError> {
+        self.workflows
+            .iter()
+            .find(|workflow| workflow.definition.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                WorkflowError::Definition(format!(
+                    "workflow {scope}: instance references missing workflow {name:?}"
+                ))
+            })
+    }
+
+    fn expand(
+        &mut self,
+        name: &str,
+        inputs: &BTreeMap<String, Value>,
+        prefix: Option<&str>,
+        depth: usize,
+    ) -> Result<NodeGroup, WorkflowError> {
+        if depth > MAX_COMPOSITION_DEPTH {
+            return Err(WorkflowError::Definition(format!(
+                "workflow composition exceeds maximum depth of {MAX_COMPOSITION_DEPTH}"
+            )));
+        }
+        if let Some(start) = self.stack.iter().position(|current| current == name) {
+            let mut cycle = self.stack[start..].to_vec();
+            cycle.push(name.to_owned());
+            return Err(WorkflowError::Definition(format!(
+                "workflow composition cycle: {}",
+                cycle.join(" -> ")
+            )));
+        }
+        self.definitions.insert(name.to_owned());
+        if self.definitions.len() > MAX_COMPOSITION_DEFINITIONS {
+            return Err(WorkflowError::Definition(format!(
+                "workflow composition references more than {MAX_COMPOSITION_DEFINITIONS} definitions"
+            )));
+        }
+        let scope = prefix.unwrap_or(name).to_owned();
+        let workflow = self.workflow(name, &scope)?;
+        self.stack.push(name.to_owned());
+        let result = self.expand_inner(&workflow, inputs, prefix, depth, &scope);
+        self.stack.pop();
+        result
+    }
+
+    fn expand_inner(
+        &mut self,
+        workflow: &LoadedWorkflow,
+        inputs: &BTreeMap<String, Value>,
+        prefix: Option<&str>,
+        depth: usize,
+        scope: &str,
+    ) -> Result<NodeGroup, WorkflowError> {
+        let mut groups = Vec::<(String, NodeGroup, Vec<String>)>::new();
+        let mut node_ids = HashSet::new();
+        for node in &workflow.definition.tasks {
+            match node {
+                WorkflowNode::Task(source) => {
+                    if prefix.is_some() && source.id.contains('.') {
+                        return Err(WorkflowError::Definition(format!(
+                            "workflow {scope}: task id {:?} cannot contain '.' inside a composition",
+                            source.id
+                        )));
+                    }
+                    validate_source_task_id(&source.id, &format!("workflow {scope}"))?;
+                    if !node_ids.insert(source.id.clone()) {
+                        return Err(WorkflowError::Definition(format!(
+                            "workflow {scope}: duplicate node id {:?}",
+                            source.id
+                        )));
+                    }
+                    let id = namespaced_id(prefix, &source.id, scope)?;
+                    let mut task = source.clone();
+                    task.id = id.clone();
+                    task.depends_on.clear();
+                    let arguments = resolve_arguments(source, inputs, scope)?;
+                    self.output_count += task.outputs.len();
+                    if self.output_count > MAX_COMPOSITION_OUTPUTS {
+                        return Err(WorkflowError::Definition(format!(
+                            "workflow composition exceeds {MAX_COMPOSITION_OUTPUTS} outputs"
+                        )));
+                    }
+                    if self.tasks.len() >= orchestrate::MAX_TASKS {
+                        return Err(WorkflowError::Definition(format!(
+                            "expanded workflow exceeds {} tasks",
+                            orchestrate::MAX_TASKS
+                        )));
+                    }
+                    self.tasks.push(ExpandedTask { task, arguments });
+                    groups.push((
+                        source.id.clone(),
+                        NodeGroup {
+                            roots: vec![id.clone()],
+                            terminals: vec![id.clone()],
+                            task_ids: vec![id],
+                            exports: BTreeMap::new(),
+                            composed: false,
+                        },
+                        source.depends_on.clone(),
+                    ));
+                }
+                WorkflowNode::Workflow(instance) => {
+                    if workflow.definition.schema_version != WORKFLOW_SCHEMA_VERSION_V2 {
+                        return Err(WorkflowError::Definition(format!(
+                            "workflow {scope}: composition requires schema_version {WORKFLOW_SCHEMA_VERSION_V2}"
+                        )));
+                    }
+                    validate_instance_id(&instance.id, &format!("workflow {scope}"))?;
+                    validate_workflow_name(&instance.workflow)?;
+                    if !node_ids.insert(instance.id.clone()) {
+                        return Err(WorkflowError::Definition(format!(
+                            "workflow {scope}: duplicate node id {:?}",
+                            instance.id
+                        )));
+                    }
+                    let child = self.workflow(&instance.workflow, scope)?;
+                    let child_inputs = resolve_child_inputs(
+                        inputs,
+                        instance,
+                        &child.definition,
+                        &format!("workflow {scope}.{}", instance.id),
+                    )?;
+                    let child_path = namespaced_id(prefix, &instance.id, scope)?;
+                    let count = self
+                        .instances_by_workflow
+                        .entry(workflow.definition.name.clone())
+                        .or_default();
+                    *count += 1;
+                    if *count > MAX_COMPOSITION_INSTANCES_PER_WORKFLOW {
+                        return Err(WorkflowError::Definition(format!(
+                            "workflow {scope} contains more than {MAX_COMPOSITION_INSTANCES_PER_WORKFLOW} instances"
+                        )));
+                    }
+                    self.total_instances += 1;
+                    if self.total_instances > MAX_COMPOSITION_INSTANCES {
+                        return Err(WorkflowError::Definition(format!(
+                            "workflow composition exceeds {MAX_COMPOSITION_INSTANCES} instances"
+                        )));
+                    }
+                    self.instances
+                        .push(orchestrate::WorkflowCompositionInstance {
+                            instance: child_path.clone(),
+                            workflow: child.definition.name.clone(),
+                            schema_version: child.definition.schema_version,
+                            definition_sha256: child.definition_sha256.clone(),
+                            resolved_inputs: child_inputs.clone(),
+                        });
+                    self.hash_instances.push(CompositionHashInstance {
+                        instance: child_path.clone(),
+                        workflow: child.definition.name.clone(),
+                        definition_sha256: child.definition_sha256.clone(),
+                        resolved_inputs: child_inputs.clone(),
+                    });
+                    let child_group = self.expand(
+                        &child.definition.name,
+                        &child_inputs,
+                        Some(&child_path),
+                        depth + 1,
+                    )?;
+                    groups.push((
+                        instance.id.clone(),
+                        NodeGroup {
+                            composed: true,
+                            ..child_group
+                        },
+                        instance.depends_on.clone(),
+                    ));
+                }
+            }
+        }
+
+        let group_map: HashMap<String, NodeGroup> = groups
+            .iter()
+            .map(|(id, group, _)| (id.clone(), group.clone()))
+            .collect();
+        for (node_id, group, dependencies) in &groups {
+            let mut seen = HashSet::new();
+            for dependency in dependencies {
+                if !seen.insert(dependency.as_str()) {
+                    return Err(WorkflowError::Definition(format!(
+                        "workflow {scope}: node {:?} repeats dependency {:?}",
+                        node_id, dependency
+                    )));
+                }
+                let dependency_group = group_map.get(dependency).ok_or_else(|| {
+                    WorkflowError::Definition(format!(
+                        "workflow {scope}: node {:?} has unknown dependency {:?}",
+                        node_id, dependency
+                    ))
+                })?;
+                for root in &group.roots {
+                    for terminal in &dependency_group.terminals {
+                        self.add_dependency(root, terminal, scope)?;
+                    }
+                }
+            }
+        }
+
+        for (_, group, _) in &groups {
+            if group.composed {
+                continue;
+            }
+            for task_id in &group.task_ids {
+                let index = self.task_index(task_id, scope)?;
+                let raw_inputs = self.tasks[index].task.inputs.clone();
+                let mut resolved_inputs = Vec::with_capacity(raw_inputs.len());
+                for input in raw_inputs {
+                    let source_group = group_map.get(&input.from_task).ok_or_else(|| {
+                        WorkflowError::Definition(format!(
+                            "workflow {scope}: task {:?} references unknown producer {:?}",
+                            task_id, input.from_task
+                        ))
+                    })?;
+                    let resolved = if source_group.composed {
+                        source_group.exports.get(&input.output).cloned().ok_or_else(|| {
+                            WorkflowError::Definition(format!(
+                                "workflow {scope}: task {:?} references unexported output {:?} from workflow instance {:?}",
+                                task_id, input.output, input.from_task
+                            ))
+                        })?
+                    } else {
+                        let producer = source_group.task_ids.first().ok_or_else(|| {
+                            WorkflowError::Definition(format!(
+                                "workflow {scope}: producer {:?} has no task",
+                                input.from_task
+                            ))
+                        })?;
+                        let producer_index = self.task_index(producer, scope)?;
+                        if !self.tasks[producer_index]
+                            .task
+                            .outputs
+                            .iter()
+                            .any(|output| output.name == input.output)
+                        {
+                            return Err(WorkflowError::Definition(format!(
+                                "workflow {scope}: task {:?} references unknown output {:?} from {:?}",
+                                task_id, input.output, input.from_task
+                            )));
+                        }
+                        ResolvedOutput {
+                            producer_task: producer.clone(),
+                            output: input.output.clone(),
+                        }
+                    };
+                    resolved_inputs.push(OutputInput {
+                        from_task: resolved.producer_task,
+                        output: resolved.output,
+                        argument: input.argument,
+                    });
+                }
+                self.tasks[index].task.inputs = resolved_inputs;
+            }
+        }
+
+        let mut exports = BTreeMap::new();
+        let declared_exports = effective_exports(&workflow.definition, scope)?;
+        for (name, export) in &declared_exports {
+            if !valid_output_name_local(name) {
+                return Err(WorkflowError::Definition(format!(
+                    "workflow {scope}: export name {:?} is invalid",
+                    name
+                )));
+            }
+            let source_group = group_map.get(&export.from_task).ok_or_else(|| {
+                WorkflowError::Definition(format!(
+                    "workflow {scope}: export {:?} references unknown node {:?}",
+                    name, export.from_task
+                ))
+            })?;
+            let resolved = if source_group.composed {
+                source_group.exports.get(&export.output).cloned().ok_or_else(|| {
+                    WorkflowError::Definition(format!(
+                        "workflow {scope}: export {:?} references unexported output {:?} from workflow instance {:?}",
+                        name, export.output, export.from_task
+                    ))
+                })?
+            } else {
+                let producer = source_group.task_ids.first().ok_or_else(|| {
+                    WorkflowError::Definition(format!(
+                        "workflow {scope}: export {:?} has no producer",
+                        name
+                    ))
+                })?;
+                let index = self.task_index(producer, scope)?;
+                if !self.tasks[index]
+                    .task
+                    .outputs
+                    .iter()
+                    .any(|output| output.name == export.output)
+                {
+                    return Err(WorkflowError::Definition(format!(
+                        "workflow {scope}: export {:?} references unknown output {:?}",
+                        name, export.output
+                    )));
+                }
+                ResolvedOutput {
+                    producer_task: producer.clone(),
+                    output: export.output.clone(),
+                }
+            };
+            self.export_count += 1;
+            if self.export_count > MAX_COMPOSITION_EXPORTS {
+                return Err(WorkflowError::Definition(format!(
+                    "workflow composition exceeds {MAX_COMPOSITION_EXPORTS} exports"
+                )));
+            }
+            exports.insert(name.clone(), resolved);
+        }
+        Ok(NodeGroup {
+            roots: root_nodes(&groups),
+            terminals: terminal_nodes(&groups),
+            task_ids: groups
+                .iter()
+                .flat_map(|(_, group, _)| group.task_ids.clone())
+                .collect(),
+            exports,
+            composed: false,
+        })
+    }
+
+    fn task_index(&self, id: &str, scope: &str) -> Result<usize, WorkflowError> {
+        self.tasks
+            .iter()
+            .position(|task| task.task.id == id)
+            .ok_or_else(|| {
+                WorkflowError::Definition(format!("workflow {scope}: task {:?} is missing", id))
+            })
+    }
+
+    fn add_dependency(
+        &mut self,
+        task_id: &str,
+        dependency: &str,
+        scope: &str,
+    ) -> Result<(), WorkflowError> {
+        if task_id == dependency {
+            return Err(WorkflowError::Definition(format!(
+                "workflow {scope}: task {:?} cannot depend on itself",
+                task_id
+            )));
+        }
+        let index = self.task_index(task_id, scope)?;
+        if !self.tasks[index]
+            .task
+            .depends_on
+            .iter()
+            .any(|current| current == dependency)
+        {
+            self.tasks[index]
+                .task
+                .depends_on
+                .push(dependency.to_owned());
+        }
+        Ok(())
+    }
+
+    fn plan_value(&self) -> Result<Value, WorkflowError> {
+        let dependency_count = self.tasks.iter().try_fold(0usize, |total, task| {
+            total
+                .checked_add(task.task.depends_on.len())
+                .ok_or_else(|| {
+                    WorkflowError::Definition("expanded dependency count overflow".into())
+                })
+        })?;
+        if dependency_count > MAX_COMPOSITION_DEPENDENCIES {
+            return Err(WorkflowError::Definition(format!(
+                "workflow composition exceeds {MAX_COMPOSITION_DEPENDENCIES} dependencies"
+            )));
+        }
+        let tasks = self
+            .tasks
+            .iter()
+            .map(task_to_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = json!({
+            "schema_version": orchestrate::PLAN_SCHEMA_VERSION,
+            "tasks": tasks,
+        });
+        let encoded = serde_json::to_vec(&plan).map_err(|error| {
+            WorkflowError::Definition(format!("resolved workflow plan cannot be encoded: {error}"))
+        })?;
+        if encoded.len() as u64 > orchestrate::MAX_PLAN_BYTES {
+            return Err(WorkflowError::Definition(format!(
+                "resolved workflow plan exceeds {} bytes",
+                orchestrate::MAX_PLAN_BYTES
+            )));
+        }
+        orchestrate::validate_plan_value(plan.clone(), self.invocation_directory)
+            .map_err(|error| WorkflowError::Definition(error.to_string()))?;
+        Ok(plan)
+    }
+}
+
+fn root_nodes(groups: &[(String, NodeGroup, Vec<String>)]) -> Vec<String> {
+    groups
+        .iter()
+        .filter(|(_, _, dependencies)| dependencies.is_empty())
+        .flat_map(|(_, group, _)| group.roots.clone())
+        .collect()
+}
+
+fn terminal_nodes(groups: &[(String, NodeGroup, Vec<String>)]) -> Vec<String> {
+    let depended_on: HashSet<&str> = groups
+        .iter()
+        .flat_map(|(_, _, dependencies)| dependencies.iter().map(String::as_str))
+        .collect();
+    groups
+        .iter()
+        .filter(|(id, _, _)| !depended_on.contains(id.as_str()))
+        .flat_map(|(_, group, _)| group.terminals.clone())
+        .collect()
+}
+
+fn task_to_value(expanded: &ExpandedTask) -> Result<Value, WorkflowError> {
+    let task = &expanded.task;
+    let mut value = Map::new();
+    value.insert("id".into(), json!(task.id));
+    value.insert("depends_on".into(), json!(task.depends_on));
+    value.insert("program".into(), json!(task.program));
+    value.insert("arguments".into(), json!(expanded.arguments));
+    value.insert("working_directory".into(), json!(task.working_directory));
+    value.insert("timeout_ms".into(), json!(task.timeout_ms));
+    value.insert(
+        "termination_grace_ms".into(),
+        json!(task.termination_grace_ms),
+    );
+    value.insert("stdout_limit_bytes".into(), json!(task.stdout_limit_bytes));
+    value.insert("stderr_limit_bytes".into(), json!(task.stderr_limit_bytes));
+    value.insert("log_limit_bytes".into(), json!(task.log_limit_bytes));
+    value.insert(
+        "redact_argument_indexes".into(),
+        json!(task.redact_argument_indexes),
+    );
+    value.insert(
+        "outputs".into(),
+        serde_json::to_value(&task.outputs).map_err(|error| {
+            WorkflowError::Definition(format!("workflow outputs cannot be encoded: {error}"))
+        })?,
+    );
+    value.insert(
+        "inputs".into(),
+        serde_json::to_value(&task.inputs).map_err(|error| {
+            WorkflowError::Definition(format!("workflow inputs cannot be encoded: {error}"))
+        })?,
+    );
+    if let Some(retry) = &task.retry {
+        value.insert(
+            "retry".into(),
+            serde_json::to_value(retry).map_err(|error| {
+                WorkflowError::Definition(format!("workflow retry cannot be encoded: {error}"))
+            })?,
+        );
+    }
+    Ok(Value::Object(value))
+}
+
+fn namespaced_id(prefix: Option<&str>, id: &str, scope: &str) -> Result<String, WorkflowError> {
+    let value = prefix.map_or_else(|| id.to_owned(), |prefix| format!("{prefix}.{id}"));
+    if !valid_plan_task_id(&value) {
+        return Err(WorkflowError::Definition(format!(
+            "workflow {scope}: namespaced task id {:?} exceeds the task-id bound",
+            value
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_source_task_id(id: &str, scope: &str) -> Result<(), WorkflowError> {
+    if !valid_plan_task_id(id) {
+        return Err(WorkflowError::Definition(format!(
+            "{scope}: task id {:?} must match [A-Za-z0-9][A-Za-z0-9._-]{{0,47}}",
+            id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_instance_id(id: &str, scope: &str) -> Result<(), WorkflowError> {
+    validate_source_task_id(id, scope)?;
+    if id.contains('.') {
+        return Err(WorkflowError::Definition(format!(
+            "{scope}: composition instance id {:?} cannot contain '.'",
+            id
+        )));
+    }
+    Ok(())
+}
+
+fn valid_plan_task_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 48
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_output_name_local(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+fn effective_exports(
+    definition: &WorkflowDefinition,
+    scope: &str,
+) -> Result<BTreeMap<String, WorkflowExport>, WorkflowError> {
+    if !definition.exports.is_empty() && !definition.workflow_outputs.is_empty() {
+        return Err(WorkflowError::Definition(format!(
+            "workflow {scope}: exports and top-level outputs cannot both be set"
+        )));
+    }
+    if definition.exports.is_empty() {
+        Ok(definition.workflow_outputs.clone())
+    } else {
+        Ok(definition.exports.clone())
+    }
+}
+
+fn resolve_arguments(
+    task: &WorkflowTask,
+    inputs: &BTreeMap<String, Value>,
+    scope: &str,
+) -> Result<Vec<String>, WorkflowError> {
+    task.arguments
+        .iter()
+        .map(|argument| match argument {
+            WorkflowArgument::Literal(value) => Ok(value.clone()),
+            WorkflowArgument::Input(reference) => inputs
+                .get(&reference.workflow_input)
+                .map(|value| {
+                    input_value_as_argument(value)
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .ok_or_else(|| {
+                    WorkflowError::Definition(format!(
+                        "workflow {scope}: input {:?} has no value",
+                        reference.workflow_input
+                    ))
+                }),
+        })
+        .collect()
+}
+
+fn resolve_child_inputs(
+    parent_inputs: &BTreeMap<String, Value>,
+    instance: &WorkflowInstance,
+    child: &WorkflowDefinition,
+    scope: &str,
+) -> Result<BTreeMap<String, Value>, WorkflowError> {
+    let mut resolved = BTreeMap::new();
+    for (name, binding) in &instance.inputs {
+        validate_input_name(name)?;
+        let definition = child.inputs.get(name).ok_or_else(|| {
+            WorkflowError::Definition(format!("workflow {scope}: unknown child input {:?}", name))
+        })?;
+        let value = match binding {
+            WorkflowInputBinding::Parent(reference) => {
+                validate_input_name(&reference.workflow_input)?;
+                parent_inputs
+                    .get(&reference.workflow_input)
+                    .cloned()
+                    .ok_or_else(|| {
+                        WorkflowError::Definition(format!(
+                            "workflow {scope}: parent input {:?} is unavailable",
+                            reference.workflow_input
+                        ))
+                    })?
+            }
+            WorkflowInputBinding::Literal(value) => value.clone(),
+        };
+        validate_input_value(name, definition.input_type, &value)?;
+        resolved.insert(name.clone(), value);
+    }
+    for (name, definition) in &child.inputs {
+        if resolved.contains_key(name) {
+            continue;
+        }
+        if let Some(default) = &definition.default {
+            resolved.insert(name.clone(), default.clone());
+        } else if definition.required {
+            return Err(WorkflowError::Definition(format!(
+                "workflow {scope}: missing required input {:?}",
+                name
+            )));
+        }
+    }
+    Ok(resolved)
+}
+
 fn load_all(project_root: &Path) -> Result<Vec<LoadedWorkflow>, WorkflowError> {
     let paths = discover_paths(project_root)?;
     let mut names = HashSet::with_capacity(paths.len());
@@ -374,12 +1210,22 @@ fn find_workflow(project_root: &Path, name: &str) -> Result<LoadedWorkflow, Work
         })
 }
 
-fn current_definition_hash(project_root: &Path, name: &str) -> Option<String> {
-    load_all(project_root)
-        .ok()?
-        .into_iter()
-        .find(|workflow| workflow.definition.name == name)
-        .map(|workflow| workflow.definition_sha256)
+fn current_definition_hash(
+    project_root: &Path,
+    name: &str,
+    persisted_inputs: Option<&BTreeMap<String, Value>>,
+) -> Option<String> {
+    let workflows = load_all(project_root).ok()?;
+    let workflow = workflows
+        .iter()
+        .find(|workflow| workflow.definition.name == name)?;
+    let inputs = persisted_inputs
+        .cloned()
+        .unwrap_or_else(|| placeholder_inputs(&workflow.definition));
+    WorkflowResolver::new(&workflows)
+        .resolve(name, &inputs, project_root)
+        .ok()
+        .map(|resolved| resolved.definition_sha256)
 }
 
 fn discover_paths(project_root: &Path) -> Result<Vec<PathBuf>, WorkflowError> {
@@ -438,7 +1284,7 @@ fn discover_paths(project_root: &Path) -> Result<Vec<PathBuf>, WorkflowError> {
     Ok(entries.into_iter().map(|(_, path)| path).collect())
 }
 
-fn load_definition(path: &Path, project_root: &Path) -> Result<LoadedWorkflow, WorkflowError> {
+fn load_definition(path: &Path, _project_root: &Path) -> Result<LoadedWorkflow, WorkflowError> {
     let metadata = fs::symlink_metadata(path).map_err(|error| workflow_io(path, error))?;
     if metadata.file_type().is_symlink() {
         return Err(WorkflowError::Definition(format!(
@@ -458,8 +1304,10 @@ fn load_definition(path: &Path, project_root: &Path) -> Result<LoadedWorkflow, W
         WorkflowError::Definition(format!("could not decode {}: {error}", path.display()))
     })?;
     validate_definition(&definition, path)?;
-    let placeholders = placeholder_inputs(&definition);
-    compile_plan(&definition, &placeholders, project_root)?;
+    if definition.schema_version == WORKFLOW_SCHEMA_VERSION_V1 {
+        let placeholders = placeholder_inputs(&definition);
+        compile_plan(&definition, &placeholders, _project_root)?;
+    }
     let canonical = serde_json::to_vec(&definition).map_err(|error| {
         WorkflowError::Definition(format!("workflow cannot be canonicalized: {error}"))
     })?;
@@ -471,7 +1319,10 @@ fn load_definition(path: &Path, project_root: &Path) -> Result<LoadedWorkflow, W
 }
 
 fn validate_definition(definition: &WorkflowDefinition, path: &Path) -> Result<(), WorkflowError> {
-    if definition.schema_version != WORKFLOW_SCHEMA_VERSION {
+    if !matches!(
+        definition.schema_version,
+        WORKFLOW_SCHEMA_VERSION_V1 | WORKFLOW_SCHEMA_VERSION_V2
+    ) {
         return Err(WorkflowError::Definition(format!(
             "unsupported workflow schema_version {} in {}",
             definition.schema_version,
@@ -502,17 +1353,74 @@ fn validate_definition(definition: &WorkflowDefinition, path: &Path) -> Result<(
             validate_input_value(name, input.input_type, default)?;
         }
     }
-    for task in &definition.tasks {
-        for argument in &task.arguments {
-            if let WorkflowArgument::Input(reference) = argument {
-                validate_input_name(&reference.workflow_input)?;
-                if !definition.inputs.contains_key(&reference.workflow_input) {
+    let mut node_ids = HashSet::new();
+    for node in &definition.tasks {
+        match node {
+            WorkflowNode::Task(task) => {
+                validate_source_task_id(&task.id, &format!("workflow {}", definition.name))?;
+                if !node_ids.insert(task.id.clone()) {
                     return Err(WorkflowError::Definition(format!(
-                        "task {:?} references unknown workflow input {:?}",
-                        task.id, reference.workflow_input
+                        "workflow {}: duplicate node id {:?}",
+                        definition.name, task.id
                     )));
                 }
+                for argument in &task.arguments {
+                    if let WorkflowArgument::Input(reference) = argument {
+                        validate_input_name(&reference.workflow_input)?;
+                        if !definition.inputs.contains_key(&reference.workflow_input) {
+                            return Err(WorkflowError::Definition(format!(
+                                "task {:?} references unknown workflow input {:?}",
+                                task.id, reference.workflow_input
+                            )));
+                        }
+                    }
+                }
             }
+            WorkflowNode::Workflow(instance) => {
+                if definition.schema_version != WORKFLOW_SCHEMA_VERSION_V2 {
+                    return Err(WorkflowError::Definition(format!(
+                        "workflow {}: composition requires schema_version {WORKFLOW_SCHEMA_VERSION_V2}",
+                        definition.name
+                    )));
+                }
+                validate_instance_id(&instance.id, &format!("workflow {}", definition.name))?;
+                validate_workflow_name(&instance.workflow)?;
+                if !node_ids.insert(instance.id.clone()) {
+                    return Err(WorkflowError::Definition(format!(
+                        "workflow {}: duplicate node id {:?}",
+                        definition.name, instance.id
+                    )));
+                }
+                for (name, binding) in &instance.inputs {
+                    validate_input_name(name)?;
+                    if let WorkflowInputBinding::Parent(reference) = binding {
+                        validate_input_name(&reference.workflow_input)?;
+                    }
+                }
+            }
+        }
+    }
+    let has_exports = !definition.exports.is_empty() || !definition.workflow_outputs.is_empty();
+    if definition.schema_version == WORKFLOW_SCHEMA_VERSION_V1 && has_exports {
+        return Err(WorkflowError::Definition(
+            "workflow exports require schema_version 2".into(),
+        ));
+    }
+    let declared_exports = effective_exports(definition, &definition.name)?;
+    if declared_exports.len() > MAX_COMPOSITION_EXPORTS {
+        return Err(WorkflowError::Definition(format!(
+            "workflow declares more than {MAX_COMPOSITION_EXPORTS} exports"
+        )));
+    }
+    for (name, export) in &declared_exports {
+        if !valid_output_name_local(name)
+            || export.from_task.is_empty()
+            || !valid_output_name_local(&export.output)
+        {
+            return Err(WorkflowError::Definition(format!(
+                "workflow {}: export {:?} is invalid",
+                definition.name, name
+            )));
         }
     }
     Ok(())
@@ -635,87 +1543,17 @@ fn compile_plan(
     inputs: &BTreeMap<String, Value>,
     invocation_directory: &Path,
 ) -> Result<Value, WorkflowError> {
-    let tasks = definition
-        .tasks
-        .iter()
-        .map(|task| {
-            let arguments = task
-                .arguments
-                .iter()
-                .map(|argument| match argument {
-                    WorkflowArgument::Literal(value) => Ok(Value::String(value.clone())),
-                    WorkflowArgument::Input(reference) => inputs
-                        .get(&reference.workflow_input)
-                        .map(input_value_as_argument)
-                        .ok_or_else(|| {
-                            WorkflowError::Definition(format!(
-                                "workflow input {:?} has no value",
-                                reference.workflow_input
-                            ))
-                        }),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut value = Map::new();
-            value.insert("id".into(), json!(task.id));
-            value.insert("depends_on".into(), json!(task.depends_on));
-            value.insert("program".into(), json!(task.program));
-            value.insert("arguments".into(), Value::Array(arguments));
-            value.insert("working_directory".into(), json!(task.working_directory));
-            value.insert("timeout_ms".into(), json!(task.timeout_ms));
-            value.insert(
-                "termination_grace_ms".into(),
-                json!(task.termination_grace_ms),
-            );
-            value.insert("stdout_limit_bytes".into(), json!(task.stdout_limit_bytes));
-            value.insert("stderr_limit_bytes".into(), json!(task.stderr_limit_bytes));
-            value.insert("log_limit_bytes".into(), json!(task.log_limit_bytes));
-            value.insert(
-                "redact_argument_indexes".into(),
-                json!(task.redact_argument_indexes),
-            );
-            value.insert(
-                "outputs".into(),
-                serde_json::to_value(&task.outputs).map_err(|error| {
-                    WorkflowError::Definition(format!(
-                        "workflow outputs cannot be encoded: {error}"
-                    ))
-                })?,
-            );
-            value.insert(
-                "inputs".into(),
-                serde_json::to_value(&task.inputs).map_err(|error| {
-                    WorkflowError::Definition(format!("workflow inputs cannot be encoded: {error}"))
-                })?,
-            );
-            if let Some(retry) = &task.retry {
-                value.insert(
-                    "retry".into(),
-                    serde_json::to_value(retry).map_err(|error| {
-                        WorkflowError::Definition(format!(
-                            "workflow retry cannot be encoded: {error}"
-                        ))
-                    })?,
-                );
-            }
-            Ok(Value::Object(value))
-        })
-        .collect::<Result<Vec<_>, WorkflowError>>()?;
-    let plan = json!({
-        "schema_version": orchestrate::PLAN_SCHEMA_VERSION,
-        "tasks": tasks,
-    });
-    let encoded = serde_json::to_vec(&plan).map_err(|error| {
-        WorkflowError::Definition(format!("resolved workflow plan cannot be encoded: {error}"))
+    let canonical = serde_json::to_vec(definition).map_err(|error| {
+        WorkflowError::Definition(format!("workflow cannot be canonicalized: {error}"))
     })?;
-    if encoded.len() as u64 > orchestrate::MAX_PLAN_BYTES {
-        return Err(WorkflowError::Definition(format!(
-            "resolved workflow plan exceeds {} bytes",
-            orchestrate::MAX_PLAN_BYTES
-        )));
-    }
-    orchestrate::validate_plan_value(plan.clone(), invocation_directory)
-        .map_err(|error| WorkflowError::Definition(error.to_string()))?;
-    Ok(plan)
+    let loaded = LoadedWorkflow {
+        definition: definition.clone(),
+        definition_sha256: orchestrate::hex_digest(sha2::Sha256::digest(&canonical)),
+    };
+    let workflows = [loaded];
+    WorkflowResolver::new(&workflows)
+        .resolve(&definition.name, inputs, invocation_directory)
+        .map(|resolved| resolved.plan)
 }
 
 fn input_value_as_argument(value: &Value) -> Value {
@@ -784,15 +1622,6 @@ fn input_default_description(input: &InputDefinition) -> String {
         (Some(default), _) => format!(" = {}", default),
         (None, true) => " (required)".to_owned(),
         (None, false) => String::new(),
-    }
-}
-
-impl OutputType {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Json => "json",
-            Self::File => "file",
-        }
     }
 }
 
@@ -1187,7 +2016,7 @@ mod tests {
         );
         assert!(unknown.is_err());
         let unsupported = definition(
-            r#"{"schema_version":2,"name":"bad","tasks":[{"id":"task","program":"/bin/true"}]}"#,
+            r#"{"schema_version":3,"name":"bad","tasks":[{"id":"task","program":"/bin/true"}]}"#,
         );
         assert!(validate_definition(&unsupported, Path::new("bad.json")).is_err());
     }
@@ -1270,5 +2099,651 @@ mod tests {
         let inputs = resolve_inputs(&workflow, &[format!("payload={input}")]).unwrap();
         let error = compile_plan(&workflow, &inputs, Path::new("/tmp")).unwrap_err();
         assert!(error.to_string().contains("resolved workflow plan exceeds"));
+    }
+    #[test]
+    fn composition_expands_namespaces_dependencies_and_exports() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let verify = json!({
+            "schema_version": 2,
+            "name": "verify",
+            "inputs": {"profile": {"type": "string", "required": true}},
+            "tasks": [
+                {"id": "inspect", "program": "/bin/true"},
+                {"id": "test", "depends_on": ["inspect"], "program": "/bin/true",
+                 "outputs": [{"name": "report", "type": "file", "path": "report.txt"}]}
+            ],
+            "exports": {"report": {"from_task": "test", "output": "report"}}
+        });
+        let release = json!({
+            "schema_version": 2,
+            "name": "release",
+            "inputs": {"profile": {"type": "string", "required": true}},
+            "tasks": [
+                {"id": "verify", "workflow": "verify", "inputs": {"profile": {"workflow_input": "profile"}}},
+                {"id": "package", "depends_on": ["verify"], "program": "/bin/true",
+                 "inputs": [{"from_task": "verify", "output": "report", "as": "--report"}]}
+            ]
+        });
+        write_workflow(
+            &workflows,
+            "verify.json",
+            &serde_json::to_string(&verify).unwrap(),
+        );
+        write_workflow(
+            &workflows,
+            "release.json",
+            &serde_json::to_string(&release).unwrap(),
+        );
+        let catalog = load_all(directory.path()).unwrap();
+        let root = catalog
+            .iter()
+            .find(|workflow| workflow.definition.name == "release")
+            .unwrap();
+        let inputs = resolve_inputs(&root.definition, &["profile=release".into()]).unwrap();
+        let resolved = WorkflowResolver::new(&catalog)
+            .resolve("release", &inputs, directory.path())
+            .unwrap();
+        let tasks = resolved.plan["tasks"].as_array().unwrap();
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["verify.inspect", "verify.test", "package"]
+        );
+        assert_eq!(tasks[1]["depends_on"], json!(["verify.inspect"]));
+        assert_eq!(tasks[2]["depends_on"], json!(["verify.test"]));
+        assert_eq!(tasks[2]["inputs"][0]["from_task"], "verify.test");
+        assert_eq!(tasks[2]["inputs"][0]["output"], "report");
+        let composition = resolved.composition.unwrap();
+        assert_eq!(composition.instances[0].instance, "verify");
+        assert_eq!(
+            composition.instances[0].resolved_inputs["profile"],
+            "release"
+        );
+        assert_eq!(
+            composition.resolved_plan_sha256,
+            resolved.resolved_plan_sha256
+        );
+    }
+
+    #[test]
+    fn composition_supports_nested_and_repeated_instances() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let unit = json!({
+            "schema_version": 2,
+            "name": "unit",
+            "tasks": [{"id": "test", "program": "/bin/true", "outputs": [{"name": "report", "type": "file", "path": "report.txt"}]}],
+            "outputs": {"report": {"from_task": "test", "output": "report"}},
+        });
+        let verify = json!({
+            "schema_version": 2,
+            "name": "verify",
+            "tasks": [{"id": "unit", "workflow": "unit"}],
+            "exports": {"report": {"from_task": "unit", "output": "report"}}
+        });
+        let release = json!({
+            "schema_version": 2,
+            "name": "release",
+            "tasks": [
+                {"id": "backend", "workflow": "verify"},
+                {"id": "frontend", "workflow": "verify"}
+            ]
+        });
+        for (name, value) in [("unit", unit), ("verify", verify), ("release", release)] {
+            write_workflow(
+                &workflows,
+                &format!("{name}.json"),
+                &serde_json::to_string(&value).unwrap(),
+            );
+        }
+        let catalog = load_all(directory.path()).unwrap();
+        let empty = BTreeMap::new();
+        let resolved = WorkflowResolver::new(&catalog)
+            .resolve("release", &empty, directory.path())
+            .unwrap();
+        let ids = resolved.plan["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["backend.unit.test", "frontend.unit.test"]);
+        assert_eq!(
+            resolved
+                .composition
+                .unwrap()
+                .instances
+                .iter()
+                .map(|instance| instance.instance.as_str())
+                .collect::<Vec<_>>(),
+            ["backend", "backend.unit", "frontend", "frontend.unit"]
+        );
+    }
+
+    #[test]
+    fn composition_cycles_and_missing_exports_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let a = json!({"schema_version": 2, "name": "a", "tasks": [{"id": "b", "workflow": "b"}]});
+        let b = json!({"schema_version": 2, "name": "b", "tasks": [{"id": "a", "workflow": "a"}]});
+        write_workflow(&workflows, "a.json", &serde_json::to_string(&a).unwrap());
+        write_workflow(&workflows, "b.json", &serde_json::to_string(&b).unwrap());
+        let catalog = load_all(directory.path()).unwrap();
+        let error = WorkflowResolver::new(&catalog)
+            .resolve("a", &BTreeMap::new(), directory.path())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("workflow composition cycle: a -> b -> a")
+        );
+
+        let bad = json!({
+            "schema_version": 2,
+            "name": "bad",
+            "tasks": [{"id": "child", "workflow": "missing"}]
+        });
+        write_workflow(
+            &workflows,
+            "bad.json",
+            &serde_json::to_string(&bad).unwrap(),
+        );
+        let catalog = load_all(directory.path()).unwrap();
+        let error = WorkflowResolver::new(&catalog)
+            .resolve("bad", &BTreeMap::new(), directory.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("missing workflow"));
+    }
+
+    #[test]
+    fn composition_hash_changes_when_child_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let child = json!({"schema_version": 2, "name": "child", "tasks": [{"id": "task", "program": "/bin/true"}]});
+        let root = json!({"schema_version": 2, "name": "root", "tasks": [{"id": "child", "workflow": "child"}]});
+        write_workflow(
+            &workflows,
+            "child.json",
+            &serde_json::to_string(&child).unwrap(),
+        );
+        write_workflow(
+            &workflows,
+            "root.json",
+            &serde_json::to_string(&root).unwrap(),
+        );
+        let first_catalog = load_all(directory.path()).unwrap();
+        let first = WorkflowResolver::new(&first_catalog)
+            .resolve("root", &BTreeMap::new(), directory.path())
+            .unwrap();
+        let changed = json!({"schema_version": 2, "name": "child", "tasks": [{"id": "task", "program": "/bin/false"}]});
+        write_workflow(
+            &workflows,
+            "child.json",
+            &serde_json::to_string(&changed).unwrap(),
+        );
+        let second_catalog = load_all(directory.path()).unwrap();
+        let second = WorkflowResolver::new(&second_catalog)
+            .resolve("root", &BTreeMap::new(), directory.path())
+            .unwrap();
+        assert_ne!(first.definition_sha256, second.definition_sha256);
+        assert_ne!(first.resolved_plan_sha256, second.resolved_plan_sha256);
+    }
+
+    #[test]
+    fn composition_rejects_ambiguous_nested_task_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let child = json!({"schema_version": 2, "name": "child", "tasks": [{"id": "part.one", "program": "/bin/true"}]});
+        let root = json!({"schema_version": 2, "name": "root", "tasks": [{"id": "child", "workflow": "child"}]});
+        write_workflow(
+            &workflows,
+            "child.json",
+            &serde_json::to_string(&child).unwrap(),
+        );
+        write_workflow(
+            &workflows,
+            "root.json",
+            &serde_json::to_string(&root).unwrap(),
+        );
+        let catalog = load_all(directory.path()).unwrap();
+        let error = WorkflowResolver::new(&catalog)
+            .resolve("root", &BTreeMap::new(), directory.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot contain '.'"));
+    }
+    #[test]
+    fn composition_depth_bound_accepts_limit_and_rejects_above() {
+        let write_chain = |directory: &Path, depth: usize| {
+            let workflows = directory.join(WORKFLOW_DIRECTORY);
+            fs::create_dir(&workflows).unwrap();
+            for index in 0..=depth {
+                let name = format!("w{index}");
+                let value = if index == depth {
+                    json!({"schema_version": 2, "name": name, "tasks": [{"id": "task", "program": "/bin/true"}]})
+                } else {
+                    json!({"schema_version": 2, "name": name, "tasks": [{"id": "next", "workflow": format!("w{}", index + 1)}]})
+                };
+                write_workflow(
+                    &workflows,
+                    &format!("{name}.json"),
+                    &serde_json::to_string(&value).unwrap(),
+                );
+            }
+        };
+        let at_limit = tempfile::tempdir().unwrap();
+        write_chain(at_limit.path(), MAX_COMPOSITION_DEPTH);
+        let catalog = load_all(at_limit.path()).unwrap();
+        assert!(
+            WorkflowResolver::new(&catalog)
+                .resolve("w0", &BTreeMap::new(), at_limit.path())
+                .is_ok()
+        );
+        let above_limit = tempfile::tempdir().unwrap();
+        write_chain(above_limit.path(), MAX_COMPOSITION_DEPTH + 1);
+        let catalog = load_all(above_limit.path()).unwrap();
+        let error = WorkflowResolver::new(&catalog)
+            .resolve("w0", &BTreeMap::new(), above_limit.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("maximum depth"));
+    }
+    #[test]
+    fn resolved_inputs_change_composition_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let child = json!({
+            "schema_version": 2,
+            "name": "child",
+            "inputs": {"profile": {"type":"string", "required":true}},
+            "tasks": [{"id":"task","program":"/bin/true","arguments":[{"workflow_input":"profile"}]}]
+        });
+        let root = json!({
+            "schema_version": 2,
+            "name": "root",
+            "inputs": {"profile": {"type":"string", "required":true}},
+            "tasks": [{"id":"child","workflow":"child","inputs":{"profile":{"workflow_input":"profile"}}}]
+        });
+        write_workflow(
+            &workflows,
+            "child.json",
+            &serde_json::to_string(&child).unwrap(),
+        );
+        write_workflow(
+            &workflows,
+            "root.json",
+            &serde_json::to_string(&root).unwrap(),
+        );
+        let catalog = load_all(directory.path()).unwrap();
+        let first_inputs =
+            BTreeMap::from([(String::from("profile"), Value::String(String::from("dev")))]);
+        let second_inputs = BTreeMap::from([(
+            String::from("profile"),
+            Value::String(String::from("release")),
+        )]);
+        let first = WorkflowResolver::new(&catalog)
+            .resolve("root", &first_inputs, directory.path())
+            .unwrap();
+        let second = WorkflowResolver::new(&catalog)
+            .resolve("root", &second_inputs, directory.path())
+            .unwrap();
+        assert_ne!(first.definition_sha256, second.definition_sha256);
+        assert_ne!(first.resolved_plan_sha256, second.resolved_plan_sha256);
+    }
+    fn resolved_plan(directory: &Path, name: &str) -> Value {
+        let catalog = load_all(directory).unwrap();
+        WorkflowResolver::new(&catalog)
+            .resolve(name, &BTreeMap::new(), directory)
+            .unwrap()
+            .plan
+    }
+
+    fn dependencies(plan: &Value, id: &str) -> Vec<String> {
+        let task = plan["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("missing task {id:?}"));
+        task["depends_on"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|dependency| dependency.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn boundary_group(id: &str, dependencies: &[&str]) -> (String, NodeGroup, Vec<String>) {
+        let id = id.to_owned();
+        (
+            id.clone(),
+            NodeGroup {
+                roots: vec![id.clone()],
+                terminals: vec![id.clone()],
+                task_ids: vec![id.clone()],
+                exports: BTreeMap::new(),
+                composed: false,
+            },
+            dependencies
+                .iter()
+                .map(|dependency| (*dependency).to_owned())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn root_and_terminal_helpers_have_distinct_graph_meanings() {
+        let linear = vec![
+            boundary_group("a", &[]),
+            boundary_group("b", &["a"]),
+            boundary_group("c", &["b"]),
+        ];
+        assert_eq!(root_nodes(&linear), vec!["a"]);
+        assert_eq!(terminal_nodes(&linear), vec!["c"]);
+
+        let fork = vec![
+            boundary_group("a", &[]),
+            boundary_group("b", &["a"]),
+            boundary_group("c", &["a"]),
+        ];
+        assert_eq!(root_nodes(&fork), vec!["a"]);
+        assert_eq!(terminal_nodes(&fork), vec!["b", "c"]);
+
+        let join = vec![
+            boundary_group("a", &[]),
+            boundary_group("b", &[]),
+            boundary_group("c", &["a", "b"]),
+        ];
+        assert_eq!(root_nodes(&join), vec!["a", "b"]);
+        assert_eq!(terminal_nodes(&join), vec!["c"]);
+
+        let disconnected = vec![
+            boundary_group("a", &[]),
+            boundary_group("b", &["a"]),
+            boundary_group("c", &[]),
+        ];
+        assert_eq!(root_nodes(&disconnected), vec!["a", "c"]);
+        assert_eq!(terminal_nodes(&disconnected), vec!["b", "c"]);
+    }
+
+    #[test]
+    fn composition_wires_parent_to_all_child_roots_and_terminals() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let verify = json!({
+            "schema_version": 1,
+            "name": "verify",
+            "tasks": [
+                {"id": "lint", "program": "/bin/true"},
+                {"id": "inspect", "program": "/bin/true"},
+                {"id": "test", "depends_on": ["lint", "inspect"], "program": "/bin/true"}
+            ]
+        });
+        let fanout = json!({
+            "schema_version": 1,
+            "name": "fanout",
+            "tasks": [
+                {"id": "inspect", "program": "/bin/true"},
+                {"id": "test", "depends_on": ["inspect"], "program": "/bin/true"},
+                {"id": "lint", "depends_on": ["inspect"], "program": "/bin/true"}
+            ]
+        });
+        let root = json!({
+            "schema_version": 2,
+            "name": "root",
+            "tasks": [
+                {"id": "prepare", "program": "/bin/true"},
+                {"id": "verify-instance", "workflow": "verify", "depends_on": ["prepare"]},
+                {"id": "fanout-instance", "workflow": "fanout", "depends_on": ["prepare"]},
+                {"id": "package", "depends_on": ["fanout-instance"], "program": "/bin/true"}
+            ]
+        });
+        for (name, value) in [("verify", verify), ("fanout", fanout), ("root", root)] {
+            write_workflow(
+                &workflows,
+                &format!("{name}.json"),
+                &serde_json::to_string(&value).unwrap(),
+            );
+        }
+
+        let plan = resolved_plan(directory.path(), "root");
+        assert_eq!(dependencies(&plan, "verify-instance.lint"), vec!["prepare"]);
+        assert_eq!(
+            dependencies(&plan, "verify-instance.inspect"),
+            vec!["prepare"]
+        );
+        assert_eq!(
+            dependencies(&plan, "verify-instance.test"),
+            vec!["verify-instance.lint", "verify-instance.inspect"]
+        );
+        assert_eq!(
+            dependencies(&plan, "fanout-instance.inspect"),
+            vec!["prepare"]
+        );
+        assert_eq!(
+            dependencies(&plan, "fanout-instance.test"),
+            vec!["fanout-instance.inspect"]
+        );
+        assert_eq!(
+            dependencies(&plan, "fanout-instance.lint"),
+            vec!["fanout-instance.inspect"]
+        );
+        assert_eq!(
+            dependencies(&plan, "package"),
+            vec!["fanout-instance.test", "fanout-instance.lint"]
+        );
+        assert!(!dependencies(&plan, "package").contains(&"fanout-instance.inspect".into()));
+    }
+
+    #[test]
+    fn composition_preserves_nested_sibling_and_repeated_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let inner = json!({
+            "schema_version": 1,
+            "name": "inner",
+            "tasks": [
+                {"id": "inspect", "program": "/bin/true"},
+                {"id": "test", "depends_on": ["inspect"], "program": "/bin/true"}
+            ]
+        });
+        let outer = json!({
+            "schema_version": 2,
+            "name": "outer",
+            "tasks": [{"id": "inner-instance", "workflow": "inner"}]
+        });
+        let root = json!({
+            "schema_version": 2,
+            "name": "root",
+            "tasks": [
+                {"id": "prepare", "program": "/bin/true"},
+                {"id": "backend", "workflow": "outer", "depends_on": ["prepare"]},
+                {"id": "frontend", "workflow": "outer", "depends_on": ["prepare"]}
+            ]
+        });
+        for (name, value) in [("inner", inner), ("outer", outer), ("root", root)] {
+            write_workflow(
+                &workflows,
+                &format!("{name}.json"),
+                &serde_json::to_string(&value).unwrap(),
+            );
+        }
+
+        let plan = resolved_plan(directory.path(), "root");
+        assert_eq!(
+            dependencies(&plan, "backend.inner-instance.inspect"),
+            vec!["prepare"]
+        );
+        assert_eq!(
+            dependencies(&plan, "backend.inner-instance.test"),
+            vec!["backend.inner-instance.inspect"]
+        );
+        assert_eq!(
+            dependencies(&plan, "frontend.inner-instance.inspect"),
+            vec!["prepare"]
+        );
+        assert_eq!(
+            dependencies(&plan, "frontend.inner-instance.test"),
+            vec!["frontend.inner-instance.inspect"]
+        );
+        assert!(
+            !dependencies(&plan, "backend.inner-instance.test")
+                .iter()
+                .any(|dependency| dependency.starts_with("frontend."))
+        );
+    }
+
+    #[test]
+    fn downstream_composed_workflow_waits_for_upstream_terminals() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let verify = json!({
+            "schema_version": 1,
+            "name": "verify",
+            "tasks": [
+                {"id": "inspect", "program": "/bin/true"},
+                {"id": "test", "depends_on": ["inspect"], "program": "/bin/true"}
+            ]
+        });
+        let package = json!({
+            "schema_version": 1,
+            "name": "package",
+            "tasks": [
+                {"id": "prepare", "program": "/bin/true"},
+                {"id": "bundle", "depends_on": ["prepare"], "program": "/bin/true"}
+            ]
+        });
+        let release = json!({
+            "schema_version": 2,
+            "name": "release",
+            "tasks": [
+                {"id": "verify-instance", "workflow": "verify"},
+                {"id": "package-instance", "workflow": "package", "depends_on": ["verify-instance"]}
+            ]
+        });
+        for (name, value) in [
+            ("verify", verify),
+            ("package", package),
+            ("release", release),
+        ] {
+            write_workflow(
+                &workflows,
+                &format!("{name}.json"),
+                &serde_json::to_string(&value).unwrap(),
+            );
+        }
+
+        let plan = resolved_plan(directory.path(), "release");
+        assert_eq!(
+            dependencies(&plan, "verify-instance.test"),
+            vec!["verify-instance.inspect"]
+        );
+        assert_eq!(
+            dependencies(&plan, "package-instance.prepare"),
+            vec!["verify-instance.test"]
+        );
+        assert_eq!(
+            dependencies(&plan, "package-instance.bundle"),
+            vec!["package-instance.prepare"]
+        );
+    }
+
+    #[test]
+    fn exported_nonterminal_output_keeps_exact_producer_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let verify = json!({
+            "schema_version": 2,
+            "name": "verify",
+            "tasks": [
+                {"id": "build", "program": "/bin/true", "outputs": [{"name": "report", "type": "file", "path": "report.txt"}]},
+                {"id": "test", "depends_on": ["build"], "program": "/bin/true"}
+            ],
+            "exports": {"report": {"from_task": "build", "output": "report"}}
+        });
+        let root = json!({
+            "schema_version": 2,
+            "name": "root",
+            "tasks": [
+                {"id": "verify-instance", "workflow": "verify"},
+                {"id": "publish", "depends_on": ["verify-instance"], "program": "/bin/true",
+                 "inputs": [{"from_task": "verify-instance", "output": "report", "as": "--report"}]}
+            ]
+        });
+        write_workflow(
+            &workflows,
+            "verify.json",
+            &serde_json::to_string(&verify).unwrap(),
+        );
+        write_workflow(
+            &workflows,
+            "root.json",
+            &serde_json::to_string(&root).unwrap(),
+        );
+
+        let plan = resolved_plan(directory.path(), "root");
+        assert_eq!(dependencies(&plan, "publish"), vec!["verify-instance.test"]);
+        assert_eq!(
+            plan["tasks"][2]["inputs"][0]["from_task"],
+            "verify-instance.build"
+        );
+        assert_eq!(plan["tasks"][2]["inputs"][0]["output"], "report");
+    }
+
+    #[test]
+    fn empty_workflows_are_rejected_before_composition() {
+        let empty = definition(r#"{"schema_version": 1, "name": "empty", "tasks": []}"#);
+        let error = validate_definition(&empty, Path::new("empty.json")).unwrap_err();
+        assert!(error.to_string().contains("between 1 and"));
+    }
+
+    #[test]
+    fn expanded_boundary_dependencies_remain_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let parent_ids = (0..32)
+            .map(|index| format!("parent{index}"))
+            .collect::<Vec<_>>();
+        let child_tasks = (0..32)
+            .map(|index| json!({"id": format!("child{index}"), "program": "/bin/true"}))
+            .collect::<Vec<_>>();
+        let mut root_tasks = parent_ids
+            .iter()
+            .map(|id| json!({"id": id, "program": "/bin/true"}))
+            .collect::<Vec<_>>();
+        root_tasks.push(json!({
+            "id": "child-instance",
+            "workflow": "child",
+            "depends_on": parent_ids
+        }));
+        let child = json!({"schema_version": 1, "name": "child", "tasks": child_tasks});
+        let root = json!({"schema_version": 2, "name": "root", "tasks": root_tasks});
+        write_workflow(
+            &workflows,
+            "child.json",
+            &serde_json::to_string(&child).unwrap(),
+        );
+        write_workflow(
+            &workflows,
+            "root.json",
+            &serde_json::to_string(&root).unwrap(),
+        );
+        let catalog = load_all(directory.path()).unwrap();
+        let error = WorkflowResolver::new(&catalog)
+            .resolve("root", &BTreeMap::new(), directory.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds 512 dependencies"));
     }
 }
