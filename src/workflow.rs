@@ -976,13 +976,9 @@ impl<'a> ExpansionContext<'a> {
 }
 
 fn root_nodes(groups: &[(String, NodeGroup, Vec<String>)]) -> Vec<String> {
-    let depended_on: HashSet<&str> = groups
-        .iter()
-        .flat_map(|(_, _, dependencies)| dependencies.iter().map(String::as_str))
-        .collect();
     groups
         .iter()
-        .filter(|(id, _, _)| !depended_on.contains(id.as_str()))
+        .filter(|(_, _, dependencies)| dependencies.is_empty())
         .flat_map(|(_, group, _)| group.roots.clone())
         .collect()
 }
@@ -2400,5 +2396,354 @@ mod tests {
             .unwrap();
         assert_ne!(first.definition_sha256, second.definition_sha256);
         assert_ne!(first.resolved_plan_sha256, second.resolved_plan_sha256);
+    }
+    fn resolved_plan(directory: &Path, name: &str) -> Value {
+        let catalog = load_all(directory).unwrap();
+        WorkflowResolver::new(&catalog)
+            .resolve(name, &BTreeMap::new(), directory)
+            .unwrap()
+            .plan
+    }
+
+    fn dependencies(plan: &Value, id: &str) -> Vec<String> {
+        let task = plan["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("missing task {id:?}"));
+        task["depends_on"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|dependency| dependency.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn boundary_group(id: &str, dependencies: &[&str]) -> (String, NodeGroup, Vec<String>) {
+        let id = id.to_owned();
+        (
+            id.clone(),
+            NodeGroup {
+                roots: vec![id.clone()],
+                terminals: vec![id.clone()],
+                task_ids: vec![id.clone()],
+                exports: BTreeMap::new(),
+                composed: false,
+            },
+            dependencies
+                .iter()
+                .map(|dependency| (*dependency).to_owned())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn root_and_terminal_helpers_have_distinct_graph_meanings() {
+        let linear = vec![
+            boundary_group("a", &[]),
+            boundary_group("b", &["a"]),
+            boundary_group("c", &["b"]),
+        ];
+        assert_eq!(root_nodes(&linear), vec!["a"]);
+        assert_eq!(terminal_nodes(&linear), vec!["c"]);
+
+        let fork = vec![
+            boundary_group("a", &[]),
+            boundary_group("b", &["a"]),
+            boundary_group("c", &["a"]),
+        ];
+        assert_eq!(root_nodes(&fork), vec!["a"]);
+        assert_eq!(terminal_nodes(&fork), vec!["b", "c"]);
+
+        let join = vec![
+            boundary_group("a", &[]),
+            boundary_group("b", &[]),
+            boundary_group("c", &["a", "b"]),
+        ];
+        assert_eq!(root_nodes(&join), vec!["a", "b"]);
+        assert_eq!(terminal_nodes(&join), vec!["c"]);
+
+        let disconnected = vec![
+            boundary_group("a", &[]),
+            boundary_group("b", &["a"]),
+            boundary_group("c", &[]),
+        ];
+        assert_eq!(root_nodes(&disconnected), vec!["a", "c"]);
+        assert_eq!(terminal_nodes(&disconnected), vec!["b", "c"]);
+    }
+
+    #[test]
+    fn composition_wires_parent_to_all_child_roots_and_terminals() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let verify = json!({
+            "schema_version": 1,
+            "name": "verify",
+            "tasks": [
+                {"id": "lint", "program": "/bin/true"},
+                {"id": "inspect", "program": "/bin/true"},
+                {"id": "test", "depends_on": ["lint", "inspect"], "program": "/bin/true"}
+            ]
+        });
+        let fanout = json!({
+            "schema_version": 1,
+            "name": "fanout",
+            "tasks": [
+                {"id": "inspect", "program": "/bin/true"},
+                {"id": "test", "depends_on": ["inspect"], "program": "/bin/true"},
+                {"id": "lint", "depends_on": ["inspect"], "program": "/bin/true"}
+            ]
+        });
+        let root = json!({
+            "schema_version": 2,
+            "name": "root",
+            "tasks": [
+                {"id": "prepare", "program": "/bin/true"},
+                {"id": "verify-instance", "workflow": "verify", "depends_on": ["prepare"]},
+                {"id": "fanout-instance", "workflow": "fanout", "depends_on": ["prepare"]},
+                {"id": "package", "depends_on": ["fanout-instance"], "program": "/bin/true"}
+            ]
+        });
+        for (name, value) in [("verify", verify), ("fanout", fanout), ("root", root)] {
+            write_workflow(
+                &workflows,
+                &format!("{name}.json"),
+                &serde_json::to_string(&value).unwrap(),
+            );
+        }
+
+        let plan = resolved_plan(directory.path(), "root");
+        assert_eq!(dependencies(&plan, "verify-instance.lint"), vec!["prepare"]);
+        assert_eq!(
+            dependencies(&plan, "verify-instance.inspect"),
+            vec!["prepare"]
+        );
+        assert_eq!(
+            dependencies(&plan, "verify-instance.test"),
+            vec!["verify-instance.lint", "verify-instance.inspect"]
+        );
+        assert_eq!(
+            dependencies(&plan, "fanout-instance.inspect"),
+            vec!["prepare"]
+        );
+        assert_eq!(
+            dependencies(&plan, "fanout-instance.test"),
+            vec!["fanout-instance.inspect"]
+        );
+        assert_eq!(
+            dependencies(&plan, "fanout-instance.lint"),
+            vec!["fanout-instance.inspect"]
+        );
+        assert_eq!(
+            dependencies(&plan, "package"),
+            vec!["fanout-instance.test", "fanout-instance.lint"]
+        );
+        assert!(!dependencies(&plan, "package").contains(&"fanout-instance.inspect".into()));
+    }
+
+    #[test]
+    fn composition_preserves_nested_sibling_and_repeated_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let inner = json!({
+            "schema_version": 1,
+            "name": "inner",
+            "tasks": [
+                {"id": "inspect", "program": "/bin/true"},
+                {"id": "test", "depends_on": ["inspect"], "program": "/bin/true"}
+            ]
+        });
+        let outer = json!({
+            "schema_version": 2,
+            "name": "outer",
+            "tasks": [{"id": "inner-instance", "workflow": "inner"}]
+        });
+        let root = json!({
+            "schema_version": 2,
+            "name": "root",
+            "tasks": [
+                {"id": "prepare", "program": "/bin/true"},
+                {"id": "backend", "workflow": "outer", "depends_on": ["prepare"]},
+                {"id": "frontend", "workflow": "outer", "depends_on": ["prepare"]}
+            ]
+        });
+        for (name, value) in [("inner", inner), ("outer", outer), ("root", root)] {
+            write_workflow(
+                &workflows,
+                &format!("{name}.json"),
+                &serde_json::to_string(&value).unwrap(),
+            );
+        }
+
+        let plan = resolved_plan(directory.path(), "root");
+        assert_eq!(
+            dependencies(&plan, "backend.inner-instance.inspect"),
+            vec!["prepare"]
+        );
+        assert_eq!(
+            dependencies(&plan, "backend.inner-instance.test"),
+            vec!["backend.inner-instance.inspect"]
+        );
+        assert_eq!(
+            dependencies(&plan, "frontend.inner-instance.inspect"),
+            vec!["prepare"]
+        );
+        assert_eq!(
+            dependencies(&plan, "frontend.inner-instance.test"),
+            vec!["frontend.inner-instance.inspect"]
+        );
+        assert!(
+            !dependencies(&plan, "backend.inner-instance.test")
+                .iter()
+                .any(|dependency| dependency.starts_with("frontend."))
+        );
+    }
+
+    #[test]
+    fn downstream_composed_workflow_waits_for_upstream_terminals() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let verify = json!({
+            "schema_version": 1,
+            "name": "verify",
+            "tasks": [
+                {"id": "inspect", "program": "/bin/true"},
+                {"id": "test", "depends_on": ["inspect"], "program": "/bin/true"}
+            ]
+        });
+        let package = json!({
+            "schema_version": 1,
+            "name": "package",
+            "tasks": [
+                {"id": "prepare", "program": "/bin/true"},
+                {"id": "bundle", "depends_on": ["prepare"], "program": "/bin/true"}
+            ]
+        });
+        let release = json!({
+            "schema_version": 2,
+            "name": "release",
+            "tasks": [
+                {"id": "verify-instance", "workflow": "verify"},
+                {"id": "package-instance", "workflow": "package", "depends_on": ["verify-instance"]}
+            ]
+        });
+        for (name, value) in [
+            ("verify", verify),
+            ("package", package),
+            ("release", release),
+        ] {
+            write_workflow(
+                &workflows,
+                &format!("{name}.json"),
+                &serde_json::to_string(&value).unwrap(),
+            );
+        }
+
+        let plan = resolved_plan(directory.path(), "release");
+        assert_eq!(
+            dependencies(&plan, "verify-instance.test"),
+            vec!["verify-instance.inspect"]
+        );
+        assert_eq!(
+            dependencies(&plan, "package-instance.prepare"),
+            vec!["verify-instance.test"]
+        );
+        assert_eq!(
+            dependencies(&plan, "package-instance.bundle"),
+            vec!["package-instance.prepare"]
+        );
+    }
+
+    #[test]
+    fn exported_nonterminal_output_keeps_exact_producer_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let verify = json!({
+            "schema_version": 2,
+            "name": "verify",
+            "tasks": [
+                {"id": "build", "program": "/bin/true", "outputs": [{"name": "report", "type": "file", "path": "report.txt"}]},
+                {"id": "test", "depends_on": ["build"], "program": "/bin/true"}
+            ],
+            "exports": {"report": {"from_task": "build", "output": "report"}}
+        });
+        let root = json!({
+            "schema_version": 2,
+            "name": "root",
+            "tasks": [
+                {"id": "verify-instance", "workflow": "verify"},
+                {"id": "publish", "depends_on": ["verify-instance"], "program": "/bin/true",
+                 "inputs": [{"from_task": "verify-instance", "output": "report", "as": "--report"}]}
+            ]
+        });
+        write_workflow(
+            &workflows,
+            "verify.json",
+            &serde_json::to_string(&verify).unwrap(),
+        );
+        write_workflow(
+            &workflows,
+            "root.json",
+            &serde_json::to_string(&root).unwrap(),
+        );
+
+        let plan = resolved_plan(directory.path(), "root");
+        assert_eq!(dependencies(&plan, "publish"), vec!["verify-instance.test"]);
+        assert_eq!(
+            plan["tasks"][2]["inputs"][0]["from_task"],
+            "verify-instance.build"
+        );
+        assert_eq!(plan["tasks"][2]["inputs"][0]["output"], "report");
+    }
+
+    #[test]
+    fn empty_workflows_are_rejected_before_composition() {
+        let empty = definition(r#"{"schema_version": 1, "name": "empty", "tasks": []}"#);
+        let error = validate_definition(&empty, Path::new("empty.json")).unwrap_err();
+        assert!(error.to_string().contains("between 1 and"));
+    }
+
+    #[test]
+    fn expanded_boundary_dependencies_remain_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflows = directory.path().join(WORKFLOW_DIRECTORY);
+        fs::create_dir(&workflows).unwrap();
+        let parent_ids = (0..32)
+            .map(|index| format!("parent{index}"))
+            .collect::<Vec<_>>();
+        let child_tasks = (0..32)
+            .map(|index| json!({"id": format!("child{index}"), "program": "/bin/true"}))
+            .collect::<Vec<_>>();
+        let mut root_tasks = parent_ids
+            .iter()
+            .map(|id| json!({"id": id, "program": "/bin/true"}))
+            .collect::<Vec<_>>();
+        root_tasks.push(json!({
+            "id": "child-instance",
+            "workflow": "child",
+            "depends_on": parent_ids
+        }));
+        let child = json!({"schema_version": 1, "name": "child", "tasks": child_tasks});
+        let root = json!({"schema_version": 2, "name": "root", "tasks": root_tasks});
+        write_workflow(
+            &workflows,
+            "child.json",
+            &serde_json::to_string(&child).unwrap(),
+        );
+        write_workflow(
+            &workflows,
+            "root.json",
+            &serde_json::to_string(&root).unwrap(),
+        );
+        let catalog = load_all(directory.path()).unwrap();
+        let error = WorkflowResolver::new(&catalog)
+            .resolve("root", &BTreeMap::new(), directory.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds 512 dependencies"));
     }
 }

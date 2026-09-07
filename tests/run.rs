@@ -5627,42 +5627,53 @@ with open(paths["final"],"w") as f: f.write("final report\n")
     })
 }
 
-fn real_composed_verify_definition(counter: &Path, retry_flag: &Path) -> Value {
+fn real_composed_verify_definition(
+    counter: &Path,
+    retry_flag: &Path,
+    ready_flag: &Path,
+    verify_complete: &Path,
+) -> Value {
     let counter = counter.to_str().unwrap();
     let retry_flag = retry_flag.to_str().unwrap();
+    let ready_flag = ready_flag.to_str().unwrap();
+    let verify_complete = verify_complete.to_str().unwrap();
     let inspect = r#"import json,os,sys
-counter,profile=sys.argv[1],sys.argv[2]
-assert profile == "release"
-with open(counter,"a") as f: f.write("inspect\\n")
+counter,ready,profile=sys.argv[1],sys.argv[2],sys.argv[3]
+assert profile == "release" and os.path.isfile(ready)
+with open(counter,"a") as f: f.write("inspect\n")
 paths=json.loads(os.environ["RELAY_OUTPUT_MANIFEST"])
 with open(paths["summary"],"w") as f: json.dump({"kind":"inspect","profile":profile},f)
-with open(paths["report"],"w") as f: f.write("inspect report\\n")
+with open(paths["report"],"w") as f: f.write("inspect report\n")
 "#;
     let format = r#"import os,sys
-if not os.path.exists(sys.argv[1]):
-    open(sys.argv[1],"w").close()
+retry_flag,counter,ready=sys.argv[1],sys.argv[2],sys.argv[3]
+assert os.path.isfile(ready)
+if not os.path.exists(retry_flag):
+    open(retry_flag,"w").close()
     sys.exit(17)
-with open(sys.argv[2],"a") as f: f.write("format\\n")
+with open(counter,"a") as f: f.write("format\n")
 "#;
     let test = r#"import json,os,sys
-assert sys.argv[2] == "release"
-assert sys.argv[3] == "--summary"
-assert json.loads(sys.argv[4])["kind"] == "inspect"
-assert sys.argv[5] == "--report" and os.path.isfile(sys.argv[6])
-with open(sys.argv[1],"a") as f: f.write("test\\n")
+counter,profile,complete=sys.argv[1],sys.argv[2],sys.argv[3]
+assert profile == "release"
+assert sys.argv[4] == "--summary"
+assert json.loads(sys.argv[5])["kind"] == "inspect"
+assert sys.argv[6] == "--report" and os.path.isfile(sys.argv[7])
+with open(counter,"a") as f: f.write("test\n")
+open(complete,"w").close()
 paths=json.loads(os.environ["RELAY_OUTPUT_MANIFEST"])
 with open(paths["summary"],"w") as f: json.dump({"kind":"test"},f)
-with open(paths["report"],"w") as f: f.write("test report\\n")
+with open(paths["report"],"w") as f: f.write("test report\n")
 "#;
     json!({
         "schema_version": 2,
         "name": "verify",
         "inputs": {"profile": {"type":"string", "required":true}},
         "tasks": [
-            {"id":"inspect", "program":"/usr/bin/python3", "arguments":["-c", inspect, counter, {"workflow_input":"profile"}],
+            {"id":"inspect", "program":"/usr/bin/python3", "arguments":["-c", inspect, counter, ready_flag, {"workflow_input":"profile"}],
              "outputs":[{"name":"summary","type":"json","path":"summary.json"},{"name":"report","type":"file","path":"inspect.txt"}]},
-            {"id":"format", "program":"/usr/bin/python3", "arguments":["-c", format, retry_flag, counter], "retry":{"max_attempts":2,"delay_ms":0}},
-            {"id":"test", "depends_on":["inspect","format"], "program":"/usr/bin/python3", "arguments":["-c", test, counter, {"workflow_input":"profile"}],
+            {"id":"format", "program":"/usr/bin/python3", "arguments":["-c", format, retry_flag, counter, ready_flag], "retry":{"max_attempts":2,"delay_ms":0}},
+            {"id":"test", "depends_on":["inspect","format"], "program":"/usr/bin/python3", "arguments":["-c", test, counter, {"workflow_input":"profile"}, verify_complete],
              "outputs":[{"name":"summary","type":"json","path":"test.json"},{"name":"report","type":"file","path":"test.txt"}],
              "inputs":[{"from_task":"inspect","output":"summary","as":"--summary"},{"from_task":"inspect","output":"report","as":"--report"}]}
         ],
@@ -5670,37 +5681,62 @@ with open(paths["report"],"w") as f: f.write("test report\\n")
     })
 }
 
-fn real_composed_package_definition(counter: &Path) -> Value {
+fn real_composed_package_definition(
+    counter: &Path,
+    verify_complete: &Path,
+    package_complete: &Path,
+) -> Value {
     let counter = counter.to_str().unwrap();
+    let verify_complete = verify_complete.to_str().unwrap();
+    let package_complete = package_complete.to_str().unwrap();
+    let prepare = r#"import os,sys
+assert os.path.isfile(sys.argv[1])
+with open(sys.argv[2],"a") as f: f.write("package-prepare\n")
+"#;
     let package = r#"import json,os,sys
-with open(sys.argv[1],"a") as f: f.write("package\\n")
+with open(sys.argv[1],"a") as f: f.write("package\n")
+open(sys.argv[2],"w").close()
 paths=json.loads(os.environ["RELAY_OUTPUT_MANIFEST"])
-with open(paths["package"],"w") as f: f.write("package\\n")
+with open(paths["package"],"w") as f: f.write("package\n")
 "#;
     json!({
         "schema_version": 1,
         "name": "package",
-        "tasks": [{"id":"package","program":"/usr/bin/python3","arguments":["-c",package,counter],"outputs":[{"name":"package","type":"file","path":"package.txt"}]}]
+        "tasks": [
+            {"id":"package-prepare","program":"/usr/bin/python3","arguments":["-c",prepare,verify_complete,counter]},
+            {"id":"package","depends_on":["package-prepare"],"program":"/usr/bin/python3","arguments":["-c",package,counter,package_complete],"outputs":[{"name":"package","type":"file","path":"package.txt"}]}
+        ]
     })
 }
 
-fn real_composed_release_definition(counter: &Path) -> Value {
+fn real_composed_release_definition(
+    counter: &Path,
+    ready_flag: &Path,
+    package_complete: &Path,
+) -> Value {
     let counter = counter.to_str().unwrap();
+    let ready_flag = ready_flag.to_str().unwrap();
+    let package_complete = package_complete.to_str().unwrap();
+    let prepare = r#"import sys
+with open(sys.argv[1],"w") as f: f.write("ready\n")
+"#;
     let publish = r#"import json,os,sys
-assert sys.argv[2] == "--report" and os.path.isfile(sys.argv[3])
-with open(sys.argv[1],"a") as f: f.write("publish\\n")
+assert os.path.isfile(sys.argv[2])
+assert sys.argv[3] == "--report" and os.path.isfile(sys.argv[4])
+with open(sys.argv[1],"a") as f: f.write("publish\n")
 paths=json.loads(os.environ["RELAY_OUTPUT_MANIFEST"])
-with open(paths["final"],"w") as f: f.write("published\\n")
+with open(paths["final"],"w") as f: f.write("published\n")
 "#;
     json!({
         "schema_version": 2,
         "name": "release",
         "inputs": {"profile": {"type":"string", "required":true}},
         "tasks": [
-            {"id":"verify-instance","workflow":"verify","inputs":{"profile":{"workflow_input":"profile"}}},
+            {"id":"prepare","program":"/usr/bin/python3","arguments":["-c",prepare,ready_flag]},
+            {"id":"verify-instance","workflow":"verify","depends_on":["prepare"],"inputs":{"profile":{"workflow_input":"profile"}}},
             {"id":"package-instance","workflow":"package","depends_on":["verify-instance"]},
             {"id":"publish","depends_on":["verify-instance","package-instance"],"program":"/usr/bin/python3",
-             "arguments":["-c",publish,counter],"inputs":[{"from_task":"verify-instance","output":"report","as":"--report"}],
+             "arguments":["-c",publish,counter,package_complete],"inputs":[{"from_task":"verify-instance","output":"report","as":"--report"}],
              "outputs":[{"name":"final","type":"file","path":"final.txt"}]}
         ]
     })
@@ -5795,7 +5831,11 @@ fn real_go_composed_workflow_expands_retries_and_resumes_immutably() {
     fs::create_dir(&workflows).unwrap();
     let counter = directory.path().join("counter");
     let retry_flag = directory.path().join("retry.flag");
-    let verify = real_composed_verify_definition(&counter, &retry_flag);
+    let ready_flag = directory.path().join("ready.flag");
+    let verify_complete = directory.path().join("verify.complete");
+    let package_complete = directory.path().join("package.complete");
+    let verify =
+        real_composed_verify_definition(&counter, &retry_flag, &ready_flag, &verify_complete);
     fs::write(
         workflows.join("verify.json"),
         serde_json::to_vec_pretty(&verify).unwrap(),
@@ -5803,12 +5843,22 @@ fn real_go_composed_workflow_expands_retries_and_resumes_immutably() {
     .unwrap();
     fs::write(
         workflows.join("package.json"),
-        serde_json::to_vec_pretty(&real_composed_package_definition(&counter)).unwrap(),
+        serde_json::to_vec_pretty(&real_composed_package_definition(
+            &counter,
+            &verify_complete,
+            &package_complete,
+        ))
+        .unwrap(),
     )
     .unwrap();
     fs::write(
         workflows.join("release.json"),
-        serde_json::to_vec_pretty(&real_composed_release_definition(&counter)).unwrap(),
+        serde_json::to_vec_pretty(&real_composed_release_definition(
+            &counter,
+            &ready_flag,
+            &package_complete,
+        ))
+        .unwrap(),
     )
     .unwrap();
 
@@ -5843,32 +5893,55 @@ fn real_go_composed_workflow_expands_retries_and_resumes_immutably() {
         inspect["started_at"].as_str().unwrap() < format["completed_at"].as_str().unwrap()
             && format["started_at"].as_str().unwrap() < inspect["completed_at"].as_str().unwrap()
     );
+    assert!(ready_flag.is_file());
+    assert!(verify_complete.is_file());
+    assert!(package_complete.is_file());
+    assert_eq!(
+        record(&persisted, "package-instance.package-prepare")["status"],
+        "succeeded"
+    );
     let counter_text = fs::read_to_string(&counter).unwrap();
     assert!(counter_text.contains("inspect"));
     assert_eq!(counter_text.matches("format").count(), 1);
     assert!(counter_text.contains("test"));
+    assert!(counter_text.contains("package-prepare"));
     assert!(counter_text.contains("package"));
     assert!(counter_text.contains("publish"));
 
     let resume_counter = directory.path().join("resume-counter");
     let resume_retry = directory.path().join("resume.retry.flag");
+    let resume_ready = directory.path().join("resume.ready");
+    let resume_verify_complete = directory.path().join("resume.verify.complete");
+    let resume_package_complete = directory.path().join("resume.package.complete");
     fs::write(
         workflows.join("verify.json"),
         serde_json::to_vec_pretty(&real_composed_verify_definition(
             &resume_counter,
             &resume_retry,
+            &resume_ready,
+            &resume_verify_complete,
         ))
         .unwrap(),
     )
     .unwrap();
     fs::write(
         workflows.join("package.json"),
-        serde_json::to_vec_pretty(&real_composed_package_definition(&resume_counter)).unwrap(),
+        serde_json::to_vec_pretty(&real_composed_package_definition(
+            &resume_counter,
+            &resume_verify_complete,
+            &resume_package_complete,
+        ))
+        .unwrap(),
     )
     .unwrap();
     fs::write(
         workflows.join("release.json"),
-        serde_json::to_vec_pretty(&real_composed_release_definition(&resume_counter)).unwrap(),
+        serde_json::to_vec_pretty(&real_composed_release_definition(
+            &resume_counter,
+            &resume_ready,
+            &resume_package_complete,
+        ))
+        .unwrap(),
     )
     .unwrap();
     let resume_state = directory.path().join("resume.state.json");
@@ -5912,6 +5985,13 @@ fn real_go_composed_workflow_expands_retries_and_resumes_immutably() {
             .unwrap()
             .len(),
         1
+    );
+    assert!(resume_ready.is_file());
+    assert!(resume_verify_complete.is_file());
+    assert!(resume_package_complete.is_file());
+    assert_eq!(
+        record(&final_state, "package-instance.package-prepare")["status"],
+        "succeeded"
     );
     for task in [
         "verify-instance.inspect",
