@@ -223,6 +223,9 @@ pub fn run(
         WorkflowCommand::List => list(project_root),
         WorkflowCommand::Show(args) => show(project_root, args),
         WorkflowCommand::Validate(args) => validate(project_root, invocation_directory, args),
+        WorkflowCommand::Explain(args) => {
+            explain_workflow(project_root, invocation_directory, args, 1)
+        }
         WorkflowCommand::Run(args) => run_workflow(project_root, invocation_directory, args),
     }
 }
@@ -332,10 +335,7 @@ fn validate(
         definition_sha256: resolved.definition_sha256.clone(),
         inputs: inputs.clone(),
         composition: resolved.composition.clone(),
-        resolved_plan_sha256: resolved
-            .composition
-            .as_ref()
-            .map(|_| resolved.resolved_plan_sha256.clone()),
+        resolved_plan_sha256: Some(resolved.resolved_plan_sha256.clone()),
     };
     let task_count = resolved.plan["tasks"].as_array().map_or(0, Vec::len);
     let human = format!(
@@ -357,11 +357,289 @@ fn validate(
     }))
 }
 
+fn explain_workflow(
+    project_root: &Path,
+    invocation_directory: &Path,
+    args: WorkflowValidateArgs,
+    jobs: usize,
+) -> Result<WorkflowResult, WorkflowError> {
+    validate_workflow_name(&args.name)?;
+    let workflows = load_all(project_root)?;
+    let workflow = workflows
+        .iter()
+        .find(|w| w.definition.name == args.name)
+        .ok_or_else(|| WorkflowError::Definition(format!("workflow {:?} not found", args.name)))?;
+    let inputs = resolve_inputs(&workflow.definition, &args.inputs)?;
+    let resolved =
+        WorkflowResolver::new(&workflows).resolve(&args.name, &inputs, invocation_directory)?;
+    let metadata = WorkflowRunMetadata {
+        name: args.name,
+        schema_version: workflow.definition.schema_version,
+        definition_sha256: resolved.definition_sha256.clone(),
+        inputs,
+        composition: resolved.composition.clone(),
+        resolved_plan_sha256: Some(resolved.resolved_plan_sha256.clone()),
+    };
+    orchestrate::validate_workflow_metadata(&metadata)?;
+    let tasks = resolved.plan["tasks"]
+        .as_array()
+        .expect("resolver produces tasks");
+    let roots: Vec<_> = tasks
+        .iter()
+        .filter(|t| t["depends_on"].as_array().is_none_or(Vec::is_empty))
+        .map(|t| t["id"].clone())
+        .collect();
+    let terminals: Vec<_> = tasks
+        .iter()
+        .filter(|t| {
+            !tasks.iter().any(|other| {
+                other["depends_on"]
+                    .as_array()
+                    .is_some_and(|deps| deps.contains(&t["id"]))
+            })
+        })
+        .map(|t| t["id"].clone())
+        .collect();
+    let width = dag_width(tasks);
+    let secrets: Vec<String> = tasks
+        .iter()
+        .flat_map(|task| {
+            task["redact_argument_indexes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|index| {
+                    task["arguments"][index.as_u64()? as usize]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+        })
+        .filter(|secret| !secret.is_empty())
+        .collect();
+    let composition_tree = orchestrate::composition_tree(&metadata);
+    let mut data = json!({
+        "workflow": metadata,
+        "composition_tree": composition_tree,
+        "definition_sha256": resolved.definition_sha256,
+        "resolved_plan_sha256": resolved.resolved_plan_sha256,
+        "plan": resolved.plan,
+        "task_sources": resolved.task_sources,
+        "exports": resolved.exports,
+        "output_bindings": resolved.output_bindings,
+        "dry_run": true,
+        "graph": {
+            "task_ids": tasks.iter().map(|task| &task["id"]).collect::<Vec<_>>(),
+            "roots": roots, "terminals": terminals,
+            "edges": tasks.iter().flat_map(|task| task["depends_on"].as_array().into_iter().flatten()
+                .map(|dependency| json!({"from": dependency, "to": task["id"]}))).collect::<Vec<_>>(),
+        },
+        "roots": roots,
+        "terminals": terminals,
+        "concurrency": {"dag_width": width, "jobs": jobs, "maximum_parallel_tasks": width.min(jobs)},
+        "bounds": resolved.bounds,
+    });
+    // Redacted argument values can also occur in resolved input bindings. Never
+    // print those bindings merely because they live outside the argv array.
+    redact_inspection_values(&mut data["workflow"]["inputs"], &secrets);
+    if let Some(instances) = data["workflow"]
+        .get_mut("composition")
+        .and_then(|c| c.get_mut("instances"))
+        .and_then(Value::as_array_mut)
+    {
+        for instance in instances {
+            redact_inspection_values(&mut instance["resolved_inputs"], &secrets);
+        }
+    }
+    redact_inspection_values(&mut data["composition_tree"], &secrets);
+    for task in data["plan"]["tasks"]
+        .as_array_mut()
+        .expect("resolved tasks")
+    {
+        let indexes = task["redact_argument_indexes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for index in indexes {
+            task["arguments"][index.as_u64().expect("validated redaction") as usize] =
+                json!("<redacted>");
+        }
+        redact_inspection_values(&mut task["arguments"], &secrets);
+    }
+    let mut human = format!(
+        "Workflow: {}\nDefinition: {}\nResolved plan: {}\nInputs: {}\nComposition:\n  {}",
+        metadata.name,
+        data["definition_sha256"].as_str().unwrap(),
+        data["resolved_plan_sha256"].as_str().unwrap(),
+        data["workflow"]["inputs"],
+        metadata.name
+    );
+    if let Some(instances) = data["workflow"]["composition"]["instances"].as_array() {
+        for instance in instances {
+            let path = instance["instance"].as_str().unwrap();
+            human.push_str(&format!(
+                "\n  {}{} -> {} @ {} (inputs: {})",
+                "  ".repeat(path.split('.').count()),
+                path,
+                instance["workflow"].as_str().unwrap(),
+                instance["definition_sha256"].as_str().unwrap(),
+                instance["resolved_inputs"]
+            ));
+        }
+    }
+    human.push_str(&format!(
+        "\nExpanded DAG:\nRoots: {}\nTerminals: {}",
+        data["roots"], data["terminals"]
+    ));
+    for task in data["plan"]["tasks"].as_array().unwrap() {
+        let id = task["id"].as_str().unwrap();
+        let source = &data["task_sources"][id];
+        human.push_str(&format!("\n  {id} <- {}\n    Source: {} / {}\n    Command: {} {}\n    Working directory: {}\n    Outputs: {}\n    Output inputs: {}\n    Retry: {}\n    Limits: timeout={}ms grace={}ms stdout={} stderr={} log={}", task["depends_on"], source["workflow"].as_str().unwrap(), source["instance"].as_str().unwrap_or("root"), task["program"], task["arguments"], task["working_directory"], task["outputs"], task["inputs"], task.get("retry").cloned().unwrap_or(json!({"max_attempts":1,"delay_ms":0})), task["timeout_ms"], task["termination_grace_ms"], task["stdout_limit_bytes"], task["stderr_limit_bytes"], task["log_limit_bytes"]));
+    }
+    human.push_str("\nOutput consumption (argument <- export <- producer):");
+    for binding in data["output_bindings"].as_array().unwrap() {
+        human.push_str(&format!(
+            "\n  {} {} <- {}.{}",
+            binding["consumer_task"],
+            binding["argument"],
+            binding["producer_task"],
+            binding["output"]
+        ));
+        if !binding["via_export"].is_null() {
+            human.push_str(&format!(
+                " (via {}.{})",
+                binding["via_export"]["instance"], binding["via_export"]["name"]
+            ));
+        }
+    }
+    human.push_str("\nExports (declared -> exact producer):");
+    let exports = data["exports"].as_array().unwrap();
+    if exports.is_empty() {
+        human.push_str(" none");
+    }
+    for export in exports {
+        human.push_str(&format!(
+            "\n  {}.{}: {}.{} -> {}.{}",
+            export["instance"].as_str().unwrap_or("root"),
+            export["name"].as_str().unwrap(),
+            export["from_task"].as_str().unwrap(),
+            export["output"].as_str().unwrap(),
+            export["producer_task"].as_str().unwrap(),
+            export["producer_output"].as_str().unwrap()
+        ));
+    }
+    human.push_str(&format!("\nPotential concurrency: {width} independent tasks; jobs {jobs}; at most {} running\nBounds (used / limit):", width.min(jobs)));
+    for (name, bound) in data["bounds"].as_object().unwrap() {
+        human.push_str(&format!(
+            "\n  {name}: {} / {}",
+            bound["used"], bound["limit"]
+        ));
+    }
+    human.push_str("\nNo processes launched. No state written.");
+    // Dynamic paths/argv are JSON quoted; escape remaining C1 and format controls
+    // without escaping the renderer-owned line breaks.
+    let mut safe = String::with_capacity(human.len());
+    for ch in human.chars() {
+        if (ch.is_control() && ch != '\n')
+            || matches!(ch, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            safe.extend(ch.escape_default());
+        } else {
+            safe.push(ch);
+        }
+    }
+    Ok(WorkflowResult::Inspection(RunOutput { human: safe, data }))
+}
+
+fn redact_inspection_values(value: &mut Value, secrets: &[String]) {
+    match value {
+        Value::String(text) => {
+            if secrets.iter().any(|secret| text.contains(secret)) {
+                *text = "<redacted>".into();
+            }
+        }
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|v| redact_inspection_values(v, secrets)),
+        Value::Object(values) => values
+            .values_mut()
+            .for_each(|v| redact_inspection_values(v, secrets)),
+        Value::Number(_) | Value::Bool(_) if secrets.contains(&value.to_string()) => {
+            *value = json!("<redacted>")
+        }
+        _ => {}
+    }
+}
+
+// DAG width is its largest antichain, not the largest topological layer.
+// Dilworth: width = vertices - maximum matching of the reachability graph.
+fn dag_width(tasks: &[Value]) -> usize {
+    let n = tasks.len();
+    let mut reachable = vec![vec![false; n]; n];
+    for (to, task) in tasks.iter().enumerate() {
+        for dependency in task["depends_on"].as_array().into_iter().flatten() {
+            let from = tasks
+                .iter()
+                .position(|t| &t["id"] == dependency)
+                .expect("validated DAG");
+            reachable[from][to] = true;
+        }
+    }
+    for via in 0..n {
+        for from in 0..n {
+            for to in 0..n {
+                reachable[from][to] |= reachable[from][via] && reachable[via][to];
+            }
+        }
+    }
+    fn augment(
+        from: usize,
+        reachable: &[Vec<bool>],
+        seen: &mut [bool],
+        matched: &mut [Option<usize>],
+    ) -> bool {
+        for to in 0..reachable.len() {
+            if reachable[from][to] && !seen[to] {
+                seen[to] = true;
+                if matched[to].is_none_or(|previous| augment(previous, reachable, seen, matched)) {
+                    matched[to] = Some(from);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    let mut matched = vec![None; n];
+    n - (0..n)
+        .filter(|&from| augment(from, &reachable, &mut vec![false; n], &mut matched))
+        .count()
+}
+
 fn run_workflow(
     project_root: &Path,
     invocation_directory: &Path,
     args: WorkflowRunArgs,
 ) -> Result<WorkflowResult, WorkflowError> {
+    if args.dry_run {
+        if let Some(supervisor) = &args.supervisor
+            && !supervisor.is_absolute()
+        {
+            return Err(
+                orchestrate::RunError::Plan("supervisor path must be absolute".into()).into(),
+            );
+        }
+        if let Some(path) = &args.state_path {
+            orchestrate::validate_state_path(path, project_root)?;
+        }
+        return explain_workflow(
+            project_root,
+            invocation_directory,
+            WorkflowValidateArgs {
+                name: args.name,
+                inputs: args.inputs,
+            },
+            args.jobs,
+        );
+    }
     validate_workflow_name(&args.name)?;
     let run_args = args.clone().into_run_args(project_root);
     if args.resume.is_some() {
@@ -405,10 +683,7 @@ fn run_workflow(
         definition_sha256: resolved.definition_sha256.clone(),
         inputs,
         composition: resolved.composition.clone(),
-        resolved_plan_sha256: resolved
-            .composition
-            .as_ref()
-            .map(|_| resolved.resolved_plan_sha256.clone()),
+        resolved_plan_sha256: Some(resolved.resolved_plan_sha256.clone()),
     };
     Ok(WorkflowResult::Run(orchestrate::run_resolved(
         run_args,
@@ -422,13 +697,16 @@ fn run_workflow(
 impl WorkflowRunArgs {
     fn into_run_args(self, project_root: &Path) -> crate::cli::RunArgs {
         crate::cli::RunArgs {
+            command: None,
             supervisor: self.supervisor,
             jobs: self.jobs,
             state_path: self.state_path,
             resume: self.resume,
-            plan: project_root
-                .join(WORKFLOW_DIRECTORY)
-                .join(format!("{}.json", self.name)),
+            plan: Some(
+                project_root
+                    .join(WORKFLOW_DIRECTORY)
+                    .join(format!("{}.json", self.name)),
+            ),
         }
     }
 }
@@ -475,6 +753,10 @@ struct ResolvedWorkflow {
     definition_sha256: String,
     composition: Option<orchestrate::WorkflowCompositionMetadata>,
     resolved_plan_sha256: String,
+    task_sources: BTreeMap<String, Value>,
+    exports: Vec<Value>,
+    output_bindings: Vec<Value>,
+    bounds: Value,
 }
 
 struct WorkflowResolver<'a> {
@@ -493,6 +775,9 @@ struct ExpansionContext<'a> {
     total_instances: usize,
     output_count: usize,
     export_count: usize,
+    task_sources: BTreeMap<String, Value>,
+    exports: Vec<Value>,
+    output_bindings: Vec<Value>,
 }
 
 impl<'a> WorkflowResolver<'a> {
@@ -527,6 +812,9 @@ impl<'a> WorkflowResolver<'a> {
             total_instances: 0,
             output_count: 0,
             export_count: 0,
+            task_sources: BTreeMap::new(),
+            exports: Vec::new(),
+            output_bindings: Vec::new(),
         };
         let _ = context.expand(root_name, inputs, None, 0)?;
         let plan = context.plan_value()?;
@@ -534,6 +822,17 @@ impl<'a> WorkflowResolver<'a> {
             WorkflowError::Definition(format!("resolved workflow plan cannot be encoded: {error}"))
         })?;
         let resolved_plan_sha256 = orchestrate::hex_digest(sha2::Sha256::digest(&encoded_plan));
+        let mut bounds = json!({
+            "tasks": {"used": context.tasks.len(), "limit": orchestrate::MAX_TASKS},
+            "plan_bytes": {"used": encoded_plan.len(), "limit": orchestrate::MAX_PLAN_BYTES},
+            "definitions": {"used": context.definitions.len(), "limit": MAX_COMPOSITION_DEFINITIONS},
+            "instances": {"used": context.total_instances, "limit": MAX_COMPOSITION_INSTANCES},
+            "instances_per_workflow": {"used": context.instances_by_workflow.values().copied().max().unwrap_or(0), "limit": MAX_COMPOSITION_INSTANCES_PER_WORKFLOW},
+            "depth": {"used": context.instances.iter().map(|i| i.instance.split('.').count()).max().unwrap_or(0), "limit": MAX_COMPOSITION_DEPTH},
+            "outputs": {"used": context.output_count, "limit": MAX_COMPOSITION_OUTPUTS},
+            "exports": {"used": context.export_count, "limit": MAX_COMPOSITION_EXPORTS},
+            "dependencies": {"used": context.tasks.iter().map(|t| t.task.depends_on.len()).sum::<usize>(), "limit": MAX_COMPOSITION_DEPENDENCIES},
+        });
         let composition =
             if root_schema_version == WORKFLOW_SCHEMA_VERSION_V2 || !context.instances.is_empty() {
                 Some(orchestrate::WorkflowCompositionMetadata {
@@ -557,6 +856,10 @@ impl<'a> WorkflowResolver<'a> {
                 ));
             }
         }
+        bounds["composition_metadata_bytes"] = json!({
+            "used": composition.as_ref().map(|c| serde_json::to_vec(c).expect("serializable metadata").len()).unwrap_or(0),
+            "limit": 16 * 1024,
+        });
         let definition_sha256 = if composition.is_some() {
             let source = CompositionHashSource {
                 root_workflow: root_name.to_owned(),
@@ -576,6 +879,10 @@ impl<'a> WorkflowResolver<'a> {
             definition_sha256,
             composition,
             resolved_plan_sha256,
+            task_sources: context.task_sources,
+            exports: context.exports,
+            output_bindings: context.output_bindings,
+            bounds,
         })
     }
 }
@@ -670,6 +977,7 @@ impl<'a> ExpansionContext<'a> {
                             orchestrate::MAX_TASKS
                         )));
                     }
+                    self.task_sources.insert(id.clone(), json!({"workflow": workflow.definition.name, "instance": prefix, "task": source.id, "definition_sha256": workflow.definition_sha256}));
                     self.tasks.push(ExpandedTask { task, arguments });
                     groups.push((
                         source.id.clone(),
@@ -826,6 +1134,14 @@ impl<'a> ExpansionContext<'a> {
                             output: input.output.clone(),
                         }
                     };
+                    self.output_bindings.push(json!({
+                        "consumer_task": task_id, "argument": input.argument,
+                        "producer_task": resolved.producer_task, "output": resolved.output,
+                        "via_export": source_group.composed.then(|| json!({
+                            "instance": namespaced_id(prefix, &input.from_task, scope).expect("validated instance"),
+                            "name": input.output,
+                        })),
+                    }));
                     resolved_inputs.push(OutputInput {
                         from_task: resolved.producer_task,
                         output: resolved.output,
@@ -888,6 +1204,7 @@ impl<'a> ExpansionContext<'a> {
                     "workflow composition exceeds {MAX_COMPOSITION_EXPORTS} exports"
                 )));
             }
+            self.exports.push(json!({"workflow": workflow.definition.name, "instance": prefix, "name": name, "from_task": export.from_task, "output": export.output, "producer_task": resolved.producer_task, "producer_output": resolved.output}));
             exports.insert(name.clone(), resolved);
         }
         Ok(NodeGroup {
@@ -969,9 +1286,8 @@ impl<'a> ExpansionContext<'a> {
                 orchestrate::MAX_PLAN_BYTES
             )));
         }
-        orchestrate::validate_plan_value(plan.clone(), self.invocation_directory)
-            .map_err(|error| WorkflowError::Definition(error.to_string()))?;
-        Ok(plan)
+        orchestrate::resolve_plan_value(plan, self.invocation_directory)
+            .map_err(|error| WorkflowError::Definition(error.to_string()))
     }
 }
 

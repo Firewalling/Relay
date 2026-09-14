@@ -41,6 +41,51 @@ pub fn discover_workflow(
     discover_with_markers(invocation_directory, scope, &[".relay", "relay-workflows"])
 }
 
+/// Discover project boundaries without invoking Git or another subprocess.
+pub fn discover_inspection(
+    invocation_directory: &Path,
+    scope: ProjectScope,
+    workflow: bool,
+) -> Result<ProjectContext, ProjectError> {
+    let mut git_repository_root = None;
+    if scope != ProjectScope::Current {
+        for directory in invocation_directory.ancestors() {
+            let path = directory.join(".git");
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    git_repository_root = Some(directory.to_owned());
+                    break;
+                }
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => return Err(ProjectError::Inspect { path, source }),
+            }
+        }
+    }
+    let markers: &[&str] = if workflow {
+        &[".relay", "relay-workflows"]
+    } else {
+        &[".relay"]
+    };
+    let relay_project_root = match scope {
+        ProjectScope::Auto => discover_upward(
+            invocation_directory,
+            git_repository_root.as_deref(),
+            markers,
+        )?
+        .unwrap_or_else(|| invocation_directory.to_owned()),
+        ProjectScope::Current => invocation_directory.to_owned(),
+        ProjectScope::Repository => git_repository_root
+            .clone()
+            .ok_or(ProjectError::RepositoryScopeOutsideGit)?,
+    };
+    Ok(ProjectContext {
+        invocation_directory: invocation_directory.to_owned(),
+        relay_project_root,
+        git_repository_root,
+        scope,
+    })
+}
+
 fn discover_with_markers(
     invocation_directory: &Path,
     scope: ProjectScope,
