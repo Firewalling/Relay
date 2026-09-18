@@ -2178,6 +2178,16 @@ fn real_go_supervisor_cancels_signal_latched_immediately_after_spawn_when_config
     assert_eq!(record(&state, "first")["status"], "cancelled");
     assert_ne!(record(&state, "first")["status"], "indeterminate");
     assert_eq!(record(&state, "later")["status"], "blocked");
+    let explanation = Command::new(env!("CARGO_BIN_EXE_relay"))
+        .current_dir(directory.path())
+        .args(["--json", "run", "explain", state_path.to_str().unwrap()])
+        .output()
+        .expect("explain cancelled persisted run");
+    let explanation = run_explanation_document(&explanation);
+    assert_eq!(explanation["data"]["run"]["status"], "cancelled");
+    assert_eq!(explanation["data"]["run"]["cancellation_requested"], true);
+    assert_eq!(explanation["data"]["tasks"][0]["status"], "cancelled");
+    assert_eq!(explanation["data"]["tasks"][1]["status"], "blocked");
     assert!(
         !first_launched.exists(),
         "cancelled task program was launched"
@@ -6644,5 +6654,736 @@ fn missing_and_cross_project_run_references_are_rejected() {
             .path()
             .join(".relay/handoffs.jsonl")
             .exists()
+    );
+}
+
+fn inspection_snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>, std::time::SystemTime)> {
+    fn visit(
+        root: &Path,
+        path: &Path,
+        entries: &mut Vec<(PathBuf, Option<Vec<u8>>, std::time::SystemTime)>,
+    ) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            let contents = if path.is_dir() {
+                None
+            } else {
+                Some(fs::read(&path).unwrap())
+            };
+            entries.push((
+                path.strip_prefix(root).unwrap().to_owned(),
+                contents,
+                fs::metadata(&path).unwrap().modified().unwrap(),
+            ));
+            if path.is_dir() {
+                visit(root, &path, entries);
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries.sort();
+    entries
+}
+
+#[test]
+fn workflow_explain_and_dry_run_are_read_only_and_match_real_identity() {
+    let harness = Harness::new();
+    harness.workflow_file("verify", &reusable_verify_definition());
+    let before = inspection_snapshot(harness.directory.path());
+    let explain = workflow_document(
+        &harness
+            .command()
+            .args([
+                "--json",
+                "workflow",
+                "explain",
+                "verify",
+                "--input",
+                "profile=release",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let dry = workflow_document(
+        &harness
+            .command()
+            .args([
+                "--json",
+                "workflow",
+                "run",
+                "verify",
+                "--dry-run",
+                "--input",
+                "profile=release",
+            ])
+            .arg("--supervisor")
+            .arg(&harness.supervisor)
+            .arg("--state-path")
+            .arg(harness.state("dry"))
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(explain["data"], dry["data"]);
+    let data = &dry["data"];
+    assert_eq!(data["roots"], json!(["inspect"]));
+    assert_eq!(data["terminals"], json!(["test"]));
+    assert_eq!(data["workflow"]["inputs"]["profile"], "release");
+    assert_eq!(data["task_sources"]["inspect"]["workflow"], "verify");
+    assert_eq!(data["plan"]["tasks"][1]["depends_on"], json!(["inspect"]));
+    assert_eq!(
+        data["plan"]["tasks"][1]["inputs"][0]["from_task"],
+        "inspect"
+    );
+    assert_eq!(before, inspection_snapshot(harness.directory.path()));
+    assert!(!harness.log.exists());
+    let state_path = harness.state("inspection");
+    let real =
+        workflow_document(&harness.workflow_run_json("verify", &state_path, &["profile=release"]));
+    assert_eq!(real["data"]["run"]["status"], "completed");
+    assert_eq!(data["workflow"], read_state(&state_path)["workflow"]);
+}
+
+#[test]
+fn workflow_explain_and_dry_run_allow_root_named_instance() {
+    let harness = Harness::new();
+    harness.workflow_file(
+        "child",
+        &json!({
+            "schema_version": 1,
+            "name": "child",
+            "tasks": [{"id": "leaf", "program": "/fake/leaf"}]
+        }),
+    );
+    harness.workflow_file(
+        "release",
+        &json!({
+            "schema_version": 2,
+            "name": "release",
+            "tasks": [
+                {"id": "root", "workflow": "child"},
+                {"id": "other", "workflow": "child"}
+            ]
+        }),
+    );
+
+    let explain = workflow_document(
+        &harness
+            .command()
+            .args([
+                "--json", "--scope", "current", "workflow", "explain", "release",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let dry_run = workflow_document(
+        &harness
+            .command()
+            .args([
+                "--json",
+                "--scope",
+                "current",
+                "workflow",
+                "run",
+                "release",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(explain["data"], dry_run["data"]);
+
+    let data = &dry_run["data"];
+    assert_eq!(
+        data["graph"]["task_ids"],
+        json!(["root.leaf", "other.leaf"])
+    );
+    assert_eq!(
+        data["plan"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["root.leaf", "other.leaf"]
+    );
+
+    let tree = &data["composition_tree"]["root"];
+    assert_eq!(tree["workflow"], "release");
+    let children = tree["children"].as_array().unwrap();
+    assert_eq!(children.len(), 2);
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| child["instance"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("root"), json!("other")]
+    );
+    assert_eq!(
+        children
+            .iter()
+            .filter(|child| child["instance"] == "root")
+            .count(),
+        1
+    );
+    assert!(children.iter().all(|child| child["children"] == json!([])));
+    assert!(!harness.log.exists(), "inspection launched a supervisor");
+}
+
+#[test]
+fn workflow_explain_nested_root_named_instances_remain_structural() {
+    let harness = Harness::new();
+    harness.workflow_file(
+        "child",
+        &json!({
+            "schema_version": 1,
+            "name": "child",
+            "tasks": [{"id": "leaf", "program": "/fake/leaf"}]
+        }),
+    );
+    harness.workflow_file(
+        "middle",
+        &json!({
+            "schema_version": 2,
+            "name": "middle",
+            "tasks": [{"id": "inner", "workflow": "child"}]
+        }),
+    );
+    harness.workflow_file(
+        "release",
+        &json!({
+            "schema_version": 2,
+            "name": "release",
+            "tasks": [{"id": "root", "workflow": "middle"}]
+        }),
+    );
+
+    let data = &workflow_document(
+        &harness
+            .command()
+            .args([
+                "--json",
+                "--scope",
+                "current",
+                "workflow",
+                "run",
+                "release",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap(),
+    )["data"];
+    let tree = &data["composition_tree"]["root"];
+    assert_eq!(tree["workflow"], "release");
+    let root_instance = &tree["children"][0];
+    assert_eq!(root_instance["instance"], "root");
+    assert_eq!(root_instance["workflow"], "middle");
+    let inner_instance = &root_instance["children"][0];
+    assert_eq!(inner_instance["instance"], "root.inner");
+    assert_eq!(inner_instance["workflow"], "child");
+    assert_eq!(inner_instance["children"], json!([]));
+    assert_eq!(data["graph"]["task_ids"], json!(["root.inner.leaf"]));
+    assert!(!harness.log.exists(), "inspection launched a supervisor");
+}
+
+#[test]
+fn direct_run_uses_explicit_path_for_plan_named_explain() {
+    let harness = Harness::new();
+    let plan = harness.directory.path().join("explain");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "tasks": [task("work", &[])]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = harness.state("explain-plan");
+    let output = harness
+        .command()
+        .args([
+            "--json",
+            "run",
+            "--supervisor",
+            harness.supervisor.to_str().unwrap(),
+            "--state-path",
+            state.to_str().unwrap(),
+            "./explain",
+        ])
+        .output()
+        .unwrap();
+    let data = run_document(&output);
+    assert_eq!(data["data"]["run"]["status"], "completed");
+    assert_eq!(harness.requests().len(), 1);
+}
+
+#[test]
+fn workflow_explain_nested_repeated_composition_retains_exports_and_sources() {
+    let harness = Harness::new();
+    harness.workflow_file("leaf", &json!({"schema_version":2,"name":"leaf","tasks":[
+        {"id":"a","program":"/fake/a"},
+        {"id":"b","program":"/fake/b"},
+        {"id":"c","program":"/fake/c","depends_on":["a","b"],"outputs":[{"name":"result","type":"json","path":"result.json"}]}
+    ],"exports":{"result":{"from_task":"c","output":"result"}}}));
+    harness.workflow_file("middle", &json!({"schema_version":2,"name":"middle","tasks":[{"id":"inner","workflow":"leaf"}],"exports":{"forward":{"from_task":"inner","output":"result"}}}));
+    harness.workflow_file("root", &json!({"schema_version":2,"name":"root","tasks":[{"id":"left","workflow":"middle"},{"id":"right","workflow":"middle","depends_on":["left"]}],"exports":{"final":{"from_task":"right","output":"forward"}}}));
+    let output = workflow_document(
+        &harness
+            .command()
+            .args([
+                "--json",
+                "workflow",
+                "run",
+                "root",
+                "--dry-run",
+                "--jobs",
+                "4",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let data = &output["data"];
+    assert_eq!(data["roots"], json!(["left.inner.a", "left.inner.b"]));
+    assert_eq!(data["terminals"], json!(["right.inner.c"]));
+    assert_eq!(
+        data["workflow"]["composition"]["instances"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    let tree = &data["composition_tree"]["root"];
+    assert_eq!(tree["instance"], "root");
+    assert_eq!(tree["workflow"], "root");
+    let children = tree["children"].as_array().unwrap();
+    assert_eq!(children.len(), 2);
+    assert_eq!(
+        children
+            .iter()
+            .find(|child| child["instance"] == "left")
+            .unwrap()["children"][0]["instance"],
+        "left.inner"
+    );
+    assert_eq!(
+        data["task_sources"]["right.inner.c"],
+        json!({"workflow":"leaf","instance":"right.inner","task":"c", "definition_sha256": data["workflow"]["composition"]["instances"][3]["definition_sha256"]})
+    );
+    assert_eq!(
+        data["plan"]["tasks"][3]["depends_on"],
+        json!(["left.inner.c"])
+    );
+    assert_eq!(data["concurrency"]["dag_width"], 2);
+    assert_eq!(data["concurrency"]["maximum_parallel_tasks"], 2);
+    assert_eq!(data["bounds"]["depth"]["used"], 2);
+    assert_eq!(data["bounds"]["tasks"]["used"], 6);
+    let export = data["exports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "final")
+        .unwrap();
+    assert_eq!(export["producer_task"], "right.inner.c");
+    assert_eq!(export["producer_output"], "result");
+    let human = harness
+        .command()
+        .args(["workflow", "explain", "root"])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(text.contains("right.inner -> leaf"));
+    assert!(text.contains("right.inner.c"));
+    assert!(!harness.log.exists());
+    let state = harness.state("composed-inspection");
+    workflow_document(&harness.workflow_run_json("root", &state, &[]));
+    assert_eq!(data["workflow"], read_state(&state)["workflow"]);
+}
+
+#[test]
+fn workflow_explain_concurrency_uses_antichain_not_largest_layer() {
+    let harness = Harness::new();
+    harness.workflow_file("width", &json!({"schema_version":1,"name":"width","tasks":[
+        {"id":"a","program":"/fake/a"},{"id":"b","program":"/fake/b"},
+        {"id":"c","program":"/fake/c","depends_on":["b"]},{"id":"d","program":"/fake/d","depends_on":["b"]}
+    ]}));
+    let data = workflow_document(
+        &harness
+            .command()
+            .args([
+                "--json",
+                "workflow",
+                "run",
+                "width",
+                "--dry-run",
+                "--jobs",
+                "3",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(data["data"]["concurrency"]["dag_width"], 3);
+    assert_eq!(data["data"]["concurrency"]["maximum_parallel_tasks"], 3);
+}
+
+#[test]
+fn invalid_dry_run_rejects_before_any_execution_or_mutation() {
+    let harness = Harness::new();
+    let mut definition = reusable_verify_definition();
+    definition["tasks"][1]["depends_on"] = json!(["missing"]);
+    harness.workflow_file("verify", &definition);
+    let before = inspection_snapshot(harness.directory.path());
+    let output = harness
+        .command()
+        .args(["--json", "workflow", "run", "verify", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["ok"], false);
+    assert_eq!(before, inspection_snapshot(harness.directory.path()));
+    assert!(!harness.log.exists());
+    let output = harness
+        .command()
+        .args([
+            "workflow",
+            "run",
+            "verify",
+            "--dry-run",
+            "--resume",
+            "/tmp/unused",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(before, inspection_snapshot(harness.directory.path()));
+}
+
+#[test]
+fn workflow_explain_redacts_inputs_arguments_and_terminal_controls() {
+    let harness = Harness::new();
+    harness.workflow_file("secret", &json!({"schema_version":1,"name":"secret","inputs":{"token":{"type":"string","default":"never-print-this-secret"}},"tasks":[{"id":"task","program":"/fake/task","arguments":[{"workflow_input":"token"},"terminal\u{1b}[31m\nspoof"],"redact_argument_indexes":[0]}]}));
+    for args in [
+        vec!["--json", "workflow", "explain", "secret"],
+        vec!["workflow", "run", "secret", "--dry-run"],
+    ] {
+        let output = harness.command().args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("never-print-this-secret"));
+        assert!(!text.contains('\u{1b}'));
+        assert!(text.contains("<redacted>"));
+    }
+}
+
+#[test]
+fn real_go_inspection_dry_run_matches_execution_and_survives_deleted_definitions() {
+    let Some(supervisor) = real_supervisor_path() else {
+        return;
+    };
+    let harness = Harness::new();
+    harness.workflow_file("child", &json!({"schema_version":2,"name":"child","tasks":[{"id":"produce","program":"/usr/bin/python3","arguments":["-c","import json,os; p=json.loads(os.environ['RELAY_OUTPUT_MANIFEST'])['result']; open(p,'w').write('{\"ok\":true}')"],"outputs":[{"name":"result","type":"json","path":"result.json"}]}],"exports":{"result":{"from_task":"produce","output":"result"}}}));
+    harness.workflow_file("root", &json!({"schema_version":2,"name":"root","tasks":[{"id":"child-instance","workflow":"child"}]}));
+    let before = inspection_snapshot(harness.directory.path());
+    let dry = workflow_document(
+        &harness
+            .command()
+            .args(["--json", "workflow", "run", "root", "--dry-run"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(before, inspection_snapshot(harness.directory.path()));
+    let state = harness.state("real-inspection");
+    let real = workflow_document(
+        &harness
+            .command()
+            .args(["--json", "workflow", "run", "root", "--supervisor"])
+            .arg(supervisor)
+            .arg("--state-path")
+            .arg(&state)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(real["data"]["run"]["status"], "completed");
+    assert_eq!(dry["data"]["workflow"], read_state(&state)["workflow"]);
+    let inspect = || {
+        harness
+            .command()
+            .args(["--json", "run", "explain"])
+            .arg(&state)
+            .output()
+            .unwrap()
+    };
+    let original = inspect();
+    assert!(
+        original.status.success(),
+        "{}",
+        String::from_utf8_lossy(&original.stderr)
+    );
+    fs::write(
+        harness.directory.path().join("relay-workflows/root.json"),
+        b"not JSON",
+    )
+    .unwrap();
+    fs::write(
+        harness.directory.path().join("relay-workflows/child.json"),
+        b"changed",
+    )
+    .unwrap();
+    assert_eq!(original.stdout, inspect().stdout);
+    fs::remove_dir_all(harness.directory.path().join("relay-workflows")).unwrap();
+    assert_eq!(original.stdout, inspect().stdout);
+    let output: Value = serde_json::from_slice(&original.stdout).unwrap();
+    let text = output.to_string();
+    assert!(text.contains("child-instance.produce"));
+    let state_value = read_state(&state);
+    let producer = &record(&state_value, "child-instance.produce")["outputs"][0];
+    assert!(text.contains(producer["attempt_run_id"].as_str().unwrap()));
+}
+
+#[test]
+fn workflow_dry_run_preserves_symlink_rejection_and_terminal_safe_errors() {
+    let harness = Harness::new();
+    let outside = tempfile::tempdir().unwrap();
+    let definition = outside.path().join("source.json");
+    fs::write(
+        &definition,
+        serde_json::to_vec(&reusable_verify_definition()).unwrap(),
+    )
+    .unwrap();
+    let directory = harness.directory.path().join("relay-workflows");
+    fs::create_dir(&directory).unwrap();
+    symlink(&definition, directory.join("unsafe\u{1b}[31m.json")).unwrap();
+    let output = harness
+        .command()
+        .args(["workflow", "run", "verify", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("symlink"));
+    assert!(!error.contains('\u{1b}'));
+    assert!(!harness.log.exists());
+    assert!(!harness.directory.path().join(".relay").exists());
+}
+
+#[test]
+fn workflow_explain_redacts_composed_input_bindings() {
+    let harness = Harness::new();
+    harness.workflow_file("child", &json!({"schema_version":2,"name":"child","inputs":{"token":{"type":"string","required":true}},"tasks":[{"id":"task","program":"/fake/task","arguments":[{"workflow_input":"token"}],"redact_argument_indexes":[0]}]}));
+    harness.workflow_file("root", &json!({"schema_version":2,"name":"root","inputs":{"token":{"type":"string","default":"composed-secret-value"}},"tasks":[{"id":"child","workflow":"child","inputs":{"token":{"workflow_input":"token"}}}]}));
+    let output = harness
+        .command()
+        .args(["--json", "workflow", "explain", "root"])
+        .output()
+        .unwrap();
+    let data = workflow_document(&output);
+    assert_eq!(data["data"]["workflow"]["inputs"]["token"], "<redacted>");
+    assert_eq!(
+        data["data"]["workflow"]["composition"]["instances"][0]["resolved_inputs"]["token"],
+        "<redacted>"
+    );
+    assert!(
+        !String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("composed-secret-value")
+    );
+}
+
+fn run_explanation_document(output: &Output) -> Value {
+    assert!(
+        output.stderr.is_empty(),
+        "run explanation unexpectedly wrote stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "run explanation failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("run explanation JSON");
+    assert_eq!(document["output_schema_version"], 1);
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["command"], "run");
+    document
+}
+
+#[test]
+fn run_explain_reports_retry_and_persisted_output_provenance() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("produce", &["nonzero", "success"])]);
+    let mut producer = retry_task("produce", &[], 2, 0);
+    producer["outputs"] = json!([{"name":"summary","type":"json","path":"summary.json"}]);
+    let plan = harness.plan_v3("explain-success", json!([producer]));
+    let state = harness
+        .directory
+        .path()
+        .join(".relay/runs/explain-success.json");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    run_document(&harness.run_json(&plan, &state));
+
+    let persisted = read_state(&state);
+    let persisted_output = PathBuf::from(
+        record(&persisted, "produce")["outputs"][0]["path"]
+            .as_str()
+            .unwrap(),
+    );
+    fs::write(&persisted_output, b"changed-after-persistence").unwrap();
+    let output = harness
+        .command()
+        .args(["--json", "run", "explain", state.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let document = run_explanation_document(&output);
+    let task = &document["data"]["tasks"][0];
+    assert_eq!(document["data"]["run"]["status"], "completed");
+    assert_eq!(
+        document["data"]["run"]["aggregate_run_id"],
+        persisted["run_id"]
+    );
+    assert_eq!(task["retry"]["status"], "succeeded_after_retry");
+    assert_eq!(task["attempts_used"], 2);
+    assert_eq!(
+        task["attempts"][0]["attempt_run_id"],
+        attempts(&persisted, "produce")[0]["run_id"]
+    );
+    assert_eq!(task["trusted_outputs"][0]["producer_task"], "produce");
+    assert_eq!(
+        task["trusted_outputs"][0]["aggregate_run_id"],
+        persisted["run_id"]
+    );
+    assert_eq!(
+        task["trusted_outputs"][0]["attempt_run_id"],
+        attempts(&persisted, "produce")[1]["run_id"]
+    );
+    assert_eq!(
+        task["trusted_outputs"][0]["sha256"].as_str().unwrap().len(),
+        64
+    );
+    let by_id = harness
+        .command()
+        .args([
+            "--json",
+            "run",
+            "explain",
+            persisted["run_id"].as_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(by_id.stdout, output.stdout);
+}
+
+#[test]
+fn run_explain_reports_failed_and_blocked_tasks() {
+    let harness = Harness::new();
+    harness.configure_sequences(&[("failed", &["nonzero", "nonzero"])]);
+    let plan = harness.plan_v3(
+        "explain-failure",
+        json!([
+            retry_task("failed", &[], 2, 0),
+            task("blocked", &["failed"])
+        ]),
+    );
+    let state = harness
+        .directory
+        .path()
+        .join(".relay/runs/explain-failure.json");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    let run = run_document(&harness.run_json(&plan, &state));
+    assert_eq!(run["data"]["run"]["status"], "failed");
+
+    let document = run_explanation_document(
+        &harness
+            .command()
+            .args(["--json", "run", "explain", state.to_str().unwrap()])
+            .output()
+            .unwrap(),
+    );
+    let tasks = document["data"]["tasks"].as_array().unwrap();
+    let failed = tasks.iter().find(|task| task["id"] == "failed").unwrap();
+    let blocked = tasks.iter().find(|task| task["id"] == "blocked").unwrap();
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["latest_reason"], "exit code 17");
+    assert_eq!(failed["attempts_used"], 2);
+    assert_eq!(failed["retry"]["status"], "exhausted");
+    assert_eq!(blocked["status"], "blocked");
+    assert_eq!(blocked["blocking_dependencies"][0]["task"], "failed");
+    assert_eq!(blocked["blocking_dependencies"][0]["status"], "failed");
+}
+
+#[test]
+fn run_explain_reports_indeterminate_reconciliation_without_revalidating_outputs() {
+    let harness = Harness::new();
+    harness.configure(&[("broken", "malformed_output")]);
+    let mut broken = task("broken", &[]);
+    broken["outputs"] = json!([{"name":"summary","type":"json","path":"summary.json"}]);
+    let plan = harness.plan_v3("explain-indeterminate", json!([broken]));
+    let state = harness
+        .directory
+        .path()
+        .join(".relay/runs/explain-indeterminate.json");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    let run = run_document(&harness.run_json(&plan, &state));
+    assert_eq!(run["data"]["run"]["status"], "indeterminate");
+    let output = harness
+        .command()
+        .args(["--json", "run", "explain", state.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let document = run_explanation_document(&output);
+    assert_eq!(
+        document["data"]["reconciliation"]["status"],
+        "indeterminate"
+    );
+    assert_eq!(
+        document["data"]["tasks"][0]["reconciliation"],
+        "indeterminate_no_automatic_retry"
+    );
+    assert_eq!(
+        document["data"]["tasks"][0]["attempts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn run_explain_redacts_persisted_workflow_inputs() {
+    let harness = Harness::new();
+    harness.workflow_file(
+        "secret-run",
+        &json!({
+            "schema_version":1,
+            "name":"secret-run",
+            "inputs":{"token":{"type":"string","default":"persisted-secret-value"}},
+            "tasks":[{"id":"task","program":"/fake/task","arguments":[{"workflow_input":"token"}],"redact_argument_indexes":[0]}]
+        }),
+    );
+    let state = harness.directory.path().join(".relay/runs/secret-run.json");
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    let run = harness.workflow_run_json("secret-run", &state, &[]);
+    assert!(run.status.success(), "workflow run failed: {:?}", run);
+    fs::remove_dir_all(harness.directory.path().join("relay-workflows")).unwrap();
+    let output = harness
+        .command()
+        .args(["--json", "run", "explain", state.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let document = run_explanation_document(&output);
+    assert_eq!(
+        document["data"]["run"]["workflow"]["inputs"]["token"],
+        "<redacted>"
+    );
+    assert!(
+        !String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("persisted-secret-value")
     );
 }

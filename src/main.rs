@@ -33,7 +33,14 @@ fn main() -> ExitCode {
         }
     };
     if let Command::Workflow(args) = cli.command {
-        let project = match project::discover_workflow(&invocation_directory, cli.scope) {
+        let inspection = matches!(&args.command, relay::cli::WorkflowCommand::Explain(_))
+            || matches!(&args.command, relay::cli::WorkflowCommand::Run(run) if run.dry_run);
+        let discovery = if inspection {
+            project::discover_inspection(&invocation_directory, cli.scope, true)
+        } else {
+            project::discover_workflow(&invocation_directory, cli.scope)
+        };
+        let project = match discovery {
             Ok(project) => project,
             Err(error) => {
                 emit_error(
@@ -74,7 +81,12 @@ fn main() -> ExitCode {
         };
     }
     if let Command::Run(args) = cli.command {
-        let project = match project::discover(&invocation_directory, cli.scope) {
+        let discovery = if args.command.is_some() {
+            project::discover_inspection(&invocation_directory, cli.scope, false)
+        } else {
+            project::discover(&invocation_directory, cli.scope)
+        };
+        let project = match discovery {
             Ok(project) => project,
             Err(error) => {
                 emit_error(
@@ -86,6 +98,15 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        if let Some(relay::cli::RunCommand::Explain { state_or_run }) = &args.command {
+            return match orchestrate::explain(state_or_run, &project.relay_project_root) {
+                Ok(output) => emit_success(json_output, command_name, output),
+                Err(error) => {
+                    emit_run_error(json_output, command_name, &error);
+                    ExitCode::FAILURE
+                }
+            };
+        }
         return match orchestrate::run(args, &invocation_directory, &project.relay_project_root) {
             Ok(result) => {
                 let exit_code = if result.succeeded() {
@@ -248,7 +269,15 @@ fn emit_error(json_output: bool, command: &str, code: &str, message: &str) {
             .expect("serializing a Relay error envelope cannot fail")
         );
     } else {
-        let _ = writeln!(stderr, "error: {message}");
+        let mut safe = String::with_capacity(message.len());
+        for ch in message.chars() {
+            if ch.is_control() || matches!(ch, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+                safe.extend(ch.escape_default());
+            } else {
+                safe.push(ch);
+            }
+        }
+        let _ = writeln!(stderr, "error: {safe}");
     }
 }
 

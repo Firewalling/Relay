@@ -384,14 +384,18 @@ fn decode_plan_value(value: Value) -> Result<Plan, String> {
         schema_version => Err(format!("unsupported plan schema_version {schema_version}")),
     }
 }
-pub(crate) fn validate_plan_value(
+pub(crate) fn resolve_plan_value(
     value: Value,
     invocation_directory: &Path,
-) -> Result<(), RunError> {
-    let plan = serde_json::from_value::<Plan>(value).map_err(|error| {
+) -> Result<Value, RunError> {
+    let mut plan = serde_json::from_value::<Plan>(value).map_err(|error| {
         RunError::Plan(format!("could not decode resolved workflow plan: {error}"))
     })?;
-    validate_plan(&plan, invocation_directory)
+    validate_plan(&plan, invocation_directory)?;
+    resolve_working_directories(&mut plan, invocation_directory, None)?;
+    validate_encoded_plan_size(&plan)?;
+    serde_json::to_value(plan)
+        .map_err(|error| RunError::Plan(format!("plan cannot be encoded: {error}")))
 }
 fn validate_encoded_plan_size(plan: &Plan) -> Result<(), RunError> {
     let bytes = serde_json::to_vec(plan)
@@ -576,6 +580,64 @@ pub struct WorkflowCompositionInstance {
     pub schema_version: u32,
     pub definition_sha256: String,
     pub resolved_inputs: BTreeMap<String, Value>,
+}
+
+pub(crate) fn composition_tree(metadata: &WorkflowRunMetadata) -> Value {
+    let root = composition_tree_node(metadata, None, None);
+    json!({"root": root})
+}
+
+fn composition_tree_node(
+    metadata: &WorkflowRunMetadata,
+    path: Option<&str>,
+    instance: Option<&WorkflowCompositionInstance>,
+) -> Value {
+    let (workflow, schema_version, definition_sha256, resolved_inputs) = match instance {
+        Some(instance) => (
+            instance.workflow.as_str(),
+            instance.schema_version,
+            instance.definition_sha256.as_str(),
+            &instance.resolved_inputs,
+        ),
+        None => (
+            metadata.name.as_str(),
+            metadata.schema_version,
+            metadata
+                .composition
+                .as_ref()
+                .map_or(metadata.definition_sha256.as_str(), |composition| {
+                    composition.root_definition_sha256.as_str()
+                }),
+            &metadata.inputs,
+        ),
+    };
+    let source_graph_sha256 = (instance.is_none() && metadata.composition.is_some())
+        .then_some(metadata.definition_sha256.as_str());
+    let children = metadata
+        .composition
+        .as_ref()
+        .into_iter()
+        .flat_map(|composition| composition.instances.iter())
+        .filter(|candidate| {
+            candidate
+                .instance
+                .rsplit_once('.')
+                .map(|(parent, _)| parent)
+                == path
+        })
+        .map(|candidate| {
+            composition_tree_node(metadata, Some(candidate.instance.as_str()), Some(candidate))
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "instance": path.unwrap_or("root"),
+        "workflow": workflow,
+        "schema_version": schema_version,
+        "definition_sha256": definition_sha256,
+        "source_graph_sha256": source_graph_sha256,
+        "resolved_inputs": resolved_inputs,
+        "children": children,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1459,16 +1521,437 @@ fn reconcile_running_attempts(
     Ok(reports)
 }
 
+fn explain_task_source(workflow: Option<&WorkflowRunMetadata>, task_id: &str) -> Value {
+    let Some(workflow) = workflow else {
+        return Value::Null;
+    };
+    let instance = workflow
+        .composition
+        .as_ref()
+        .into_iter()
+        .flat_map(|composition| composition.instances.iter())
+        .filter(|candidate| {
+            let prefix = format!("{}.", candidate.instance);
+            task_id.starts_with(&prefix)
+        })
+        .max_by_key(|candidate| candidate.instance.len());
+    let (instance_path, source_task, definition_sha256) = match instance {
+        Some(instance) => {
+            let prefix = format!("{}.", instance.instance);
+            (
+                instance.instance.as_str(),
+                task_id.strip_prefix(&prefix).unwrap_or(task_id),
+                instance.definition_sha256.as_str(),
+            )
+        }
+        None => (
+            "root",
+            task_id,
+            workflow
+                .composition
+                .as_ref()
+                .map_or(workflow.definition_sha256.as_str(), |composition| {
+                    composition.root_definition_sha256.as_str()
+                }),
+        ),
+    };
+    json!({
+        "workflow": instance.map_or(workflow.name.as_str(), |value| value.workflow.as_str()),
+        "instance": instance_path,
+        "source_task": source_task,
+        "definition_sha256": definition_sha256,
+    })
+}
+fn redact_explanation_value(value: &mut Value, secrets: &[String]) {
+    match value {
+        Value::String(text) => {
+            if secrets
+                .iter()
+                .any(|secret| !secret.is_empty() && text.contains(secret))
+            {
+                *text = "<redacted>".into();
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_explanation_value(value, secrets);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_explanation_value(value, secrets);
+            }
+        }
+        Value::Number(_) | Value::Bool(_) if secrets.contains(&value.to_string()) => {
+            *value = json!("<redacted>");
+        }
+        Value::Null | Value::Number(_) | Value::Bool(_) => {}
+    }
+}
+
+fn redact_explanation_text(text: String, secrets: &[String]) -> String {
+    if secrets
+        .iter()
+        .any(|secret| !secret.is_empty() && text.contains(secret))
+    {
+        "<redacted>".into()
+    } else {
+        text
+    }
+}
+
+fn resolve_run_selector(selector: &Path, project_root: &Path) -> Result<PathBuf, RunError> {
+    let Some(id) = selector
+        .to_str()
+        .filter(|value| value.parse::<Uuid>().is_ok())
+        .map(str::to_owned)
+    else {
+        return Ok(if selector.is_absolute() {
+            selector.to_owned()
+        } else {
+            project_root.join(selector)
+        });
+    };
+    let runs = project_root.join(".relay/runs");
+    let default = runs.join(format!("{id}.json"));
+    match fs::symlink_metadata(&default) {
+        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+            return Ok(default);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(RunError::State(format!(
+                "could not inspect {}: {error}",
+                default.display()
+            )));
+        }
+    }
+    if fs::symlink_metadata(&runs)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Ok(default);
+    }
+    let entries = match fs::read_dir(&runs) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(default),
+        Err(error) => {
+            return Err(RunError::State(format!(
+                "could not inspect {}: {error}",
+                runs.display()
+            )));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| RunError::State(error.to_string()))?;
+        if !entry
+            .file_type()
+            .map_err(|error| RunError::State(error.to_string()))?
+            .is_file()
+        {
+            continue;
+        }
+        let candidate = entry.path();
+        let Ok((canonical, bytes)) = read_handoff_state(&candidate) else {
+            continue;
+        };
+        let Ok(state) = decode_run_state(&bytes, &canonical) else {
+            continue;
+        };
+        if state.run_id == id {
+            return Ok(candidate);
+        }
+    }
+    Ok(default)
+}
+
+pub fn explain(selector: &Path, project_root: &Path) -> Result<RunOutput, RunError> {
+    let path = resolve_run_selector(selector, project_root)?;
+    validate_state_path(&path, project_root)?;
+    let project =
+        fs::canonicalize(project_root).map_err(|error| RunError::State(error.to_string()))?;
+    let (canonical_path, bytes) = read_handoff_state(&path)?;
+    if !canonical_path.starts_with(&project) {
+        return Err(RunError::State(
+            "run explanation requires a project-local state path".into(),
+        ));
+    }
+    let state = decode_run_state(&bytes, &canonical_path)?;
+    validate_encoded_plan_size(&state.plan)?;
+    validate_plan(&state.plan, project_root)?;
+    validate_historical_state(&state, &state.plan, &canonical_path, project_root)?;
+    let redacted = state
+        .plan
+        .tasks
+        .iter()
+        .any(|task| !task.redact_argument_indexes.is_empty());
+    let mut redaction_secrets = Vec::new();
+    if redacted && let Some(workflow) = state.workflow.as_ref() {
+        redaction_secrets.extend(
+            workflow
+                .inputs
+                .values()
+                .filter_map(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        );
+        if let Some(composition) = workflow.composition.as_ref() {
+            redaction_secrets.extend(
+                composition
+                    .instances
+                    .iter()
+                    .flat_map(|instance| instance.resolved_inputs.values())
+                    .filter_map(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+    }
+    let mut workflow = json!(state.workflow);
+    if redacted {
+        if let Some(inputs) = workflow.get_mut("inputs").and_then(Value::as_object_mut) {
+            inputs
+                .values_mut()
+                .for_each(|value| *value = json!("<redacted>"));
+        }
+        if let Some(instances) = workflow
+            .get_mut("composition")
+            .and_then(|c| c.get_mut("instances"))
+            .and_then(Value::as_array_mut)
+        {
+            for instance in instances {
+                if let Some(inputs) = instance["resolved_inputs"].as_object_mut() {
+                    inputs
+                        .values_mut()
+                        .for_each(|value| *value = json!("<redacted>"));
+                }
+            }
+        }
+    }
+    let reconciliation_status = match state.status {
+        RunStatus::Indeterminate => "indeterminate",
+        RunStatus::Running => "requires_live_reconciliation",
+        _ => "no_unresolved_attempts",
+    };
+    let workflow_name = workflow
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("direct plan");
+    let definition_sha256 = workflow.get("definition_sha256").and_then(Value::as_str);
+    let resolved_plan_sha256 = workflow.get("resolved_plan_sha256").and_then(Value::as_str);
+    let composition_instances = workflow
+        .get("composition")
+        .and_then(|value| value.get("instances"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let mut human = format!(
+        "Run: {}\nStatus: {}\nWorkflow: {}\nReconciliation: {} (persisted evidence only; reconciliation history is not recorded)",
+        state.run_id,
+        state.status.as_str(),
+        workflow_name,
+        reconciliation_status
+    );
+    human.push_str(&format!(
+        "\nDefinition: {}\nResolved plan: {}\nComposition instances: {}",
+        definition_sha256.unwrap_or("unavailable"),
+        resolved_plan_sha256.unwrap_or("unavailable"),
+        composition_instances
+    ));
+    let mut tasks = Vec::with_capacity(state.tasks.len());
+    for (task, plan_task) in state.tasks.iter().zip(&state.plan.tasks) {
+        let maximum = plan_task
+            .retry
+            .as_ref()
+            .map_or(1, |retry| retry.max_attempts);
+        let retryable = task
+            .summary
+            .as_ref()
+            .is_some_and(execution_summary_is_retryable_failure);
+        let retry = if task.status == TaskStatus::Indeterminate {
+            "refused_indeterminate"
+        } else if task.status == TaskStatus::Succeeded {
+            if task.attempts.len() > 1 {
+                "succeeded_after_retry"
+            } else {
+                "not_needed"
+            }
+        } else if task.retry_ready_at.is_some() {
+            "scheduled"
+        } else if plan_task.retry.is_none() {
+            "disabled"
+        } else if task.status == TaskStatus::Failed
+            && retryable
+            && task.attempts.len() >= maximum as usize
+        {
+            "exhausted"
+        } else if task.status == TaskStatus::Failed || task.status == TaskStatus::Cancelled {
+            "not_retryable"
+        } else {
+            "available"
+        };
+        let latest_reason = task
+            .summary
+            .as_ref()
+            .and_then(|summary| {
+                summary
+                    .exit_code
+                    .filter(|code| *code != 0)
+                    .map(|code| format!("exit code {code}"))
+            })
+            .or_else(|| {
+                task.summary
+                    .as_ref()
+                    .and_then(|summary| summary.failure_message.clone())
+            })
+            .or_else(|| task.reason.clone())
+            .map(|reason| redact_explanation_text(reason, &redaction_secrets));
+        let mut dependencies: Vec<_> = plan_task
+            .depends_on
+            .iter()
+            .map(|id| {
+                let dependency = state
+                    .tasks
+                    .iter()
+                    .find(|t| &t.id == id)
+                    .expect("validated dependency");
+                json!({"task": id, "status": dependency.status, "reason": dependency.reason})
+            })
+            .collect();
+        for dependency in &mut dependencies {
+            redact_explanation_value(dependency, &redaction_secrets);
+        }
+        let blocking: Vec<_> = dependencies
+            .iter()
+            .filter(|dependency| dependency["status"] != "succeeded")
+            .cloned()
+            .collect();
+        let source = explain_task_source(state.workflow.as_ref(), &task.id);
+        let mut outputs = json!(task.outputs.as_deref().unwrap_or_default());
+        let mut attempts = json!(task.attempts);
+        for output in outputs.as_array_mut().expect("validated output array") {
+            output["aggregate_run_id"] = json!(state.run_id);
+        }
+        for attempt in attempts.as_array_mut().expect("validated attempt array") {
+            attempt["attempt_number"] = attempt["attempt"].clone();
+            attempt["attempt_run_id"] = attempt["run_id"].clone();
+            attempt["aggregate_run_id"] = json!(state.run_id);
+        }
+        redact_explanation_value(&mut outputs, &redaction_secrets);
+        redact_explanation_value(&mut attempts, &redaction_secrets);
+        if redacted {
+            // Persisted argv cannot identify the original secret. Withhold payload
+            // values, not producer identity, rather than guess which are safe.
+            for output in outputs.as_array_mut().unwrap() {
+                output["value"] = json!("<redacted>");
+            }
+            for attempt in attempts.as_array_mut().unwrap() {
+                if let Some(outputs) = attempt.get_mut("outputs").and_then(Value::as_array_mut) {
+                    for output in outputs {
+                        output["value"] = json!("<redacted>");
+                    }
+                }
+            }
+        }
+        let reconciliation = match task.status {
+            TaskStatus::Indeterminate => "indeterminate_no_automatic_retry",
+            TaskStatus::Running => "requires_live_reconciliation",
+            _ => "no_unresolved_attempt",
+        };
+        let mut reason = json!(task.reason);
+        redact_explanation_value(&mut reason, &redaction_secrets);
+        human.push_str(&format!("\n\n{}\nStatus: {}\nDependencies: {}\nAttempts: {} / {}\nRetry: {}\nReconciliation: {}", task.id, task.status.as_str(), json!(plan_task.depends_on), task.attempts.len(), maximum, retry, reconciliation));
+        if let Some(reason) = &latest_reason {
+            human.push_str(&format!("\nLatest reason: {}", json!(reason)));
+        }
+        if task.status == TaskStatus::Blocked {
+            for dependency in &blocking {
+                human.push_str(&format!(
+                    "\nReason: dependency \x60{}\x60 {}",
+                    dependency["task"].as_str().unwrap(),
+                    dependency["status"].as_str().unwrap()
+                ));
+            }
+        }
+        for attempt in attempts.as_array().unwrap() {
+            human.push_str(&format!(
+                "\n  Attempt {}: {} (attempt run {}, aggregate run {})",
+                attempt["attempt_number"],
+                attempt["status"],
+                attempt["attempt_run_id"],
+                attempt["aggregate_run_id"]
+            ));
+        }
+        human.push_str(&format!(
+            "\nTrusted outputs (persisted provenance; files not revalidated): {}",
+            outputs
+        ));
+        tasks.push(json!({
+            "id": task.id,
+            "status": task.status,
+            "source": source,
+            "aggregate_run_id": state.run_id,
+            "depends_on": plan_task.depends_on,
+            "dependencies": dependencies,
+            "blocking_dependencies": blocking,
+            "reason": reason,
+            "latest_reason": latest_reason,
+            "attempts": attempts,
+            "attempts_used": task.attempts.len(),
+            "max_attempts": maximum,
+            "retry": {
+                "status": retry,
+                "delay_ms": plan_task.retry.as_ref().map_or(0, |r| r.delay_ms),
+                "ready_at": task.retry_ready_at,
+            },
+            "reconciliation": reconciliation,
+            "trusted_outputs": outputs,
+            "output_inputs": plan_task.inputs,
+        }));
+    }
+    Ok(RunOutput {
+        human,
+        data: json!({
+            "run": {
+                "run_id": state.run_id,
+                "aggregate_run_id": state.run_id,
+                "status": state.status,
+                "state_path": state.state_path,
+                "workflow": workflow.clone(),
+                "resolved_plan_sha256": workflow
+                    .get("resolved_plan_sha256")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "jobs": state.jobs,
+                "created_at": state.created_at,
+                "updated_at": state.updated_at,
+                "cancellation_requested": state.cancellation_requested,
+            },
+            "tasks": tasks,
+            "reconciliation": {
+                "status": reconciliation_status,
+                "mode": "persisted_only",
+                "history": "not_recorded",
+            },
+            "output_verification": "persisted_provenance_only",
+        }),
+    })
+}
+
 pub fn run(
     args: RunArgs,
     invocation_directory: &Path,
     project_root: &Path,
 ) -> Result<RunResult, RunError> {
-    let raw_plan = read_bounded(&args.plan, MAX_PLAN_BYTES).map_err(|error| {
-        RunError::Plan(format!("could not read {}: {error}", args.plan.display()))
+    let plan_path = args
+        .plan
+        .as_deref()
+        .ok_or_else(|| RunError::Plan("a plan is required".into()))?;
+    let raw_plan = read_bounded(plan_path, MAX_PLAN_BYTES).map_err(|error| {
+        RunError::Plan(format!("could not read {}: {error}", plan_path.display()))
     })?;
     let plan: Plan = serde_json::from_slice(&raw_plan).map_err(|error| {
-        RunError::Plan(format!("could not decode {}: {error}", args.plan.display()))
+        RunError::Plan(format!("could not decode {}: {error}", plan_path.display()))
     })?;
     run_plan(
         args,
@@ -3067,7 +3550,7 @@ fn sanitize_plan(plan: &Plan) -> Plan {
     sanitized
 }
 
-fn validate_state_path(path: &Path, project_root: &Path) -> Result<(), RunError> {
+pub(crate) fn validate_state_path(path: &Path, project_root: &Path) -> Result<(), RunError> {
     if !path.is_absolute() {
         return Err(RunError::State("state path must be absolute".into()));
     }
@@ -4047,7 +4530,7 @@ fn attempt_status_from_task_status(status: TaskStatus) -> Option<AttemptStatus> 
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
-fn validate_workflow_metadata(workflow: &WorkflowRunMetadata) -> Result<(), RunError> {
+pub(crate) fn validate_workflow_metadata(workflow: &WorkflowRunMetadata) -> Result<(), RunError> {
     if !valid_workflow_name(&workflow.name) {
         return Err(RunError::State(format!(
             "persisted workflow name {:?} is invalid",
@@ -4197,6 +4680,7 @@ fn validate_attempt_outputs(
     aggregate_run_id: &str,
     plan_task: &PlanTask,
     attempt: &AttemptRecord,
+    verify_artifacts: bool,
 ) -> Result<(), RunError> {
     let Some(outputs) = &attempt.outputs else {
         if attempt.status == AttemptStatus::Succeeded && !plan_task.outputs.is_empty() {
@@ -4252,11 +4736,19 @@ fn validate_attempt_outputs(
         let path = Path::new(&record.path);
         match record.output_type {
             OutputType::Json => {
-                if record.size_bytes > MAX_STRUCTURED_OUTPUT_BYTES as u64 {
+                if record.size_bytes > MAX_STRUCTURED_OUTPUT_BYTES as u64
+                    || serde_json::to_vec(&record.value)
+                        .map_err(|error| RunError::State(error.to_string()))?
+                        .len()
+                        > MAX_STRUCTURED_OUTPUT_BYTES
+                {
                     return Err(RunError::State(format!(
                         "structured output {:?} exceeds its bound",
                         record.name
                     )));
+                }
+                if !verify_artifacts {
+                    continue;
                 }
                 let (bytes, size, sha256) =
                     read_hashed_output(path, MAX_STRUCTURED_OUTPUT_BYTES as u64, true)
@@ -4299,6 +4791,12 @@ fn validate_attempt_outputs(
                         record.name
                     )));
                 }
+                if record.size_bytes > MAX_ARTIFACT_FILE_BYTES {
+                    return Err(RunError::State("artifact size exceeds its bound".into()));
+                }
+                if !verify_artifacts {
+                    continue;
+                }
                 let (bytes, size, sha256) =
                     read_hashed_output(path, MAX_ARTIFACT_FILE_BYTES, false)
                         .map_err(RunError::State)?;
@@ -4320,9 +4818,16 @@ fn validate_task_outputs(
     aggregate_run_id: &str,
     plan_task: &PlanTask,
     task: &TaskRecord,
+    verify_artifacts: bool,
 ) -> Result<(), RunError> {
     for attempt in &task.attempts {
-        validate_attempt_outputs(project_root, aggregate_run_id, plan_task, attempt)?;
+        validate_attempt_outputs(
+            project_root,
+            aggregate_run_id,
+            plan_task,
+            attempt,
+            verify_artifacts,
+        )?;
     }
     let should_have_outputs = task.status == TaskStatus::Succeeded && !plan_task.outputs.is_empty();
     if task.outputs.is_some() != should_have_outputs {
@@ -4351,6 +4856,33 @@ fn validate_resume_state(
     state_path: &Path,
     project_root: &Path,
     reject_redacted: bool,
+) -> Result<(), RunError> {
+    validate_resume_state_with_artifacts(
+        state,
+        plan,
+        state_path,
+        project_root,
+        reject_redacted,
+        true,
+    )
+}
+
+fn validate_historical_state(
+    state: &RunState,
+    plan: &Plan,
+    state_path: &Path,
+    project_root: &Path,
+) -> Result<(), RunError> {
+    validate_resume_state_with_artifacts(state, plan, state_path, project_root, false, false)
+}
+
+fn validate_resume_state_with_artifacts(
+    state: &RunState,
+    plan: &Plan,
+    state_path: &Path,
+    project_root: &Path,
+    reject_redacted: bool,
+    verify_artifacts: bool,
 ) -> Result<(), RunError> {
     if state.schema_version != RUN_STATE_SCHEMA_VERSION {
         return Err(RunError::State(format!(
@@ -4410,8 +4942,20 @@ fn validate_resume_state(
     let mut supervisor_paths = HashSet::new();
     for (index, task) in state.tasks.iter().enumerate() {
         let plan_task = &plan.tasks[index];
-        validate_attempt_history(task, plan_task, &mut attempt_ids, &mut supervisor_paths)?;
-        validate_task_outputs(project_root, &state.run_id, plan_task, task)?;
+        validate_attempt_history(
+            task,
+            plan_task,
+            &mut attempt_ids,
+            &mut supervisor_paths,
+            verify_artifacts,
+        )?;
+        validate_task_outputs(
+            project_root,
+            &state.run_id,
+            plan_task,
+            task,
+            verify_artifacts,
+        )?;
         let has_current = task.attempt_run_id.is_some() && task.supervisor_state_path.is_some();
         if task.attempt_run_id.is_some() != task.supervisor_state_path.is_some() {
             return Err(RunError::State(format!(
@@ -4604,6 +5148,7 @@ fn validate_attempt_history<'a>(
     plan_task: &PlanTask,
     attempt_ids: &mut HashSet<&'a str>,
     supervisor_paths: &mut HashSet<&'a Path>,
+    verify_live_paths: bool,
 ) -> Result<(), RunError> {
     if task.attempts.len() > MAX_RETRY_ATTEMPTS as usize {
         return Err(RunError::State(format!(
@@ -4646,7 +5191,10 @@ fn validate_attempt_history<'a>(
             )));
         }
         let supervisor_path = Path::new(&attempt.supervisor_state_path);
-        validate_supervisor_state_path(supervisor_path)?;
+        validate_supervisor_state_path_shape(supervisor_path)?;
+        if verify_live_paths {
+            reject_symlinked_components(supervisor_path)?;
+        }
         if supervisor_path.file_stem() != Some(OsStr::new(&attempt.run_id))
             || supervisor_path.extension() != Some(OsStr::new("json"))
         {
@@ -4986,6 +5534,11 @@ fn expected_supervisor_state_path(attempt_run_id: &str) -> PathBuf {
 }
 
 fn validate_supervisor_state_path(path: &Path) -> Result<(), RunError> {
+    validate_supervisor_state_path_shape(path)?;
+    reject_symlinked_components(path)
+}
+
+fn validate_supervisor_state_path_shape(path: &Path) -> Result<(), RunError> {
     if !path.is_absolute() || normalize_absolute(path)? != path {
         return Err(RunError::State(format!(
             "supervisor state path must be normalized and absolute: {}",
@@ -5001,7 +5554,7 @@ fn validate_supervisor_state_path(path: &Path) -> Result<(), RunError> {
             path.display()
         )));
     }
-    reject_symlinked_components(path)
+    Ok(())
 }
 
 fn supervisor_state_path(attempt_run_id: &str) -> Result<PathBuf, RunError> {

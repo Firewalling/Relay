@@ -130,6 +130,8 @@ pub enum WorkflowCommand {
     Show(WorkflowNameArgs),
     /// Parse and validate one reusable workflow.
     Validate(WorkflowValidateArgs),
+    /// Explain the resolved workflow without executing it.
+    Explain(WorkflowValidateArgs),
     /// Run one reusable workflow through the existing coordinator.
     Run(WorkflowRunArgs),
 }
@@ -159,6 +161,9 @@ pub struct WorkflowValidateArgs {
         .multiple(false)
 ))]
 pub struct WorkflowRunArgs {
+    /// Resolve, validate, explain, and exit without execution or writes.
+    #[arg(long, conflicts_with = "resume")]
+    pub dry_run: bool,
     /// Absolute path to the relay-supervisor executable.
     #[arg(long)]
     pub supervisor: Option<std::path::PathBuf>,
@@ -208,12 +213,15 @@ pub fn generate_completions(shell: CompletionShell) {
 }
 
 #[derive(Debug, Args)]
+#[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
 #[command(group(
     ArgGroup::new("state")
         .args(["state_path", "resume"])
         .multiple(false)
 ))]
 pub struct RunArgs {
+    #[command(subcommand)]
+    pub command: Option<RunCommand>,
     /// Absolute path to the relay-supervisor executable.
     #[arg(long)]
     pub supervisor: Option<std::path::PathBuf>,
@@ -227,7 +235,14 @@ pub struct RunArgs {
     #[arg(long)]
     pub resume: Option<std::path::PathBuf>,
     /// Task plan JSON file.
-    pub plan: std::path::PathBuf,
+    #[arg(required = true)]
+    pub plan: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RunCommand {
+    /// Explain a persisted run without execution or reconciliation.
+    Explain { state_or_run: std::path::PathBuf },
 }
 
 #[derive(Debug, Args)]
@@ -564,6 +579,37 @@ mod tests {
             Command::Run(RunArgs { jobs: 65, .. })
         ));
         assert!(zero.is_err());
+    }
+
+    #[test]
+    fn run_inspection_cannot_be_combined_with_execution_arguments() {
+        let cli = Cli::try_parse_from(["relay", "run", "explain", "state.json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run(RunArgs {
+                command: Some(RunCommand::Explain { .. }),
+                plan: None,
+                ..
+            })
+        ));
+        let escaped = Cli::try_parse_from(["relay", "run", "./explain"]).unwrap();
+        let Command::Run(RunArgs {
+            command: None,
+            plan: Some(plan),
+            ..
+        }) = escaped.command
+        else {
+            panic!("expected an explicitly qualified plan path");
+        };
+        assert_eq!(plan, std::path::PathBuf::from("./explain"));
+        assert!(Cli::try_parse_from(["relay", "run"]).is_err());
+        assert!(Cli::try_parse_from(["relay", "run", "explain"]).is_err());
+        assert!(
+            Cli::try_parse_from(["relay", "run", "--jobs", "2", "explain", "state.json"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["relay", "run", "plan.json", "explain", "state.json"]).is_err()
+        );
     }
 
     #[test]
