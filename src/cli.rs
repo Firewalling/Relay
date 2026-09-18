@@ -592,6 +592,16 @@ mod tests {
                 ..
             })
         ));
+        let escaped = Cli::try_parse_from(["relay", "run", "./explain"]).unwrap();
+        let Command::Run(RunArgs {
+            command: None,
+            plan: Some(plan),
+            ..
+        }) = escaped.command
+        else {
+            panic!("expected an explicitly qualified plan path");
+        };
+        assert_eq!(plan, std::path::PathBuf::from("./explain"));
         assert!(Cli::try_parse_from(["relay", "run"]).is_err());
         assert!(Cli::try_parse_from(["relay", "run", "explain"]).is_err());
         assert!(

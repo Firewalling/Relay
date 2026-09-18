@@ -6745,6 +6745,180 @@ fn workflow_explain_and_dry_run_are_read_only_and_match_real_identity() {
 }
 
 #[test]
+fn workflow_explain_and_dry_run_allow_root_named_instance() {
+    let harness = Harness::new();
+    harness.workflow_file(
+        "child",
+        &json!({
+            "schema_version": 1,
+            "name": "child",
+            "tasks": [{"id": "leaf", "program": "/fake/leaf"}]
+        }),
+    );
+    harness.workflow_file(
+        "release",
+        &json!({
+            "schema_version": 2,
+            "name": "release",
+            "tasks": [
+                {"id": "root", "workflow": "child"},
+                {"id": "other", "workflow": "child"}
+            ]
+        }),
+    );
+
+    let explain = workflow_document(
+        &harness
+            .command()
+            .args([
+                "--json", "--scope", "current", "workflow", "explain", "release",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let dry_run = workflow_document(
+        &harness
+            .command()
+            .args([
+                "--json",
+                "--scope",
+                "current",
+                "workflow",
+                "run",
+                "release",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(explain["data"], dry_run["data"]);
+
+    let data = &dry_run["data"];
+    assert_eq!(
+        data["graph"]["task_ids"],
+        json!(["root.leaf", "other.leaf"])
+    );
+    assert_eq!(
+        data["plan"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["root.leaf", "other.leaf"]
+    );
+
+    let tree = &data["composition_tree"]["root"];
+    assert_eq!(tree["workflow"], "release");
+    let children = tree["children"].as_array().unwrap();
+    assert_eq!(children.len(), 2);
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| child["instance"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("root"), json!("other")]
+    );
+    assert_eq!(
+        children
+            .iter()
+            .filter(|child| child["instance"] == "root")
+            .count(),
+        1
+    );
+    assert!(children.iter().all(|child| child["children"] == json!([])));
+    assert!(!harness.log.exists(), "inspection launched a supervisor");
+}
+
+#[test]
+fn workflow_explain_nested_root_named_instances_remain_structural() {
+    let harness = Harness::new();
+    harness.workflow_file(
+        "child",
+        &json!({
+            "schema_version": 1,
+            "name": "child",
+            "tasks": [{"id": "leaf", "program": "/fake/leaf"}]
+        }),
+    );
+    harness.workflow_file(
+        "middle",
+        &json!({
+            "schema_version": 2,
+            "name": "middle",
+            "tasks": [{"id": "inner", "workflow": "child"}]
+        }),
+    );
+    harness.workflow_file(
+        "release",
+        &json!({
+            "schema_version": 2,
+            "name": "release",
+            "tasks": [{"id": "root", "workflow": "middle"}]
+        }),
+    );
+
+    let data = &workflow_document(
+        &harness
+            .command()
+            .args([
+                "--json",
+                "--scope",
+                "current",
+                "workflow",
+                "run",
+                "release",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap(),
+    )["data"];
+    let tree = &data["composition_tree"]["root"];
+    assert_eq!(tree["workflow"], "release");
+    let root_instance = &tree["children"][0];
+    assert_eq!(root_instance["instance"], "root");
+    assert_eq!(root_instance["workflow"], "middle");
+    let inner_instance = &root_instance["children"][0];
+    assert_eq!(inner_instance["instance"], "root.inner");
+    assert_eq!(inner_instance["workflow"], "child");
+    assert_eq!(inner_instance["children"], json!([]));
+    assert_eq!(data["graph"]["task_ids"], json!(["root.inner.leaf"]));
+    assert!(!harness.log.exists(), "inspection launched a supervisor");
+}
+
+#[test]
+fn direct_run_uses_explicit_path_for_plan_named_explain() {
+    let harness = Harness::new();
+    let plan = harness.directory.path().join("explain");
+    fs::write(
+        &plan,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "tasks": [task("work", &[])]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = harness.state("explain-plan");
+    let output = harness
+        .command()
+        .args([
+            "--json",
+            "run",
+            "--supervisor",
+            harness.supervisor.to_str().unwrap(),
+            "--state-path",
+            state.to_str().unwrap(),
+            "./explain",
+        ])
+        .output()
+        .unwrap();
+    let data = run_document(&output);
+    assert_eq!(data["data"]["run"]["status"], "completed");
+    assert_eq!(harness.requests().len(), 1);
+}
+
+#[test]
 fn workflow_explain_nested_repeated_composition_retains_exports_and_sources() {
     let harness = Harness::new();
     harness.workflow_file("leaf", &json!({"schema_version":2,"name":"leaf","tasks":[

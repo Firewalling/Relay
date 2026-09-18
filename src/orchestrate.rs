@@ -583,13 +583,13 @@ pub struct WorkflowCompositionInstance {
 }
 
 pub(crate) fn composition_tree(metadata: &WorkflowRunMetadata) -> Value {
-    let root = composition_tree_node(metadata, "root", None);
+    let root = composition_tree_node(metadata, None, None);
     json!({"root": root})
 }
 
 fn composition_tree_node(
     metadata: &WorkflowRunMetadata,
-    path: &str,
+    path: Option<&str>,
     instance: Option<&WorkflowCompositionInstance>,
 ) -> Value {
     let (workflow, schema_version, definition_sha256, resolved_inputs) = match instance {
@@ -622,13 +622,15 @@ fn composition_tree_node(
             candidate
                 .instance
                 .rsplit_once('.')
-                .map_or("root", |(parent, _)| parent)
+                .map(|(parent, _)| parent)
                 == path
         })
-        .map(|candidate| composition_tree_node(metadata, &candidate.instance, Some(candidate)))
+        .map(|candidate| {
+            composition_tree_node(metadata, Some(candidate.instance.as_str()), Some(candidate))
+        })
         .collect::<Vec<_>>();
     json!({
-        "instance": path,
+        "instance": path.unwrap_or("root"),
         "workflow": workflow,
         "schema_version": schema_version,
         "definition_sha256": definition_sha256,
