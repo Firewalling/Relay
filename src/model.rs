@@ -9,6 +9,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const OUTPUT_SCHEMA_VERSION: u32 = 1;
 pub const ORCHESTRATION_PROTOCOL_VERSION: u32 = 1;
 pub const HANDOFF_SCHEMA_VERSION: u32 = 2;
+pub const WORKTREE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -128,6 +129,25 @@ pub struct GitSnapshot {
     pub changed_files_truncated: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub changed_files_omitted: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeProvenance {
+    pub schema_version: u32,
+    pub repository_id: String,
+    pub repository_root: String,
+    pub worktree_id: String,
+    pub worktree_path: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub ref_name: Option<String>,
+    #[serde(default)]
+    pub head: Option<String>,
+    pub detached: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -140,8 +160,12 @@ pub struct HandoffRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_session: Option<HandoffSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_worktree: Option<WorktreeProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_agent: Option<String>,
     pub target_agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_worktree: Option<WorktreeProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
     #[serde(default)]
@@ -208,6 +232,8 @@ pub struct HandoffSessionSnapshot {
     pub last_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_from: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeProvenance>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -255,6 +281,8 @@ pub struct HandoffRunReference {
     pub run_id: String,
     pub state_path: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<HandoffWorkflowSnapshot>,
     #[serde(default)]

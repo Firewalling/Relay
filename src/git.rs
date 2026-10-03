@@ -1,4 +1,7 @@
-use crate::model::{GitSnapshot, SCHEMA_VERSION};
+use crate::{
+    model::{GitSnapshot, SCHEMA_VERSION},
+    worktree,
+};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -18,12 +21,15 @@ pub enum GitError {
     Command { directory: PathBuf, message: String },
     #[error("Git returned non-UTF-8 output in {directory}")]
     NonUtf8 { directory: PathBuf },
+    #[error(transparent)]
+    Worktree(#[from] worktree::WorktreeError),
 }
 
 pub fn capture(directory: &Path) -> Result<GitSnapshot, GitError> {
     let Some(root) = repository_root(directory)? else {
         return Ok(GitSnapshot::unavailable());
     };
+    let worktree = worktree::current(directory)?;
     let project_prefix = directory.strip_prefix(&root).unwrap_or(Path::new(""));
 
     let branch = optional_text(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
@@ -80,6 +86,7 @@ pub fn capture(directory: &Path) -> Result<GitSnapshot, GitError> {
         git_path_encoding: escaped.then(|| "escaped_bytes_v1".into()),
         changed_files_truncated: false,
         changed_files_omitted: 0,
+        worktree,
     })
 }
 

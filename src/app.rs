@@ -1,7 +1,7 @@
 use crate::{
     cli::{
         CheckpointArgs, Command, ContextArgs, DoctorArgs, HandoffArgs, HistoryArgs, NoteArgs,
-        NoteCategory, SearchArgs, SessionSelectorArgs, StartArgs,
+        NoteCategory, SearchArgs, SessionSelectorArgs, StartArgs, WorktreeArgs, WorktreeCommand,
     },
     git, handoff,
     lock::{self, ProjectLock},
@@ -9,9 +9,10 @@ use crate::{
         Checkpoint, Diagnostic, DiagnosticSeverity, Event, GitSnapshot, HandoffRecord,
         ORCHESTRATION_PROTOCOL_VERSION, OUTPUT_SCHEMA_VERSION, OperationEffect, OperationMarker,
         ProtocolComponent, ProtocolManifest, ProtocolOperation, ProtocolState, ProtocolStdin,
-        ProtocolTransport, SCHEMA_VERSION, Session, SessionState,
+        ProtocolTransport, SCHEMA_VERSION, Session, SessionState, WORKTREE_SCHEMA_VERSION,
     },
     storage::{self, StorageError},
+    worktree,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -43,6 +44,8 @@ pub enum AppError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Git(#[from] git::GitError),
+    #[error(transparent)]
+    Worktree(#[from] worktree::WorktreeError),
     #[error(transparent)]
     Lock(#[from] lock::LockError),
     #[error("could not access {path}: {source}")]
@@ -404,9 +407,102 @@ pub fn run(command: Command, project: &Path) -> Result<RunOutput, AppError> {
         Command::Supervise(_) => unreachable!("supervise is handled before project discovery"),
         Command::Run(_) => unreachable!("run is handled before project discovery"),
         Command::Workflow(_) => unreachable!("workflow is handled before project discovery"),
+        Command::Worktree(_) => unreachable!("worktree is handled before project discovery"),
         Command::Completions(_) => unreachable!("completions are handled before project discovery"),
     };
     Ok(output)
+}
+
+pub fn worktree_output(args: WorktreeArgs, invocation: &Path) -> Result<RunOutput, AppError> {
+    let listing = worktree::list(invocation)?;
+    match args.command {
+        WorktreeCommand::List => {
+            let human = listing
+                .worktrees
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{}  {}  {}  {}  {}{}",
+                        item.provenance.worktree_path,
+                        item.provenance.branch.as_deref().unwrap_or("detached"),
+                        item.provenance.head.as_deref().unwrap_or("unborn"),
+                        if item.current {
+                            "current"
+                        } else if item.stale {
+                            "stale"
+                        } else {
+                            "linked"
+                        },
+                        item.active.session.as_deref().unwrap_or("-"),
+                        item.active
+                            .run
+                            .as_deref()
+                            .map(|run| format!("  {run}"))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(RunOutput {
+                human: if human.is_empty() {
+                    "No Git worktrees recorded".into()
+                } else {
+                    human
+                },
+                data: json!(listing),
+            })
+        }
+        WorktreeCommand::Show(selector) => {
+            let selector = selector.worktree;
+            let selector_path = {
+                let raw = Path::new(&selector);
+                if raw.is_absolute() {
+                    raw.to_owned()
+                } else {
+                    invocation.join(raw)
+                }
+            };
+            let selector_path = selector_path.to_string_lossy();
+            let matches = listing
+                .worktrees
+                .iter()
+                .filter(|item| {
+                    item.provenance.worktree_id == selector
+                        || item.provenance.worktree_path == selector_path
+                        || item.provenance.branch.as_deref() == Some(selector.as_str())
+                        || item.provenance.ref_name.as_deref() == Some(selector.as_str())
+                        || item.provenance.head.as_deref() == Some(selector.as_str())
+                })
+                .collect::<Vec<_>>();
+            let item = match matches.as_slice() {
+                [item] => *item,
+                [] => {
+                    return Err(AppError::Lifecycle(format!(
+                        "no Git worktree matches {selector:?}"
+                    )));
+                }
+                _ => {
+                    return Err(AppError::Lifecycle(format!(
+                        "Git worktree selector {selector:?} is ambiguous"
+                    )));
+                }
+            };
+            Ok(RunOutput {
+                human: format!(
+                    "Worktree: {}\nBranch: {}\nRef: {}\nHEAD: {}\nDetached: {}\nStale: {}\nActive session: {}\nActive run: {}",
+                    item.provenance.worktree_path,
+                    item.provenance.branch.as_deref().unwrap_or("none"),
+                    item.provenance.ref_name.as_deref().unwrap_or("none"),
+                    item.provenance.head.as_deref().unwrap_or("none"),
+                    item.provenance.detached,
+                    item.stale,
+                    item.active.session.as_deref().unwrap_or("none"),
+                    item.active.run.as_deref().unwrap_or("none")
+                ),
+                data: json!({"worktree": item}),
+            })
+        }
+    }
 }
 
 fn list_output(project: &Path) -> Result<RunOutput, AppError> {
@@ -730,6 +826,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Run(_) => "run",
         Command::Supervise(_) => "supervise",
         Command::Workflow(_) => "workflow",
+        Command::Worktree(_) => "worktree",
         Command::Completions(_) => "completions",
     }
 }
@@ -760,6 +857,14 @@ fn start(project: &Path, args: StartArgs) -> Result<StartResult, AppError> {
         last_agent: None,
         resumed_from: None,
     };
+    if let Some(provenance) = session.initial_git.worktree.as_ref() {
+        worktree::claim(
+            provenance,
+            worktree::ClaimKind::Session,
+            &session.id.to_string(),
+        )
+        .map_err(|error| AppError::Lifecycle(error.to_string()))?;
+    }
     let mut operation = Operation::begin(
         &paths,
         "start",
@@ -835,7 +940,7 @@ fn status(project: &Path) -> Result<RunOutput, AppError> {
         .unwrap_or_else(|| "none".into());
 
     let human = format!(
-        "Goal: {}\nSession: {}\nState: {}\nStarted: {}\nResumed from: {}\nProject: .\nGit branch: {}\nGit commit: {}\nGit clean: {}\nEvents: {}\nLatest checkpoint: {}\nLast agent: {}",
+        "Goal: {}\nSession: {}\nState: {}\nStarted: {}\nResumed from: {}\nProject: .\nGit branch: {}\nGit commit: {}\nGit clean: {}\nWorktree: {}\nEvents: {}\nLatest checkpoint: {}\nLast agent: {}",
         safe_markdown_value(project, &session.goal),
         session.id,
         state_name(&session.state),
@@ -847,6 +952,16 @@ fn status(project: &Path) -> Result<RunOutput, AppError> {
         display_option(live_git.branch.as_deref(), live_git.available),
         display_option(live_git.commit.as_deref(), live_git.available),
         display_clean(&live_git),
+        safe_markdown_value(
+            project,
+            display_option(
+                live_git
+                    .worktree
+                    .as_ref()
+                    .map(|worktree| worktree.worktree_path.as_str()),
+                live_git.available,
+            ),
+        ),
         event_count,
         latest,
         safe_markdown_value(project, session.last_agent.as_deref().unwrap_or("unknown")),
@@ -854,6 +969,7 @@ fn status(project: &Path) -> Result<RunOutput, AppError> {
     let data = json!({
         "session": &session,
         "git": &live_git,
+        "worktree": &live_git.worktree,
         "event_count": event_count,
         "project": ".",
     });
@@ -944,6 +1060,12 @@ fn handoff_create(project: &Path, args: HandoffArgs) -> Result<HandoffResult, Ap
     }
 
     let live_git = git::capture(project)?;
+    let target_worktree = if let Some(selector) = args.target_worktree.as_deref() {
+        let listing = worktree::list(project)?;
+        Some(worktree::select(&listing, selector, project)?)
+    } else {
+        None
+    };
     let mut run_states = Vec::with_capacity(args.runs.len());
     for requested in &args.runs {
         let path = if requested.is_absolute() {
@@ -955,8 +1077,16 @@ fn handoff_create(project: &Path, args: HandoffArgs) -> Result<HandoffResult, Ap
             .map_err(|error| AppError::Lifecycle(error.to_string()))?;
         run_states.push((path, state));
     }
-    let record = handoff::build_record(project, &args, &session, &events, live_git, &run_states)
-        .map_err(AppError::Lifecycle)?;
+    let record = handoff::build_record(
+        project,
+        &args,
+        &session,
+        &events,
+        live_git,
+        target_worktree,
+        &run_states,
+    )
+    .map_err(AppError::Lifecycle)?;
     let markdown = handoff::render(&record, project);
     let path = project.join(&record.artifact_path);
     let relative = record.artifact_path.clone();
@@ -1187,6 +1317,14 @@ fn finish(project: &Path) -> Result<FinishResult, AppError> {
     storage::write_json_atomic(&paths.session, &session)?;
     operation.advance("current_session")?;
     operation.complete()?;
+    if let Some(provenance) = session.initial_git.worktree.as_ref() {
+        worktree::release(
+            provenance,
+            worktree::ClaimKind::Session,
+            &session.id.to_string(),
+        )
+        .map_err(|error| AppError::Lifecycle(error.to_string()))?;
+    }
 
     Ok(FinishResult {
         session,
@@ -1313,6 +1451,14 @@ fn resume(project: &Path, args: SessionSelectorArgs) -> Result<ResumeResult, App
         last_agent: None,
         resumed_from: Some(source_id),
     };
+    if let Some(provenance) = session.initial_git.worktree.as_ref() {
+        worktree::claim(
+            provenance,
+            worktree::ClaimKind::Session,
+            &session.id.to_string(),
+        )
+        .map_err(|error| AppError::Lifecycle(error.to_string()))?;
+    }
     let mut operation = Operation::begin(
         &paths,
         "resume",
@@ -2842,7 +2988,34 @@ fn validate_version(kind: &'static str, found: u32) -> Result<(), AppError> {
 }
 
 fn validate_git_version(git: &GitSnapshot) -> Result<(), AppError> {
-    validate_version("Git snapshot", git.schema_version)
+    validate_version("Git snapshot", git.schema_version)?;
+    if let Some(worktree) = &git.worktree {
+        if worktree.schema_version != WORKTREE_SCHEMA_VERSION {
+            return Err(AppError::UnsupportedSchema {
+                kind: "Git worktree provenance",
+                found: worktree.schema_version,
+                supported: WORKTREE_SCHEMA_VERSION,
+            });
+        }
+        for (name, value) in [
+            ("repository identity", &worktree.repository_id),
+            ("repository root", &worktree.repository_root),
+            ("worktree identity", &worktree.worktree_id),
+            ("worktree path", &worktree.worktree_path),
+        ] {
+            if value.is_empty() || !Path::new(value).is_absolute() {
+                return Err(AppError::Lifecycle(format!(
+                    "Git worktree {name} must be an absolute non-empty path"
+                )));
+            }
+        }
+        if worktree.detached && worktree.branch.is_some() {
+            return Err(AppError::Lifecycle(
+                "detached Git worktree provenance must not contain a branch".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn create_state_directories(paths: &Paths) -> Result<(), AppError> {
@@ -3008,6 +3181,7 @@ mod tests {
             list: false,
             to: None,
             source_agent: None,
+            target_worktree: None,
             goal: None,
             next_actions: Vec::new(),
             runs: Vec::new(),
@@ -3187,6 +3361,7 @@ mod tests {
             list: false,
             to: None,
             source_agent: None,
+            target_worktree: None,
             goal: None,
             next_actions: Vec::new(),
             runs: Vec::new(),

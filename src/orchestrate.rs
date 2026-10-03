@@ -1,7 +1,9 @@
 use crate::{
     app::RunOutput,
     cli::{RunArgs, SuperviseArgs},
+    model::{WORKTREE_SCHEMA_VERSION, WorktreeProvenance},
     supervise::{self, ExecutionResult, Lifecycle, SupervisorError, TerminationReason},
+    worktree::{self, ClaimKind},
 };
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
@@ -666,6 +668,8 @@ pub struct RunState {
     pub jobs: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowRunMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeProvenance>,
     plan: Plan,
     pub tasks: Vec<TaskRecord>,
 }
@@ -701,6 +705,8 @@ struct RunStateWire {
     jobs: JobsField,
     #[serde(default)]
     workflow: Option<WorkflowRunMetadata>,
+    #[serde(default)]
+    worktree: Option<WorktreeProvenance>,
     plan: Plan,
     tasks: Vec<Value>,
 }
@@ -1752,6 +1758,15 @@ pub fn explain(selector: &Path, project_root: &Path) -> Result<RunOutput, RunErr
         workflow_name,
         reconciliation_status
     );
+    if let Some(worktree) = &state.worktree {
+        human.push_str(&format!(
+            "\nRepository: {}\nWorktree: {}\nBranch: {}\nHEAD: {}",
+            worktree.repository_id,
+            worktree.worktree_path,
+            worktree.branch.as_deref().unwrap_or("detached"),
+            worktree.head.as_deref().unwrap_or("unborn"),
+        ));
+    }
     human.push_str(&format!(
         "\nDefinition: {}\nResolved plan: {}\nComposition instances: {}",
         definition_sha256.unwrap_or("unavailable"),
@@ -1918,6 +1933,7 @@ pub fn explain(selector: &Path, project_root: &Path) -> Result<RunOutput, RunErr
                 "status": state.status,
                 "state_path": state.state_path,
                 "workflow": workflow.clone(),
+                "worktree": state.worktree,
                 "resolved_plan_sha256": workflow
                     .get("resolved_plan_sha256")
                     .cloned()
@@ -2088,6 +2104,11 @@ fn run_plan(
     {
         validate_plan(plan, invocation_directory)?;
     }
+    let invocation_worktree = worktree::current(invocation_directory).map_err(|error| {
+        RunError::State(format!(
+            "could not capture Git worktree provenance: {error}"
+        ))
+    })?;
 
     let requested_state_path = match args.resume.clone().or(args.state_path.clone()) {
         Some(path) => path,
@@ -2204,6 +2225,7 @@ fn run_plan(
             cancellation_requested: false,
             jobs: args.jobs,
             workflow: workflow_metadata,
+            worktree: invocation_worktree.clone(),
             plan: sanitize_plan(&plan),
             tasks: plan
                 .tasks
@@ -2223,6 +2245,11 @@ fn run_plan(
         };
         test_pause("before_initial_install")?;
         store.write_initial(&state)?;
+    }
+    let claimed_worktree = state.worktree.clone().or(invocation_worktree);
+    if let Some(provenance) = claimed_worktree.as_ref() {
+        worktree::claim(provenance, ClaimKind::Run, &state.run_id)
+            .map_err(|error| RunError::Busy(error.to_string()))?;
     }
 
     mark_blocked(&plan, &mut state);
@@ -2606,6 +2633,13 @@ fn run_plan(
 
     state.status = derive_status(&state.tasks, state.cancellation_requested);
     persist_at(&mut store, &mut state, "final")?;
+    if state.status != RunStatus::Indeterminate
+        && let Some(provenance) = claimed_worktree.as_ref()
+    {
+        worktree::release(provenance, ClaimKind::Run, &state.run_id).map_err(|error| {
+            RunError::State(format!("could not release worktree claim: {error}"))
+        })?;
+    }
     if let Some(source) = boundary_error {
         return Err(supervisor_error(&state, source));
     }
@@ -4390,6 +4424,7 @@ fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
         cancellation_requested,
         jobs,
         workflow,
+        worktree,
         plan,
         tasks,
     } = wire;
@@ -4468,6 +4503,7 @@ fn decode_run_state(bytes: &[u8], path: &Path) -> Result<RunState, RunError> {
         cancellation_requested,
         jobs,
         workflow,
+        worktree,
         plan,
         tasks,
     })
@@ -4876,6 +4912,33 @@ fn validate_historical_state(
     validate_resume_state_with_artifacts(state, plan, state_path, project_root, false, false)
 }
 
+fn validate_run_worktree(worktree: &WorktreeProvenance) -> Result<(), RunError> {
+    if worktree.schema_version != WORKTREE_SCHEMA_VERSION {
+        return Err(RunError::State(format!(
+            "unsupported worktree provenance schema {}",
+            worktree.schema_version
+        )));
+    }
+    for (name, value) in [
+        ("repository identity", &worktree.repository_id),
+        ("repository root", &worktree.repository_root),
+        ("worktree identity", &worktree.worktree_id),
+        ("worktree path", &worktree.worktree_path),
+    ] {
+        if value.is_empty() || !Path::new(value).is_absolute() {
+            return Err(RunError::State(format!(
+                "worktree {name} must be an absolute non-empty path"
+            )));
+        }
+    }
+    if worktree.detached && worktree.branch.is_some() {
+        return Err(RunError::State(
+            "detached worktree provenance must not contain a branch".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_resume_state_with_artifacts(
     state: &RunState,
     plan: &Plan,
@@ -4888,6 +4951,9 @@ fn validate_resume_state_with_artifacts(
         return Err(RunError::State(format!(
             "schema_version must be {RUN_STATE_SCHEMA_VERSION}"
         )));
+    }
+    if let Some(worktree) = &state.worktree {
+        validate_run_worktree(worktree)?;
     }
     if let Some(workflow) = state.workflow.as_ref() {
         validate_workflow_metadata(workflow)?;
@@ -5815,6 +5881,7 @@ mod tests {
             cancellation_requested: false,
             jobs: 1,
             workflow: None,
+            worktree: None,
             plan,
             tasks,
         }

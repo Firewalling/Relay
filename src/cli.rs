@@ -59,6 +59,8 @@ pub enum Command {
     Supervise(SuperviseArgs),
     /// Run, inspect, and validate project-local reusable workflows.
     Workflow(WorkflowArgs),
+    /// Inspect Git repository worktrees and Relay ownership.
+    Worktree(WorktreeArgs),
     /// Prints the negotiated, versioned Rust/Go process contract and launches nothing.
     Protocol,
     /// Start a session with a goal.
@@ -98,6 +100,7 @@ impl Command {
             Self::Protocol => "protocol",
             Self::Supervise(_) => "supervise",
             Self::Workflow(_) => "workflow",
+            Self::Worktree(_) => "worktree",
             Self::Start(_) => "start",
             Self::Status => "status",
             Self::Checkpoint(_) => "checkpoint",
@@ -120,6 +123,25 @@ impl Command {
 pub struct WorkflowArgs {
     #[command(subcommand)]
     pub command: WorkflowCommand,
+}
+
+#[derive(Debug, Args)]
+pub struct WorktreeArgs {
+    #[command(subcommand)]
+    pub command: WorktreeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorktreeCommand {
+    /// List registered and historically observed Git worktrees.
+    List,
+    /// Show one worktree by path, branch, ref, or identity.
+    Show(WorktreeSelectorArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WorktreeSelectorArgs {
+    pub worktree: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -389,6 +411,9 @@ pub struct HandoffArgs {
     /// Agent creating the handoff, when explicitly known.
     #[arg(long = "source-agent", alias = "from", value_parser = parse_agent)]
     pub source_agent: Option<String>,
+    /// Explicit destination Git worktree for an inspectable cross-worktree handoff.
+    #[arg(long = "target-worktree")]
+    pub target_worktree: Option<String>,
     /// Optional handoff goal override.
     #[arg(long, value_parser = parse_goal)]
     pub goal: Option<String>,
