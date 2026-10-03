@@ -5,7 +5,7 @@ use crate::{
         HandoffEntry, HandoffEntrySource, HandoffNoteReference, HandoffOutputReference,
         HandoffOutputType, HandoffRecord, HandoffReferences, HandoffRunReference,
         HandoffSessionSnapshot, HandoffTaskSnapshot, HandoffUnavailable, HandoffWorkflowSnapshot,
-        SCHEMA_VERSION, Session, SessionState,
+        SCHEMA_VERSION, Session, SessionState, WORKTREE_SCHEMA_VERSION, WorktreeProvenance,
     },
     orchestrate::{OutputRecord, OutputType, RunState, TaskStatus},
     storage,
@@ -192,6 +192,7 @@ pub fn action(args: &HandoffArgs) -> Result<HandoffAction, String> {
 fn has_create_options(args: &HandoffArgs) -> bool {
     args.to.is_some()
         || args.source_agent.is_some()
+        || args.target_worktree.is_some()
         || args.goal.is_some()
         || !args.completed_work.is_empty()
         || !args.decision.is_empty()
@@ -605,6 +606,7 @@ pub fn build_record(
     session: &Session,
     events: &[Event],
     mut git: GitSnapshot,
+    target_worktree: Option<WorktreeProvenance>,
     run_states: &[(PathBuf, RunState)],
 ) -> Result<HandoffRecord, String> {
     let HandoffAction::Create { target } = action(args)? else {
@@ -732,6 +734,7 @@ pub fn build_record(
         started_at: session.started_at,
         completed_at: session.completed_at,
         last_agent: session_last_agent,
+        worktree: session.initial_git.worktree.clone(),
         resumed_from: session.resumed_from,
     });
     let mut unavailable = Vec::new();
@@ -797,6 +800,8 @@ pub fn build_record(
         blockers,
         next_actions,
         references,
+        source_worktree: session.initial_git.worktree.clone(),
+        target_worktree,
         git,
         unavailable,
         supersedes,
@@ -1088,6 +1093,7 @@ fn run_reference(
             run_id: state.run_id.clone(),
             state_path,
             status: state.status.as_str().to_owned(),
+            worktree: state.worktree.clone(),
             workflow,
             tasks,
         },
@@ -1137,6 +1143,28 @@ fn bound_git(mut git: GitSnapshot) -> GitSnapshot {
         let (bounded, _) = bound_text(value, MAX_HANDOFF_PATH_BYTES);
         *value = bounded;
     }
+    if let Some(worktree) = git.worktree.as_mut() {
+        for value in [
+            &mut worktree.repository_id,
+            &mut worktree.repository_root,
+            &mut worktree.worktree_id,
+            &mut worktree.worktree_path,
+        ] {
+            let (bounded, _) = bound_text(value, MAX_HANDOFF_PATH_BYTES);
+            *value = bounded;
+        }
+        for value in [
+            &mut worktree.branch,
+            &mut worktree.ref_name,
+            &mut worktree.head,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let (bounded, _) = bound_text(value, MAX_HANDOFF_PATH_BYTES);
+            *value = bounded;
+        }
+    }
     if git.changed_files.len() > MAX_HANDOFF_CHANGED_FILES {
         let omitted = git.changed_files.len() - MAX_HANDOFF_CHANGED_FILES;
         git.changed_files.truncate(MAX_HANDOFF_CHANGED_FILES);
@@ -1184,6 +1212,15 @@ pub fn validate_record(record: &HandoffRecord) -> Result<(), String> {
         {
             return Err("handoff session snapshot has inconsistent lifecycle fields".into());
         }
+        if let Some(worktree) = &session.worktree {
+            validate_worktree(worktree)?;
+        }
+    }
+    if let Some(worktree) = &record.source_worktree {
+        validate_worktree(worktree)?;
+    }
+    if let Some(worktree) = &record.target_worktree {
+        validate_worktree(worktree)?;
     }
     validate_entries(&record.completed, "completed")?;
     validate_entries(&record.decisions, "decisions")?;
@@ -1268,6 +1305,9 @@ pub fn validate_record(record: &HandoffRecord) -> Result<(), String> {
         validate_relative_reference(&run.state_path, RUN_DIRECTORY)?;
         if Path::new(&run.state_path).extension() != Some(std::ffi::OsStr::new("json")) {
             return Err(format!("run {} has an invalid state path", run.run_id));
+        }
+        if let Some(worktree) = &run.worktree {
+            validate_worktree(worktree)?;
         }
         validate_text(&run.status, MAX_HANDOFF_STATUS_BYTES, "run status")?;
         if !matches!(
@@ -1452,8 +1492,42 @@ fn validate_entries(entries: &[HandoffEntry], name: &str) -> Result<(), String> 
             "handoff {name} exceeds {MAX_HANDOFF_ENTRIES} entries"
         ));
     }
+
     for entry in entries {
         validate_nonblank_bounded(&entry.text, MAX_HANDOFF_ENTRY_BYTES, "handoff entry")?;
+    }
+    Ok(())
+}
+
+fn validate_worktree(worktree: &WorktreeProvenance) -> Result<(), String> {
+    if worktree.schema_version != WORKTREE_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported worktree provenance schema {}",
+            worktree.schema_version
+        ));
+    }
+    for (name, value) in [
+        ("repository identity", &worktree.repository_id),
+        ("repository root", &worktree.repository_root),
+        ("worktree identity", &worktree.worktree_id),
+        ("worktree path", &worktree.worktree_path),
+    ] {
+        validate_text(value, MAX_HANDOFF_PATH_BYTES, name)?;
+        if !Path::new(value).is_absolute() {
+            return Err(format!("{name} must be absolute"));
+        }
+    }
+    for (name, value) in [
+        ("worktree branch", &worktree.branch),
+        ("worktree ref", &worktree.ref_name),
+        ("worktree HEAD", &worktree.head),
+    ] {
+        if let Some(value) = value {
+            validate_text(value, MAX_HANDOFF_PATH_BYTES, name)?;
+        }
+    }
+    if worktree.detached && worktree.branch.is_some() {
+        return Err("detached worktree must not have a branch".into());
     }
     Ok(())
 }
@@ -1464,6 +1538,9 @@ fn validate_git(git: &GitSnapshot) -> Result<(), String> {
             "unsupported Git snapshot schema {}",
             git.schema_version
         ));
+    }
+    if let Some(worktree) = &git.worktree {
+        validate_worktree(worktree)?;
     }
     for (value, name) in [
         (&git.repository_root, "Git repository root"),
@@ -1714,6 +1791,22 @@ pub fn render(record: &HandoffRecord, project: &Path) -> String {
     } else {
         markdown.push_str("- Unavailable (not a Git repository)\n");
     }
+    if let Some(worktree) = &record.source_worktree {
+        markdown.push_str(&format!(
+            "- Repository: {}\n- Worktree: {}\n- Ref: {}\n- HEAD: {}\n",
+            safe_inline(project, &worktree.repository_id),
+            safe_inline(project, &worktree.worktree_path),
+            safe_inline(project, worktree.ref_name.as_deref().unwrap_or("detached")),
+            safe_inline(project, worktree.head.as_deref().unwrap_or("unborn")),
+        ));
+    }
+    if let Some(worktree) = &record.target_worktree {
+        markdown.push_str(&format!(
+            "- Target worktree: {} ({})\n",
+            safe_inline(project, &worktree.worktree_path),
+            safe_inline(project, worktree.branch.as_deref().unwrap_or("detached")),
+        ));
+    }
     markdown.push_str("\n## Changed files\n\n");
     if !record.git.available || record.git.changed_files.is_empty() {
         markdown.push_str(if record.git.available {
@@ -1963,6 +2056,8 @@ mod tests {
             artifact_path: format!(".relay/handoffs/record-{}.md", Uuid::nil()),
             created_at: DateTime::UNIX_EPOCH,
             source_session: None,
+            source_worktree: None,
+            target_worktree: None,
             source_agent: None,
             target_agent: "agent-b".into(),
             goal: Some("goal".into()),
@@ -1997,6 +2092,8 @@ mod tests {
             artifact_path: format!(".relay/handoffs/record-{}.md", Uuid::nil()),
             created_at: DateTime::UNIX_EPOCH,
             source_session: None,
+            source_worktree: None,
+            target_worktree: None,
             source_agent: None,
             target_agent: "agent-b".into(),
             goal: Some("goal".into()),

@@ -32,6 +32,20 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Command::Worktree(args) = cli.command {
+        return match app::worktree_output(args, &invocation_directory) {
+            Ok(output) => emit_success(json_output, command_name, output),
+            Err(error) => {
+                emit_error(
+                    json_output,
+                    command_name,
+                    error_code(&error),
+                    &error.to_string(),
+                );
+                ExitCode::FAILURE
+            }
+        };
+    }
     if let Command::Workflow(args) = cli.command {
         let inspection = matches!(&args.command, relay::cli::WorkflowCommand::Explain(_))
             || matches!(&args.command, relay::cli::WorkflowCommand::Run(run) if run.dry_run);
@@ -287,6 +301,7 @@ fn error_code(error: &app::AppError) -> &'static str {
         app::AppError::UnsupportedSchema { .. } => "unsupported_schema",
         app::AppError::Storage(_) => "storage_error",
         app::AppError::Git(_) => "git_error",
+        app::AppError::Worktree(_) => "worktree_error",
         app::AppError::Lock(_) => "project_busy",
         app::AppError::Io { .. } => "io_error",
         app::AppError::CorruptSession { .. } => "corrupt_state",

@@ -9,3 +9,4 @@ pub mod project;
 pub mod storage;
 pub mod supervise;
 pub mod workflow;
+pub mod worktree;
